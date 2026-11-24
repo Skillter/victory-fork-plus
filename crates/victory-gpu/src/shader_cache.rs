@@ -1,7 +1,9 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (`VICTORY_TRANSLATOR_HASH`, made by `build.rs` from
+//! the translator's source, this file, `Cargo.lock` and the toolchain), so
+//! a changed translator never serves an old translation and a rebuild that
+//! leaves it alone keeps the cache. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -37,13 +39,19 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies the translation: the translator's fingerprint (made at
+/// build time, see `build.rs`), whether this is a diagnostics build (which
+/// turns on the translator's own diagnostics feature), and the translation
+/// settings it runs with (the loop limit, which a diagnostics build can
+/// change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let exe: std::io::Result<Vec<u8>> = Ok([
+            env!("VICTORY_TRANSLATOR_HASH").as_bytes(),
+            &[u8::from(cfg!(feature = "diagnostics")), u8::from(cfg!(debug_assertions))],
+        ]
+        .concat());
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
