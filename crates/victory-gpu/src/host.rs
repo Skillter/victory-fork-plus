@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_2};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -495,6 +495,116 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// The `D3D12Core.dll` a redistributed Agility SDK ships, beside the
+/// executable in a `D3D12` folder, is 1.<version>.0 and later: the number
+/// after the `1.` is what the SDK configuration carries.
+const AGILITY_SDK_VERSION: u32 = 614;
+
+/// Points the system `d3d12.dll` at a redistributed D3D12 core, so the
+/// process gets the Agility SDK's D3D12 rather than the older one Windows 10
+/// ships. That is what provides feature level 12_2, shader model 6.6 and
+/// root signatures declaring heap direct indexing. Windows 11's inbox core
+/// has them already, so a missing folder is not an error.
+///
+/// `SetSDKVersion` is unusable here: it must be the process's first D3D12
+/// call, and import binding has already run. `CreateDeviceFactory` has no
+/// such ordering requirement, and `ApplyToGlobalState` is required or
+/// `d3d12.dll`'s own exports (the root-signature serializer among them) keep
+/// using the old core.
+fn d3d12_factory() -> Option<ID3D12DeviceFactory> {
+    use windows::Win32::Graphics::Direct3D12::{
+        CLSID_D3D12SDKConfiguration, D3D12GetInterface, ID3D12DeviceFactory,
+        ID3D12SDKConfiguration1,
+    };
+
+    static FACTORY: OnceLock<Option<ID3D12DeviceFactory>> = OnceLock::new();
+    FACTORY
+        .get_or_init(|| {
+            let folder = std::env::var_os("VICTORY_D3D12_SDK")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    let exe = std::env::current_exe().ok()?;
+                    Some(exe.parent()?.join("D3D12"))
+                })?;
+            if !folder.join("D3D12Core.dll").is_file() {
+                tracing::debug!(
+                    folder = %folder.display(),
+                    "no redistributed D3D12 core; the system one stays"
+                );
+                return None;
+            }
+            let mut config: Option<ID3D12SDKConfiguration1> = None;
+            // SAFETY: a documented entry point; the class id and interface
+            // both come from the same headers.
+            if let Err(e) = unsafe { D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config) }
+            {
+                tracing::warn!(error = %e, "D3D12 SDK configuration is unavailable");
+                return None;
+            }
+            let config = config?;
+            let text = folder.to_string_lossy().to_string();
+            for candidate in [text.clone(), format!("{text}\\")] {
+                let path: Vec<u8> = candidate.bytes().chain([0]).collect();
+                // SAFETY: a NUL-terminated path alive across the call.
+                let made: windows::core::Result<ID3D12DeviceFactory> = unsafe {
+                    config.CreateDeviceFactory(AGILITY_SDK_VERSION, windows::core::PCSTR(path.as_ptr()))
+                };
+                match made {
+                    Ok(factory) => {
+                        // SAFETY: a live factory; the call sets global state.
+                        if let Err(e) = unsafe { factory.ApplyToGlobalState() } {
+                            tracing::warn!(error = %e, "the new core did not become global");
+                        }
+                        tracing::info!(
+                            version = AGILITY_SDK_VERSION,
+                            path = %candidate,
+                            "D3D12 Agility SDK selected"
+                        );
+                        return Some(factory);
+                    }
+                    Err(e) => tracing::debug!(
+                        error = %e,
+                        path = %candidate,
+                        "D3D12 Agility SDK path refused"
+                    ),
+                }
+            }
+            tracing::warn!(
+                version = AGILITY_SDK_VERSION,
+                folder = %text,
+                "D3D12 Agility SDK refused; the system core stays"
+            );
+            None
+        })
+        .clone()
+}
+
+/// Creates the device through the redistributed core when there is one, else
+/// through the system `d3d12.dll`.
+fn create_device(
+    factory: Option<&ID3D12DeviceFactory>,
+    adapter: Option<&IDXGIAdapter>,
+    level: D3D_FEATURE_LEVEL,
+    device: &mut Option<ID3D12Device>,
+) -> windows::core::Result<()> {
+    match (factory, adapter) {
+        // SAFETY: a live factory and adapter; the device is written once.
+        (Some(factory), Some(adapter)) => unsafe { factory.CreateDevice(adapter, level, device) },
+        // SAFETY: as above, with the default adapter.
+        (Some(factory), None) => unsafe {
+            factory.CreateDevice(None::<&windows::core::IUnknown>, level, device)
+        },
+        (None, Some(adapter)) => {
+            // SAFETY: a live adapter; the device is written once.
+            unsafe { D3D12CreateDevice(adapter, level, device) }
+        }
+        (None, None) => {
+            // SAFETY: the default adapter; the device is written once.
+            unsafe { D3D12CreateDevice(None, level, device) }
+        }
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -537,15 +647,42 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        // A newer D3D12 core, before anything creates a device: Windows 10's
+        // own tops out below what the title's pipelines expect.
+        let factory = d3d12_factory();
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            create_device(
+                factory.as_ref(),
+                Some(&adapter),
+                D3D_FEATURE_LEVEL_12_2,
+                &mut device,
+            )?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Feature level 12_2 is where shader model 6.6 and descriptor-heap
+            // direct indexing live, which the title's pipelines and root
+            // signatures use. An older host refuses it, and then 12_0 runs.
+            if let Err(e) = create_device(
+                factory.as_ref(),
+                None,
+                D3D_FEATURE_LEVEL_12_2,
+                &mut device,
+            ) {
+                tracing::warn!(
+                    error = %e,
+                    "feature level 12_2 unavailable; falling back to 12_0"
+                );
+                create_device(
+                    factory.as_ref(),
+                    None,
+                    D3D_FEATURE_LEVEL_12_0,
+                    &mut device,
+                )?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the

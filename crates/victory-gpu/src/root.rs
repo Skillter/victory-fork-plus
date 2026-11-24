@@ -27,6 +27,13 @@ const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
 
 const CONSOLE_FLAGS: u32 = 0xff00_0000;
 
+/// `D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` (0x400) and
+/// `D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED` (0x800): valid
+/// only for a version-1.1 description, which the version-1 serializer the
+/// title uses refuses with "Unsupported bit-flag set". Dropped there and
+/// reported; VIctory's own signatures keep them.
+const VERSION_11_FLAGS: u32 = 0x400 | 0x800;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Desc {
@@ -85,10 +92,15 @@ fn without_console_flags(desc: Desc) -> Desc {
             "console root signature flags dropped"
         );
     }
-    Desc {
-        flags: desc.flags & !CONSOLE_FLAGS,
-        ..desc
+    let mut flags = desc.flags & !CONSOLE_FLAGS;
+    if flags & VERSION_11_FLAGS != 0 {
+        tracing::warn!(
+            flags = format_args!("{:#x}", desc.flags),
+            "1.1-only root signature flags dropped (the version-1 serializer refuses them)"
+        );
+        flags &= !VERSION_11_FLAGS;
     }
+    Desc { flags, ..desc }
 }
 
 /// `d3d12_xs!D3D12SerializeRootSignature`.
