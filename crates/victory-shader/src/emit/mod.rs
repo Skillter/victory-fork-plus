@@ -1564,6 +1564,32 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    /// `v_fma_mixlo_f16` into a register whose old value has no host value
+    /// keeps 0 in the high half, as the other 16-bit writes do, instead of
+    /// refusing the result: the console compiler reuses a register whose
+    /// other half nothing reads again. The title's deferred textured
+    /// material writes the low half of the register a `v_interp_p1ll_f16`
+    /// first half left, then reads that low half alone; its draws were
+    /// dropped (`PS_DeferredTextured_*`, "the first half of an
+    /// interpolation" at its G-buffer export, 2026-11-25). Here the old
+    /// value is an instruction's that does not translate (`v_cvt_f32_f64`),
+    /// which has no host value either.
+    #[test]
+    fn fma_mixlo_into_a_register_without_a_value_keeps_its_low_half() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0x7E04_1F00, // v_cvt_f32_f64 v2, v[0:1] (no host value)
+            0xCC21_0002, // v_fma_mixlo_f16 v2, v0, v1, 0 (f32 sources)
+            0x0202_0300,
+            0x7E06_1702, // v_cvt_f32_f16 v3, v2
+            e0,
+            e1, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
