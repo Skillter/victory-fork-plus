@@ -106,12 +106,9 @@ target\release\victory.exe run <title.exe> --execute
   `v_cvt_f32_f64`), not a friendly sentence; grep the opcode.
 - `modules::all()` registers only a subset of HLE areas; the rest are
   `QueryApiImpl` objects with their own vtables, not DLL exports.
-- Known doc drift; trust code: `MEMORY.md` says the fork asks for 12_0 while
-  `victory-gpu::device` asks for 12_2; `docs/architecture.md` calls BCPack
-  planned although `victory_formats::bcpack` is implemented;
-  `victory-gpu/src/lib.rs` calls present planned although DXGI presentation
-  exists; `victory_game::KNOWN_BUILDS` is empty so every build prints
-  "unknown".
+- `victory_game::KNOWN_BUILDS` is intentionally empty: `identify` returns
+  `None` and `victory run` prints `build unknown (<hash>)`. The label is
+  cosmetic; add a `KnownBuild` only with a verified executable hash.
 - `VICTORY_*` switches are read at their use sites. Search the variable name
   before documenting one; several are diagnostics-only.
 

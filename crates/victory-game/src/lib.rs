@@ -5,7 +5,8 @@
 
 pub mod sgd5;
 
-/// A specific build of the title executable we know how to run.
+/// One title build whose hash we can name. Carries no code and gates
+/// nothing: an unlisted executable still runs.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownBuild {
     /// Our own label, e.g. "1.0.0 retail".
@@ -14,7 +15,10 @@ pub struct KnownBuild {
     pub blake3: &'static str,
 }
 
-/// Builds we support. Empty until the executable is available.
+/// Builds we can name. Deliberately empty in this tree: identification only
+/// changes the banner `victory run` prints, and every unlisted build reports
+/// `build unknown (<hash>)`. Add an entry only with a hash verified on the
+/// build it names.
 pub const KNOWN_BUILDS: &[KnownBuild] = &[];
 
 /// Looks up a build by the BLAKE3 hash of its executable.
