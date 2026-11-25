@@ -149,6 +149,16 @@ pub(crate) extern "system" fn wait(
     // time-out shorter than a tick) answer as before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `VICTORY_PACE=none` answers a blocking wait at once: our clock stops
+    // pacing and a title with its own frame limiter paces alone. This is the
+    // experiment that tells a title doubling its frames from one that is slow.
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NONE.get_or_init(|| {
+        std::env::var_os("VICTORY_PACE").is_some_and(|v| v.eq_ignore_ascii_case("none"))
+    }) {
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+        wait = Duration::ZERO;
+    }
     if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
         && limit >= wait
         && tick > last(kind).load(Ordering::Relaxed) + 1

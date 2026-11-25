@@ -252,6 +252,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_ASK_PAGES=<n>` | pages one submission may ask the kernel about, 262,144 (1 GiB) by default; the rest wait for a later submission, so a title that declares more dirty ranges than it wrote costs latency, not a stall |
 | `VICTORY_COPY_THREADS=<n>` | threads that read title memory back, by default the machine's less one (2 to 6) |
 | `VICTORY_LATE_WAITS=1` | a blocking wait sleeps on to the next tick even when it could end on the tick that passed: the old pacing, for a title that polls instead of waiting |
+| `VICTORY_PACE=none` | a blocking wait answers at once, so our frame clock stops pacing and only the title's own limiter does: the experiment that tells a title doubling its frame time from one that is merely slow |
 | `VICTORY_DSTORAGE_WORKERS=<n>` | threads that read the package, by default four per core up to 64 |
 | `VICTORY_DSTORAGE_STAGING_MB=<n>` | bytes of package reads in flight, 32 MiB by default (the console's staging buffer), so a bigger pool has more to fill |
 | `VICTORY_PIPELINE_WAIT_SHARED=0` | give each thread its own 500 ms pipeline wait per frame instead of sharing one budget across the frame |
