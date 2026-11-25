@@ -483,6 +483,35 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// What a submission's deferred copies into title memory cost, by stage,
+/// since the last frame line: the steps' own time ([`ST_STEP`], the number
+/// [`PREPARING`] is given) and the parts of it measured apart — the flush
+/// before a copy ([`ST_FLUSH`], which [`Batch::update`] counts again as its
+/// own), opening the guards over what the copy writes ([`ST_GUARD`]), the
+/// kernel's read ([`ST_READ`]), noting the bytes written ([`ST_WROTE`]) —
+/// the copies and the runs of them ([`ST_STEPS`], [`ST_RUNS`]), and the
+/// host copies a step forced up to date ([`ST_UPDATE`]).
+///
+/// The frame line's `copies` is `ST_UPDATE` plus the steps' time with
+/// `ST_FLUSH` inside it: the flush of a copy is refresh work once, and
+/// counted twice while it ran inside the step that asked for it.
+static COPY_STAGES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+const ST_STEP: usize = 0;
+const ST_FLUSH: usize = 1;
+const ST_GUARD: usize = 2;
+const ST_READ: usize = 3;
+const ST_WROTE: usize = 4;
+const ST_UPDATE: usize = 5;
+const ST_STEPS: usize = 6;
+const ST_RUNS: usize = 7;
+
+/// Adds `micros` to a [`COPY_STAGES`] entry.
+fn staged(at: usize, micros: u64) {
+    COPY_STAGES[at].fetch_add(micros, Ordering::Relaxed);
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -3113,6 +3142,192 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// The deferred steps from `at` that one copy group runs: the `Copy` there
+/// and those after it whose destination carries on exactly where the one
+/// before it ended, and where the group's destination ends. Nothing is
+/// recorded between steps that follow each other, so a group is run in the
+/// order it was recorded and the copies of it still go one after another,
+/// each failing on its own; what a group shares is the work around them —
+/// the flush before them, opening the guards over all their destinations,
+/// noting them written, and their accounting. Returned with their count, at
+/// least `1`.
+///
+/// The bytes a group moves are the bytes a submission used to move in the
+/// same order: a copy's source may lie in another's destination, and the
+/// copies are not reordered for that (the title emits tile mappings whose
+/// destinations are adjacent, ~0.5 KB each, 13,034 of them a frame).
+fn copy_run(steps: &[Step], at: usize) -> (usize, usize) {
+    let Some(&Step::Copy(dst, _, len)) = steps.get(at) else {
+        return (1, 0);
+    };
+    let mut end = dst.saturating_add(len);
+    let mut taken = 1;
+    while let Some(&Step::Copy(next, _, len)) = steps.get(at + taken) {
+        if len == 0 || next != end {
+            break;
+        }
+        end = end.saturating_add(len);
+        taken += 1;
+    }
+    (taken, end)
+}
+
+/// Runs the copies of the group at `at` ([`copy_run`]), one after another, to
+/// `copy` (destination, source, bytes); the bytes they move. The group's
+/// guards are opened over all of their destinations before this is called.
+fn group_copies(steps: &[Step], at: usize, mut copy: impl FnMut(usize, usize, usize)) -> usize {
+    let (taken, _) = copy_run(steps, at);
+    let mut bytes = 0;
+    for step in &steps[at..at + taken] {
+        // `copy_run` took the copies only, and the one at `at` is one.
+        let Step::Copy(dst, src, len) = *step else {
+            break;
+        };
+        copy(dst, src, len);
+        bytes += len;
+    }
+    bytes
+}
+
+/// Where a copy's time went, for [`COPY_STAGES`]: nanoseconds in the
+/// kernel's read.
+#[derive(Default)]
+struct Stages {
+    read: u64,
+}
+
+/// What a copy into title memory has opened for it before it reads.
+enum Open {
+    /// Not into title memory (`Step::Fill`, and the reads out of it).
+    Nothing,
+    /// Into title memory, on its own: the guards over its range, when the
+    /// copy is made ([`crate::watch::writing`]).
+    Own,
+    /// Into title memory, in a group that opened the guards over the whole
+    /// group's destination before its first copy ([`copy_run`]).
+    Group,
+}
+
+impl Open {
+    /// Whether the copy writes title memory.
+    fn writes_title(&self) -> bool {
+        !matches!(self, Open::Nothing)
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{Step, copy_run, group_copies};
+
+    /// The steps of a title's copies, as recorded, into a "title memory" that
+    /// starts at `base`: (destination, source, bytes) as offsets.
+    fn steps_of(base: usize, copies: &[(usize, usize, usize)]) -> Vec<Step> {
+        copies
+            .iter()
+            .map(|&(dst, src, len)| Step::Copy(base + dst, base + src, len))
+            .collect()
+    }
+
+    /// Every byte a run's copies write is inside the one range the run opens
+    /// its guard over and notes as written, and that range starts where the
+    /// first copy's destination does: no copy of a run is left unopened or
+    /// unreported, and none reaches outside what was opened for it.
+    fn covered(steps: &[Step], at: usize) -> bool {
+        let (taken, end) = copy_run(steps, at);
+        let first = match &steps[at] {
+            &Step::Copy(first, _, _) => first,
+            _ => return true,
+        };
+        (0..taken).all(|k| match &steps[at + k] {
+            &Step::Copy(dst, _, len) => dst >= first && dst <= end && len <= end - dst,
+            _ => false,
+        })
+    }
+
+    /// A run takes the copies whose destinations carry on from one another,
+    /// and stops at a gap in them or at any other step: a `Fill`, or work
+    /// recorded between two copies of the title's, which must not be moved
+    /// past either of them.
+    #[test]
+    fn a_run_is_the_copies_whose_destinations_carry_on() {
+        let base = 0x1000;
+        let mut steps = steps_of(base, &[(0, 400, 16), (16, 950, 16), (32, 980, 16)]);
+        steps.push(Step::Fill(0, base + 900, 16));
+        steps.extend(steps_of(base, &[(64, 900, 16), (80, 900, 16)]));
+        steps.push(Step::Host(Box::new(|| {})));
+        steps.extend(steps_of(base, &[(64, 900, 16)]));
+        steps.extend(steps_of(base, &[(0, 400, 16), (32, 950, 16)]));
+
+        assert_eq!(copy_run(&steps, 0), (3, base + 48));
+        assert!(covered(&steps, 0));
+        // A fill ends the run whether or not destinations would carry on: the
+        // step after it is no `Copy` at all.
+        assert_eq!(copy_run(&steps, 3), (1, 0));
+        // Two copies whose destinations carry on are one run of two.
+        assert_eq!(copy_run(&steps, 4), (2, base + 96));
+        assert!(covered(&steps, 4));
+        // Work recorded between two copies ends a run: it may read what they
+        // wrote, and must not be moved past them.
+        assert_eq!(copy_run(&steps, 6), (1, 0));
+        assert_eq!(copy_run(&steps, 7), (1, base + 80));
+        // Destinations that do not carry on are two runs, not one.
+        assert_eq!(copy_run(&steps, 8), (1, base + 16));
+        assert_eq!(copy_run(&steps, 9), (1, base + 48));
+        assert!(covered(&steps, 8));
+        // Past the end: one step, nothing to cover.
+        assert_eq!(copy_run(&steps, steps.len()), (1, 0));
+    }
+
+    /// A run moves the bytes the copies would move one at a time, in the
+    /// order they were recorded: a copy that reads another's destination sees
+    /// what it wrote, so nothing may be reordered or merged into one copy.
+    #[test]
+    fn a_run_moves_the_same_bytes_in_the_same_order() {
+        let base = 0x2000;
+        let mut title: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        // The second copy reads what the first wrote.
+        let steps = steps_of(base, &[(0, 400, 16), (16, 8, 16), (32, 416, 16)]);
+        let one_by_one = {
+            let mut bytes = title.clone();
+            for step in &steps {
+                let &Step::Copy(dst, src, len) = step else { continue };
+                let (dst, src) = (dst - base, src - base);
+                assert!(dst + len <= bytes.len() && src + len <= bytes.len());
+                bytes.copy_within(src..src + len, dst);
+            }
+            bytes
+        };
+        let mut at = 0;
+        let mut order = Vec::new();
+        while at < steps.len() {
+            let (taken, end) = copy_run(&steps, at);
+            let first = match &steps[at] {
+                &Step::Copy(dst, _, _) => dst,
+                _ => unreachable!("a run starts at a copy"),
+            };
+            // The one range the run opens its guard over.
+            assert!(end >= first && covered(&steps, at));
+            group_copies(&steps, at, |dst, src, len| {
+                order.push(dst - base);
+                title.copy_within(src - base..src - base + len, dst - base);
+            });
+            at += taken;
+        }
+        assert_eq!(title, one_by_one);
+        assert_eq!(order, [0, 16, 32]);
+    }
+
+    /// A run that takes one copy takes the copy before it in the same place:
+    /// the group's bytes are the step's own when nothing carries on.
+    #[test]
+    fn a_run_of_one_is_the_step_itself() {
+        let base = 0x3000;
+        let steps = steps_of(base, &[(0, 400, 16), (100, 400, 16)]);
+        assert_eq!(group_copies(&steps, 0, |_, _, _| {}), 16);
+        assert_eq!(group_copies(&steps, 1, |_, _, _| {}), 16);
+    }
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
@@ -5662,22 +5877,64 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let list = self.deferred();
+        let steps: &[Step] = &list.copies;
+        let mut at = 0;
+        while at < steps.len() {
+            let step = &steps[at];
             let started = std::time::Instant::now();
+            // The steps this one runs, and the microseconds of them a flush
+            // took (it is refresh work, counted apart as well).
+            let mut taken = 1;
+            let mut flushed = 0;
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, _, _) => {
+                    // The copies whose destinations carry on from this one's,
+                    // run as one group: one flush before them (a copy writes
+                    // title memory, so what is pending reads it first), the
+                    // guards opened over all of their destinations, one note
+                    // that the bytes were written, and each copy in the order
+                    // it was recorded — the same bytes in the same order as
+                    // one copy at a time, with the work around them shared.
+                    let (run, end) = copy_run(steps, at);
+                    taken = run;
+                    let flushing = std::time::Instant::now();
+                    batch.title_written();
+                    flushed = flushing.elapsed().as_micros() as u64;
+                    staged(ST_FLUSH, flushed);
+                    // shortcut: one opening of the guards for the run, not one
+                    // a copy. The blocks opened are exactly the ones each
+                    // copy would open (its destination's), so nothing beyond
+                    // what the run writes is opened; only the moment moves
+                    // earlier, and a title write into a later copy's block in
+                    // the microseconds between the two copies is not seen by
+                    // the guards — the run writes those bytes itself anyway.
+                    let guarding = std::time::Instant::now();
+                    crate::watch::writing(dst, end - dst);
+                    staged(ST_GUARD, guarding.elapsed().as_micros() as u64);
+                    let mut stages = Stages::default();
+                    let copying = std::time::Instant::now();
+                    let bytes = group_copies(steps, at, |at, from, bytes| {
+                        copy_staged(at as *mut u8, from as *const u8, bytes, Open::Group, Some(&mut stages));
+                    });
+                    crate::flow::put(
+                        crate::flow::Site::IntoTitle,
+                        bytes,
+                        copying.elapsed().as_nanos() as u64,
+                    );
+                    staged(ST_READ, stages.read / 1000);
+                    // With the submission's one asking: the journal learns it.
+                    let noting = std::time::Instant::now();
+                    crate::watch::wrote(dst, end - dst);
+                    staged(ST_WROTE, noting.elapsed().as_micros() as u64);
+                    staged(ST_STEPS, run as u64);
+                    staged(ST_RUNS, 1);
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        add(C::Copies, run as u64);
+                        add(C::CopyBytes, bytes as u64);
                     }
-                    batch.title_written();
-                    let begun = std::time::Instant::now();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    crate::flow::took(crate::flow::Site::IntoTitle, len, begun);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
-                    len
+                    bytes
                 }
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5697,6 +5954,7 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
+                    at += 1;
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -5714,6 +5972,7 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    at += 1;
                     continue;
                 }
                 Step::Rectangles(work) => {
@@ -5723,6 +5982,7 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    at += 1;
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -5740,16 +6000,24 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
+                    at += 1;
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    at += 1;
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            at += taken;
+            // What the steps cost, the flush of a copy aside: `Batch::update`
+            // counts its own time too, and it ran inside this step's flush.
+            let step_us = started.elapsed().as_micros() as u64;
+            let own = step_us.saturating_sub(flushed);
+            staged(ST_STEP, own);
+            PREPARING[0].fetch_add(own, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
@@ -5831,6 +6099,7 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        staged(ST_UPDATE, us);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -5887,6 +6156,36 @@ impl Batch {
     }
 }
 
+/// The copies the title recorded into its own memory, split by what they
+/// cost, logged after each frame line: the frame line's `copies` is one
+/// number for five costs, and 13,034 copies of ~0.5 KB a frame are their own
+/// per-call work rather than the bytes they move (`flow` says which call
+/// site moved the bytes; this says what the call cost around them).
+fn copy_stages_line(frames: f64) {
+    let v: Vec<u64> = COPY_STAGES.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    if v[ST_STEPS] == 0 {
+        return;
+    }
+    let steps = v[ST_STEPS] as f64 / frames;
+    let runs = v[ST_RUNS] as f64 / frames;
+    let ms = |at: usize| v[at] as f64 / 1e3 / frames;
+    let rest = v[ST_STEP].saturating_sub(v[ST_GUARD] + v[ST_READ] + v[ST_WROTE]) as f64 / 1e3 / frames;
+    tracing::info!(
+        "the copies into title memory, per frame: {steps:.0} copies in {runs:.0} runs of {:.1} (a run's destinations carry on \
+         from one another), {:.2} ms in the steps they made: {:.2} flushing before them, {:.2} opening their guards, {:.2} the \
+         kernel's reads, {:.2} noting them written, {:.2} the rest; {:.2} ms refreshing the host copies a step forced, which \
+         runs inside that step's flush and is counted in the frame line's copies twice",
+        steps / runs.max(1.0),
+        ms(ST_STEP),
+        ms(ST_FLUSH),
+        ms(ST_GUARD),
+        ms(ST_READ),
+        ms(ST_WROTE),
+        rest,
+        ms(ST_UPDATE),
+    );
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -5897,6 +6196,14 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let open = if title_dst { Open::Own } else { Open::Nothing };
+    copy_staged(dst, src, len, open, None);
+}
+
+/// [`copy_mapped`], with what is opened for the copy before it reads, and a
+/// place to time the kernel's read into (the deferred copies' stage line).
+fn copy_staged(dst: *mut u8, src: *const u8, len: usize, open: Open, stages: Option<&mut Stages>) {
+    let title_dst = open.writes_title();
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -5928,13 +6235,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded.
+    // The kernel writes the destination: it must not be guarded. A copy in a
+    // group finds them opened over the whole group's destination already.
+    if matches!(open, Open::Own) {
         crate::watch::writing(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    let timed = stages.as_ref().map(|_| std::time::Instant::now());
     let whole = read(src, dst, len);
+    if let (Some(stages), Some(timed)) = (stages, timed) {
+        stages.read += timed.elapsed().as_nanos() as u64;
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6693,6 +7005,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         crate::flow::line(frames);
+        copy_stages_line(frames);
         {
             let [passes, pieces, compares, ranges, range_pieces] =
                 [0, 1, 2, 3, 4].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

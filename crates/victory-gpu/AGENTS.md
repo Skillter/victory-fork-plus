@@ -138,6 +138,13 @@
   at what rate. `copystat` names the ranges and the memory kinds behind them.
   A new copy path adds its bytes there, or the frame line's `copies` and
   `copying back` stay unattributed.
+- The title's buffer copies are deferred steps, run at submission in runs
+  whose destinations carry on (`host::copy_run`): a run shares one flush
+  before it, one opening of the guards over all it writes, one
+  `watch::wrote` and one `flow` figure, and its copies still go one after
+  another, in the order recorded, each failing on its own. The line after
+  `flow`'s splits what they cost (`host::copy_stages_line`), because the
+  frame line's `copies` is one number for five costs.
 - Most `shortcut:` comments live here. Read the one next to the code you
   touch; it states what the approximation costs.
 

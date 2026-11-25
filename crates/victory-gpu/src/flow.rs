@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 #[derive(Clone, Copy)]
 pub(crate) enum Site {
     /// Host memory into title memory at submission (`host`'s `Step::Copy`
-    /// and `Step::Fill`, through `copy_mapped`).
+    /// and `Step::Fill`, through `copy_mapped`; the copies of one run, whose
+    /// destinations carry on, are one figure).
     IntoTitle,
     /// Title memory into a host copy in place, under the guard that stops
     /// the runtime changing what it shows (`Shadow::read_in_place`).
