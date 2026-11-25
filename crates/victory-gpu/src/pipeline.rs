@@ -483,6 +483,119 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     drops
 }
 
+/// Why a draw or dispatch was not run on the host, one per site that drops
+/// work. Every build counts these ([`note_drop_reason`]) so an ordinary
+/// release build can say why it dropped work; the formatted detail behind
+/// them (shader hashes, missing stages, root arguments) stays
+/// diagnostics-only, next to the frame listing that prints it.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) enum DropReason {
+    /// Nothing was bound, or the host pipeline for what was bound is not
+    /// made (its shaders do not translate, or it is still being made), or
+    /// the host list would not run the draw with it.
+    NoPipeline,
+    /// The pipeline does not suit the draw made with it: another kind
+    /// (compute against a graphics draw), or another topology.
+    Mismatch,
+    /// A stage of the ray-tracing structure builder, which is off.
+    BuilderOff,
+    /// Everything was set, and the host list still refused the pipeline.
+    Unbindable,
+    /// The indirect arguments lie outside title buffers.
+    Arguments,
+    /// The count of indirect arguments lies outside title buffers.
+    Count,
+    /// No host signature for the indirect kind.
+    Signature,
+    /// Mesh dispatches are switched off (`VICTORY_MESH_TEST=skip`).
+    MeshOff,
+    /// Indirect arguments that could not be clamped to their window.
+    Unbounded,
+}
+
+#[cfg(windows)]
+impl DropReason {
+    /// How many reasons there are: one drop counter each.
+    const COUNT: usize = 9;
+    /// Every reason, in counter order: what the release stats line walks.
+    #[cfg(not(feature = "diagnostics"))]
+    const ALL: [DropReason; DropReason::COUNT] = [
+        DropReason::NoPipeline,
+        DropReason::Mismatch,
+        DropReason::BuilderOff,
+        DropReason::Unbindable,
+        DropReason::Arguments,
+        DropReason::Count,
+        DropReason::Signature,
+        DropReason::MeshOff,
+        DropReason::Unbounded,
+    ];
+
+    /// The reason as the stats line prints it, after
+    /// "dropped N.N/frame without a host pipeline: ". Diagnostics builds
+    /// print the formatted reasons instead, so this is not compiled there.
+    #[cfg(not(feature = "diagnostics"))]
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            DropReason::NoPipeline => {
+                "nothing bound, or the bound pipeline could not be made or run"
+            }
+            DropReason::Mismatch => "the pipeline does not suit the draw",
+            DropReason::BuilderOff => {
+                "a stage of the ray-tracing structure builder, which is off"
+            }
+            DropReason::Unbindable => "the pipeline could not be bound to the list",
+            DropReason::Arguments => "the indirect arguments lie outside title buffers",
+            DropReason::Count => "the indirect count lies outside title buffers",
+            DropReason::Signature => "no host signature for the indirect kind",
+            DropReason::MeshOff => "mesh dispatches are switched off (VICTORY_MESH_TEST=skip)",
+            DropReason::Unbounded => "indirect arguments that could not be clamped",
+        }
+    }
+
+    /// The counter holding this reason: its place in the declaration, which
+    /// `ALL` repeats (the test below holds the two together).
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Draws and dispatches dropped in every build, one counter a reason. A
+/// drop costs one relaxed add, with no lock and no text made, so a release
+/// build can afford the breakdown on its stats line.
+#[cfg(windows)]
+static DROP_COUNTS: [std::sync::atomic::AtomicU64; DropReason::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; DropReason::COUNT];
+
+/// Counts a draw or dispatch dropped for `reason`, in every build: the site
+/// has the reason as a static string already, so nothing is built here.
+/// Diagnostics builds keep the same calls (one relaxed add) and print the
+/// formatted reasons `note_why` counts instead.
+#[cfg(windows)]
+pub(crate) fn note_drop_reason(reason: DropReason) {
+    DROP_COUNTS[reason.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The reasons drops were counted for since the last call, most first,
+/// leaving out the reasons with none (release builds).
+#[cfg(all(windows, not(feature = "diagnostics")))]
+pub(crate) fn take_drop_reasons() -> Vec<(DropReason, u64)> {
+    let mut counts: Vec<(DropReason, u64)> = DropReason::ALL
+        .into_iter()
+        .map(|reason| {
+            let n = DROP_COUNTS[reason.index()].swap(0, std::sync::atomic::Ordering::Relaxed);
+            (reason, n)
+        })
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    // Ties keep an order of their own, as `take_drops` does for the frame
+    // listing: a printout that reorders itself between reports is read as a
+    // change.
+    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.text().cmp(b.0.text())));
+    counts
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
@@ -732,6 +845,18 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// The counters are indexed by declaration order, so `ALL` must hold
+    /// every reason in it: a reason inserted in the middle of the enum and
+    /// left out of `ALL` would be reported as the count of the one before.
+    #[cfg(all(windows, not(feature = "diagnostics")))]
+    #[test]
+    fn drop_reasons_are_all_and_in_order() {
+        assert_eq!(super::DropReason::ALL.len(), super::DropReason::COUNT);
+        for (i, reason) in super::DropReason::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), i);
+        }
     }
 
     use super::*;

@@ -22,6 +22,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
+use crate::pipeline::DropReason;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
@@ -1460,15 +1461,36 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
-        if !room {
+        let no_room = crate::resource::room().err();
+        if no_room.is_some() {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-            once!("textures picked by index: the card has no room for more; they wait");
         }
-        let mut refused = 0;
+        let mut refused = 0u64;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // Ranges of that memory the queue could not hold are thrown away
+        // whole (`descriptor::host::remapped`): once a window, with the
+        // count and the cap, so a texture written and never re-read says so.
+        {
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let dropped = crate::descriptor::host::RANGES_DROPPED.swap(0, Ordering::Relaxed);
+            let now = crate::host::now_ms();
+            let last = LAST.load(Ordering::Relaxed);
+            if dropped > 0
+                && now >= last + 5_000
+                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                tracing::info!(
+                    "textures picked by index: {dropped} ranges of memory mapped, unmapped or written under texture views were \
+                     dropped in the last {} s: the queue holds {} of them ({} KiB), and they were not taken before it filled; \
+                     the slots there are looked at when they are due",
+                    now.saturating_sub(last).max(1) / 1000,
+                    crate::descriptor::host::RANGE_CAP,
+                    (crate::descriptor::host::RANGE_CAP * std::mem::size_of::<(u64, u64)>()) >> 10
+                );
+            }
+        }
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -1553,7 +1575,7 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
-            if !room {
+            if no_room.is_some() {
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -1625,6 +1647,29 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             host.texture_slot_done(index, write, again);
         }
+        // Why the card has no room, once a window (the stats line's 5 s),
+        // with how many slots were refused since the last line and how many
+        // are still due: the rule that refused and its numbers, not a line
+        // per texture (a 7.5-minute run said only "they wait").
+        if let Some(why) = no_room {
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            static REFUSED: AtomicU64 = AtomicU64::new(0);
+            let refused = REFUSED.fetch_add(refused, Ordering::Relaxed) + refused;
+            let now = crate::host::now_ms();
+            let last = LAST.load(Ordering::Relaxed);
+            if now >= last + 5_000
+                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                REFUSED.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    "textures picked by index: no room for more in the last {} s: {refused} slots refused since the last line, \
+                     {} still due; {}",
+                    now.saturating_sub(last).max(1) / 1000,
+                    HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
+                    why.why()
+                );
+            }
+        }
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -1676,6 +1721,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(DropReason::BuilderOff);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -1689,6 +1735,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(DropReason::NoPipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -1702,6 +1749,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(DropReason::Unbindable);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -1820,6 +1868,11 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(if mesh_test() == 1 {
+                DropReason::MeshOff
+            } else {
+                DropReason::NoPipeline
+            });
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2148,6 +2201,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(DropReason::NoPipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2249,6 +2303,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_reason(DropReason::NoPipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2282,11 +2337,20 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Why an indirect execution was not run: counted in every build (one
+        // relaxed add, nothing built), and spelled out for the frame
+        // listing in diagnostics builds, which is where the formatted
+        // reason is worth its allocation.
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let why = |reason: DropReason, what: &'static str| {
+            crate::pipeline::note_drop_reason(reason);
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why =
+            |reason: DropReason, _what: &'static str| crate::pipeline::note_drop_reason(reason);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::note_drop_reason(DropReason::NoPipeline);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -2315,22 +2379,27 @@ impl State {
             _ => false,
         };
         if !matches_kind {
-            why(&format!(
-                "pipeline mismatch (compute {}, mesh {}, topology {})",
+            // The only reason whose text needs the pipeline's own kinds:
+            // counted here, and spelled out for the frame listing that
+            // diagnostics builds print.
+            crate::pipeline::note_drop_reason(DropReason::Mismatch);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "indirect kind {kind}: pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
-            why("arguments outside title buffers");
+            why(DropReason::Arguments, "arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why(DropReason::Count, "count outside title buffers");
                     return false;
                 }
             },
@@ -2340,11 +2409,14 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why(DropReason::Signature, "no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
-            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            why(
+                DropReason::MeshOff,
+                "mesh draws are switched off (VICTORY_MESH_TEST=skip)",
+            );
             return false;
         }
         // A window of records clamped in one pass (`windows`): for single
@@ -2411,7 +2483,10 @@ impl State {
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    why(
+                        DropReason::Unbounded,
+                        "not bounded (no clamp, or arguments not 4-byte aligned)",
+                    );
                     return false;
                 };
                 self.host_pipeline = 0;
@@ -2436,7 +2511,7 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &bounded);
-            why("prepare failed");
+            why(DropReason::Unbindable, "prepare failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]

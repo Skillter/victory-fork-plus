@@ -321,6 +321,192 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// The length of a stage's code; `None` when the stage is absent.
+fn stage_len(code: &D3D12_SHADER_BYTECODE) -> Option<usize> {
+    (!code.pShaderBytecode.is_null()).then_some(code.BytecodeLength)
+}
+
+/// The combinations D3D12's documentation calls invalid, as far as a
+/// description names them: a build without the debug layer gets
+/// `E_INVALIDARG` and nothing else, so the reason has to be read from the
+/// values the description holds. A `diagnostics` build has the debug
+/// layer's own message as well.
+fn invalid_combinations(
+    stage: (&'static str, Option<usize>),
+    root: bool,
+    dsv: DXGI_FORMAT,
+    depth: &D3D12_DEPTH_STENCIL_DESC,
+    sample_mask: u32,
+    samples: DXGI_SAMPLE_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+) -> Vec<String> {
+    let (name, code) = stage;
+    let mut why = Vec::new();
+    if !root {
+        why.push("no root signature".to_owned());
+    }
+    if code.is_none() {
+        why.push(format!("no {name} shader"));
+    }
+    if samples.Count == 0 {
+        why.push("a sample count of zero".to_owned());
+    }
+    if sample_mask == 0 {
+        why.push("a sample mask of zero".to_owned());
+    }
+    if targets.NumRenderTargets > 8 {
+        why.push("more than eight render targets".to_owned());
+    }
+    let used = targets.NumRenderTargets.min(8) as usize;
+    if used > 0 && targets.RTFormats[..used].iter().all(|f| *f == DXGI_FORMAT_UNKNOWN) {
+        why.push("no render target format for its render targets".to_owned());
+    }
+    if dsv == DXGI_FORMAT_UNKNOWN && depth.DepthEnable.as_bool() {
+        why.push("a depth test with no DSV format".to_owned());
+    }
+    if dsv == DXGI_FORMAT_UNKNOWN && depth.StencilEnable.as_bool() {
+        why.push("a stencil test with no DSV format".to_owned());
+    }
+    why
+}
+
+/// Whether a depth or stencil test runs while the description names no DSV
+/// format: D3D12 refuses that, and with no depth attachment the test reads
+/// nothing, so the fallback below cannot change the pixels.
+fn depth_without_attachment(depth: &D3D12_DEPTH_STENCIL_DESC, dsv: DXGI_FORMAT) -> bool {
+    dsv == DXGI_FORMAT_UNKNOWN && (depth.DepthEnable.as_bool() || depth.StencilEnable.as_bool())
+}
+
+/// `depth` with the test off and nothing written: what a description with
+/// no DSV format means, since it has no attachment for the test to read or
+/// the write to reach.
+fn without_depth(depth: D3D12_DEPTH_STENCIL_DESC) -> D3D12_DEPTH_STENCIL_DESC {
+    D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable: false.into(),
+        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+        StencilEnable: false.into(),
+        ..depth
+    }
+}
+
+/// The blend state as D3D12 validates it: per render target, whether it
+/// blends and what it writes.
+fn blend_writes(blend: &D3D12_BLEND_DESC, targets: u32) -> String {
+    let used = (targets.min(8) as usize).max(1);
+    blend.RenderTarget[..used]
+        .iter()
+        .map(|t| format!("{}{:x}", u8::from(t.BlendEnable.as_bool()), t.RenderTargetWriteMask))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The fields D3D12 validates of a graphics description, in one line, with
+/// the combinations it documents as invalid: its `E_INVALIDARG` names no
+/// parameter by itself.
+fn log_graphics_refusal(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, shaders: &[Arc<Shader>]) {
+    let targets = D3D12_RT_FORMAT_ARRAY {
+        RTFormats: desc.RTVFormats,
+        NumRenderTargets: desc.NumRenderTargets,
+    };
+    let used = desc.NumRenderTargets.min(8) as usize;
+    tracing::warn!(
+        ?shaders,
+        vs = ?stage_len(&desc.VS),
+        ps = ?stage_len(&desc.PS),
+        gs = ?stage_len(&desc.GS),
+        hs = ?stage_len(&desc.HS),
+        ds = ?stage_len(&desc.DS),
+        root_signature = desc.pRootSignature.is_some(),
+        targets = desc.NumRenderTargets,
+        formats = format_args!("{:?}", &desc.RTVFormats[..used]),
+        dsv_format = desc.DSVFormat.0,
+        depth = desc.DepthStencilState.DepthEnable.as_bool(),
+        depth_write = desc.DepthStencilState.DepthWriteMask.0,
+        stencil = desc.DepthStencilState.StencilEnable.as_bool(),
+        samples = desc.SampleDesc.Count,
+        quality = desc.SampleDesc.Quality,
+        sample_mask = format_args!("{:#x}", desc.SampleMask),
+        strip_cut = desc.IBStripCutValue.0,
+        topology = desc.PrimitiveTopologyType.0,
+        blend = blend_writes(&desc.BlendState, desc.NumRenderTargets),
+        input_elements = desc.InputLayout.NumElements,
+        node_mask = desc.NodeMask,
+        flags = desc.Flags.0,
+        suspected = ?invalid_combinations(
+            ("vertex", stage_len(&desc.VS)),
+            desc.pRootSignature.is_some(),
+            desc.DSVFormat,
+            &desc.DepthStencilState,
+            desc.SampleMask,
+            desc.SampleDesc,
+            &targets,
+        ),
+        "host graphics pipeline refused: the fields D3D12 validates"
+    );
+}
+
+/// As [`log_graphics_refusal`], for a mesh pipeline: the same fields, from
+/// the stream's state.
+fn log_mesh_refusal(
+    ms: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    depth: &D3D12_DEPTH_STENCIL_DESC,
+    shaders: &[Arc<Shader>],
+) {
+    let used = g.targets.NumRenderTargets.min(8) as usize;
+    tracing::warn!(
+        ?shaders,
+        ms = ?stage_len(&ms),
+        ps = ?stage_len(&ps),
+        root_signature = true,
+        targets = g.targets.NumRenderTargets,
+        formats = format_args!("{:?}", &g.targets.RTFormats[..used]),
+        dsv_format = g.depth_format.0,
+        depth = depth.DepthEnable.as_bool(),
+        depth_write = depth.DepthWriteMask.0,
+        stencil = depth.StencilEnable.as_bool(),
+        samples = g.samples.Count,
+        quality = g.samples.Quality,
+        sample_mask = format_args!("{:#x}", g.sample_mask),
+        topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
+        blend = blend_writes(&g.blend, g.targets.NumRenderTargets),
+        node_mask = 0,
+        flags = 0,
+        suspected = ?invalid_combinations(
+            ("mesh", stage_len(&ms)),
+            true,
+            g.depth_format,
+            depth,
+            g.sample_mask,
+            g.samples,
+            &g.targets,
+        ),
+        "host mesh pipeline refused: the fields D3D12 validates"
+    );
+}
+
+/// As [`log_graphics_refusal`], for a compute description: a shader, a root
+/// signature, a node mask and flags are all D3D12 validates there.
+fn log_compute_refusal(desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC, shaders: &[Arc<Shader>]) {
+    let mut suspected = Vec::new();
+    if desc.pRootSignature.is_none() {
+        suspected.push("no root signature".to_owned());
+    }
+    if stage_len(&desc.CS).is_none() {
+        suspected.push("no compute shader".to_owned());
+    }
+    tracing::warn!(
+        ?shaders,
+        cs = ?stage_len(&desc.CS),
+        root_signature = desc.pRootSignature.is_some(),
+        node_mask = desc.NodeMask,
+        flags = desc.Flags.0,
+        suspected = ?suspected,
+        "host compute pipeline refused: the fields D3D12 validates"
+    );
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -523,7 +709,11 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    log_compute_refusal(&desc, shaders);
                     host.log_messages();
+                    // Nothing here is ours to change: the shader, the root
+                    // signature and the flags are what the title asked for,
+                    // so a compute pipeline the host refuses is dropped.
                     return None;
                 }
             };
@@ -550,19 +740,48 @@ impl HostPipeline {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
-            // looked up again.
-            let name = super::library::name(
-                "mesh triangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            // looked up again. A fallback's name says what it changed of
+            // the state, so no stored pipeline is found by another state's
+            // name.
+            let mesh_name = |fallback: &str| {
+                let state = if fallback.is_empty() {
+                    state.clone()
+                } else {
+                    format!("{state} {fallback}")
+                };
+                super::library::name(
+                    "mesh triangles",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                    &state,
+                )
+            };
+            let attempt = |depth: D3D12_DEPTH_STENCIL_DESC, name: &str| {
+                mesh_pipeline(&host.device, &root, code(0), code(1), g, depth, name)
+            };
+            let pso = match attempt(g.depth, &mesh_name("")) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    log_mesh_refusal(code(0), code(1), g, &g.depth, shaders);
                     host.log_messages();
-                    return None;
+                    if !depth_without_attachment(&g.depth, g.depth_format) {
+                        return None;
+                    }
+                    // The one fallback that cannot change the pixels: no
+                    // DSV format means no attachment for the test to read.
+                    tracing::warn!(
+                        ?shaders,
+                        "a mesh pipeline retried with the depth and stencil tests off: its description names no DSV format"
+                    );
+                    match attempt(without_depth(g.depth), &mesh_name("depth off (no DSV format)")) {
+                        Ok(pso) => pso,
+                        Err(e) => {
+                            tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                            host.log_messages();
+                            return None;
+                        }
+                    }
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
@@ -627,20 +846,29 @@ impl HostPipeline {
             ..Default::default()
         };
         // A pipeline with the geometry stage has a name of its own in the
-        // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
-                "graphics rectangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
-                &state,
-            ),
-            None => super::library::name(
-                "graphics",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            ),
+        // library; the others keep theirs. `fallback` says what a retry
+        // changed of the state, so that no stored pipeline is found by
+        // another state's name.
+        let name = |gs: Option<&Vec<u8>>, fallback: &str| {
+            let state = if fallback.is_empty() {
+                state.clone()
+            } else {
+                format!("{state} {fallback}")
+            };
+            match gs {
+                Some(gs) => super::library::name(
+                    "graphics rectangles",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                    &state,
+                ),
+                None => super::library::name(
+                    "graphics",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                    &state,
+                ),
+            }
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
             super::library::pipeline(
@@ -651,14 +879,32 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let mut made = make(&desc, &name(rect_gs.as_ref(), ""));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            made = make(&desc, &name(None, ""));
+        }
+        if made.is_err() {
+            log_graphics_refusal(&desc, shaders);
+            if depth_without_attachment(&desc.DepthStencilState, desc.DSVFormat) {
+                // The one fallback that cannot change what the title draws:
+                // with no DSV format there is no depth attachment, so the
+                // depth and stencil tests have nothing to read and their
+                // writes nothing to reach. Every other check D3D12 makes
+                // (a format or sample count the host lacks, a blend or
+                // target count it cannot take) would be answered by
+                // changing the pixels, so a refusal there stays a refusal.
+                tracing::warn!(
+                    ?shaders,
+                    "a host pipeline retried with the depth and stencil tests off: its description names no DSV format"
+                );
+                desc.DepthStencilState = without_depth(desc.DepthStencilState);
+                made = make(&desc, &name(rect_gs.as_ref(), "depth off (no DSV format)"));
+            }
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -737,6 +983,9 @@ fn mesh_pipeline(
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    // `g`'s, or with the tests off when a retry has established that the
+    // description names no DSV format.
+    depth: D3D12_DEPTH_STENCIL_DESC,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
@@ -764,7 +1013,7 @@ fn mesh_pipeline(
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, depth),
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
@@ -920,12 +1169,73 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, g.depth, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, g.depth, &name).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
+        );
+    }
+
+    /// What a refusal is read from: the combination D3D12 documents as
+    /// invalid is named, and the fallback turns off exactly that, leaving
+    /// the rest of the state as the title asked for it.
+    #[test]
+    fn a_refusal_names_what_is_invalid_and_the_fallback_turns_only_tests_off() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // The default state has the depth test on and names no DSV.
+        let why = invalid_combinations(
+            ("vertex", Some(8)),
+            true,
+            g.depth_format,
+            &g.depth,
+            g.sample_mask,
+            g.samples,
+            &g.targets,
+        );
+        assert_eq!(why, ["a depth test with no DSV format"]);
+        assert!(depth_without_attachment(&g.depth, g.depth_format));
+        let off = without_depth(g.depth);
+        assert!(!off.DepthEnable.as_bool());
+        assert_eq!(off.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
+        assert!(!off.StencilEnable.as_bool());
+        assert_eq!(off.DepthFunc, g.depth.DepthFunc);
+        assert_eq!(off.FrontFace.StencilFunc, g.depth.FrontFace.StencilFunc);
+        // With a depth attachment of its own nothing is wrong and nothing
+        // is turned off: the test reads the title's depth.
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!depth_without_attachment(&g.depth, g.depth_format));
+        assert!(
+            invalid_combinations(
+                ("vertex", Some(8)),
+                true,
+                g.depth_format,
+                &g.depth,
+                g.sample_mask,
+                g.samples,
+                &g.targets,
+            )
+            .is_empty()
+        );
+        // What a description cannot have at all is named as well.
+        assert_eq!(
+            invalid_combinations(
+                ("vertex", None),
+                false,
+                g.depth_format,
+                &g.depth,
+                0,
+                g.samples,
+                &g.targets,
+            ),
+            [
+                "no root signature",
+                "no vertex shader",
+                "a sample mask of zero"
+            ]
         );
     }
 }

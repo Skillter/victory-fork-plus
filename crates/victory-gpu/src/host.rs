@@ -5750,7 +5750,10 @@ struct Presenter {
 }
 
 /// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
+/// every few seconds. The counters the logged block shows are taken once, in
+/// that block, so each of them is summed over every second since the last
+/// block; [`Meter::reported`] and [`Meter::reported_drawn`] are the frames
+/// and the draws of those seconds, which is what they are divided by.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -5758,6 +5761,9 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frames presented and draws made since `logged`.
+    reported: u32,
+    reported_drawn: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -5765,13 +5771,16 @@ struct Meter {
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
+        let drawn = crate::draw::drawn();
         Meter {
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
-            drawn: crate::draw::drawn(),
+            drawn,
             logged: now,
+            reported: 0,
+            reported_drawn: drawn,
             caption: None,
         }
     }
@@ -5783,6 +5792,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.reported += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -5797,19 +5807,6 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
@@ -5856,24 +5853,53 @@ impl Meter {
                 );
             }
         }
-        // Passes over the heap's buffer views for shaders that pick them by index.
-        let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
-        let picked_ms =
-            crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
-        // Copies between depth textures and their colour twins, each way.
-        let [twin_to_depth, twin_to_colour] =
-            [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-        // Depth planes drawn from their twins.
-        let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-        // Copies in the card's memory (`crate::shadow::cards`).
-        let card = crate::shadow::card_stats();
-        #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        // The block printed every few seconds covers every second since the
+        // last one printed, so the counters it shows are taken here, once: each
+        // is summed over all of those seconds and divided by the frames they
+        // presented. Taken a second at a time, only the last second's counts
+        // were shown, against the whole window's frame count.
+        let printed = self.logged.elapsed();
+        if printed >= std::time::Duration::from_secs(5) {
+            let frames = f64::from(self.reported);
+            let fps = frames / printed.as_secs_f64();
+            let ms = printed.as_secs_f64() * 1000.0 / frames;
+            let draws = (drawn - self.reported_drawn) as f64 / frames;
+            (self.logged, self.reported, self.reported_drawn) =
+                (std::time::Instant::now(), 0, drawn);
+            // Of a frame, ms preparing submissions and ms waiting for the GPU.
+            let [cpu, gpu] = [0, 1].map(|i| {
+                SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            });
+            let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+                let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+            });
+            let [back_ms, back_mb] = [0, 1].map(|i| {
+                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+            });
+            let dropped = crate::draw::take_dropped() as f64 / frames;
+            // Why those were dropped, split by reason: counted in every build,
+            // and taken over the same window as the count above.
+            #[cfg(not(feature = "diagnostics"))]
+            let drop_reasons = crate::pipeline::take_drop_reasons();
+            let indirect = crate::list::take_indirect() as f64 / frames;
+            // Passes over the heap's buffer views for shaders that pick them by index.
+            let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
+            let picked_ms =
+                crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            // Copies between depth textures and their colour twins, each way.
+            let [twin_to_depth, twin_to_colour] = [2, 3].map(|i| {
+                crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames
+            });
+            // Depth planes drawn from their twins.
+            let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+            // Copies in the card's memory (`crate::shadow::cards`).
+            let card = crate::shadow::card_stats();
+            #[cfg(feature = "diagnostics")]
+            let slow = crate::watch::slow_asks();
+            // Over the same frames as the counts above.
+            #[cfg(feature = "diagnostics")]
+            let drops = crate::pipeline::take_drops();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -5954,6 +5980,18 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // The reasons, in the builds that do not print the frame listing:
+            // the same drops, split by why each was not run. Diagnostics
+            // builds split them by the detail worth formatting there (shader
+            // hashes, missing stages), so they are not printed there too.
+            #[cfg(not(feature = "diagnostics"))]
+            for (why, n) in drop_reasons.iter().take(10) {
+                tracing::info!(
+                    "dropped {:.1}/frame without a host pipeline: {}",
+                    *n as f64 / frames,
+                    why.text()
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -6128,10 +6166,28 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        // The swap chain's buffers are the size of the frame the title hands
+        // us, whatever the window is: one `CopyResource` puts it in a back
+        // buffer, and D3D12 copies at one size only — there is no scaled
+        // copy. So the scale into the window is the host GPU's, at present.
+        // A console title sizes its window to its render target (4K), and
+        // that window is fitted to the screen when it does not fit, so the
+        // two sizes differ on most screens.
+        // shortcut: a swap chain of the window's size would cut the present's
+        // copy to a quarter (4K into a 2K window) and let a shader of ours
+        // filter the scale; it needs a fullscreen pipeline this path has none
+        // of, so DXGI scales each present instead, keeping the frame's aspect
+        // (a window of another shape is letterboxed, not stretched into).
+        let client = client_size(hwnd);
+        // Which way the host GPU scales a frame into the window: stretching
+        // fills a window of the frame's shape exactly, and a window of another
+        // shape is letterboxed instead, so the picture never distorts. Chosen
+        // once, here: a scaling mode cannot change without a new swap chain.
+        let letterbox = client.is_some_and(|c| !same_shape(c, (width, height)));
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let desc = |scaling: DXGI_SCALING| DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -6141,15 +6197,59 @@ impl Host {
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
+                Scaling: scaling,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let made = factory
+                .CreateSwapChainForHwnd(
+                    &self.queue,
+                    hwnd,
+                    &desc(if letterbox {
+                        DXGI_SCALING_ASPECT_RATIO_STRETCH
+                    } else {
+                        DXGI_SCALING_STRETCH
+                    }),
+                    None,
+                    None,
+                )
+                .or_else(|e| {
+                    if !letterbox {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        "no swap chain that keeps the frame's aspect; stretching into the window"
+                    );
+                    factory.CreateSwapChainForHwnd(
+                        &self.queue,
+                        hwnd,
+                        &desc(DXGI_SCALING_STRETCH),
+                        None,
+                        None,
+                    )
+                })?;
+            let swap_chain = made.cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            if let Some((window_width, window_height)) = client
+                .filter(|&(w, h)| (w, h) != (width, height))
+            {
+                tracing::info!(
+                    width,
+                    height,
+                    window_width,
+                    window_height,
+                    scaled = if letterbox {
+                        "letterboxed to the frame's aspect"
+                    } else {
+                        "stretched to the window"
+                    },
+                    "the window is another size than the frame: the host GPU scales each present into it (the title renders \
+                     the size of the console's display mode, VICTORY_DISPLAY_MODE=WxH)"
+                );
+            }
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -6161,6 +6261,44 @@ impl Host {
                 meter: Meter::new(),
             })
         }
+    }
+}
+
+/// A window's client area: the outside of the swap chain's buffers is the
+/// window, and what DXGI scales them into.
+fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+    let mut rect = RECT::default();
+    // SAFETY: a window handle, and a rectangle that receives its client area.
+    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    (w > 0 && h > 0).then_some((w as u32, h as u32))
+}
+
+/// Whether two sizes have the same shape near enough that scaling between them
+/// neither distorts the picture nor bars it: within a half percent, which is
+/// less than a pixel of bar at any window size that matters.
+fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
+    let (left, right) = (
+        u64::from(a.0) * u64::from(b.1),
+        u64::from(a.1) * u64::from(b.0),
+    );
+    left.abs_diff(right) * 200 <= left.max(right)
+}
+
+#[cfg(test)]
+mod present_tests {
+    use super::same_shape;
+
+    /// One shape, whichever way round the sizes are given; a window of another
+    /// shape is not.
+    #[test]
+    fn shapes_match_within_half_a_percent() {
+        assert!(same_shape((3840, 2160), (3840, 2160)));
+        assert!(same_shape((1994, 1122), (3840, 2160)));
+        assert!(same_shape((2560, 1600), (1920, 1200)));
+        assert!(!same_shape((1024, 768), (3840, 2160)));
+        assert!(!same_shape((3440, 1440), (3840, 2160)));
+        assert!(!same_shape((1995, 1080), (3840, 2160)));
     }
 }
 

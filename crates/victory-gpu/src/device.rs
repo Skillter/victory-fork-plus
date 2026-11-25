@@ -346,14 +346,25 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// The largest word of a description that could be a size rather than a
+/// pointer: shader code and counts are small, and the title's own memory
+/// lies far above this.
+const SMALL: u64 = 0x1_0000;
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// pipeline, silently.
+///
+/// The layout of neither description is established: 128 bytes whose first
+/// word points at another 128 is neither the PC graphics description
+/// (0x2b0, shaders inline) nor the compute one (0x60), and no call so far
+/// says which word is the root signature, which is a stage and which a
+/// size. So both still fail, with `out` null; the first calls log what
+/// writing them needs: the words in hex, every word that reads as a small
+/// size, and the block it points at, which tells a byte count from a small
+/// pointer (a size beside a pointer is what a shader stage looks like).
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -388,11 +399,31 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // A word that reads as a small size — a byte count, a count of
+        // words, a stage mask — is the only thing in a block of unknown
+        // words that says what the rest is, and the block it points at says
+        // whether it is a size of that block or a small pointer. Each one
+        // is followed.
+        let small: Vec<(usize, u64)> = description
+            .iter()
+            .flatten()
+            .copied()
+            .enumerate()
+            .filter(|&(_, word)| word != 0 && word <= SMALL)
+            .collect();
+        let pointed: Vec<String> = small
+            .iter()
+            .filter_map(|&(at, word)| {
+                words(word as usize).map(|block| format!("[{at}] {word:#x} -> {block:x?}"))
+            })
+            .collect();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            small = format_args!("{small:x?}"),
+            pointed = format_args!("{pointed:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }

@@ -187,6 +187,22 @@ impl Spans {
     }
 }
 
+/// Ranges kept until a pass takes them.
+pub(crate) const RANGE_CAP: usize = 1 << 18;
+
+/// Ranges of memory dropped because a pass did not take them before
+/// [`RANGE_CAP`] filled, since the last window line about them (the pass
+/// takes them: `draw.rs` `heap_textures`). [`STALE`] 2 holds the count
+/// since the start.
+pub(crate) static RANGES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// What the queue costs: 16 bytes a range, 4 MiB at `RANGE_CAP`. (It was
+// 512 KiB at 32,768, and a 7.5-minute run dropped 131,072 ranges of 131,072:
+// the queue filled between passes and every range in it was thrown away.
+// The array is a `Vec`: growth leaves up to as much again spare.)
+const _: () = assert!(RANGE_CAP * size_of::<(u64, u64)>() == 4 << 20);
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -221,8 +237,6 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -236,10 +250,11 @@ pub(crate) fn remapped(at: usize, len: usize) {
         last.1 = end;
         return;
     }
-    if ranges.len() >= MOST {
+    if ranges.len() >= RANGE_CAP {
         // No pass runs (no shader that picks textures by index is bound):
         // the slots there are looked at when they are due, as before.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        RANGES_DROPPED.fetch_add(ranges.len() as u64, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));

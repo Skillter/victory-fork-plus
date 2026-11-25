@@ -70,7 +70,7 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
-/// at most every 20 s).
+/// at most every `SAVE_EVERY`, a minute).
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
@@ -431,7 +431,9 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most.
+/// Title pipelines listed for an early start, at most. Past this the list
+/// stops recording: a name first drawn after it is filled is not listed, and
+/// the next run loses that early start. [`note_used`] says so once.
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
@@ -565,7 +567,12 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // A save rewrites the whole library, whichever pipeline was added: the
+    // 222 MiB one a 32-minute session left (2,853 pipelines) went out every
+    // 20 s through the warm-up, and run 60's second save wrote 1,352 MB. A
+    // minute does the same work three times less often, and a crash still
+    // costs at most the pipelines of the last minute.
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -626,14 +633,22 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
+        Ok(()) => {
+            // The library's size, not just what this save wrote: a save with
+            // nothing new in the library (bytes 0, only the early list
+            // written) still shows the blob growing run by run.
+            // SAFETY: a plain query on a live library.
+            let size = unsafe { library.library.GetSerializedSize() };
+            tracing::info!(
+                bytes,
+                library = size,
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            )
+        }
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
 }
@@ -700,9 +715,24 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
+    // Said once, when the list is full: before this the list stopped
+    // recording in silence, and a run past 8,192 pipelines simply started
+    // fewer of them early the next time.
+    static FULL: AtomicBool = AtomicBool::new(false);
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if set.len() >= EARLY_MAX {
+        // A listed name still counts as wanted; only a new one is dropped.
+        if !set.contains(key) && !FULL.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                cap = EARLY_MAX,
+                file = EARLY_FILE,
+                "the early pipeline list is full: the pipelines first drawn from now on are not listed for an early start"
+            );
+        }
+        return;
+    }
+    if set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }

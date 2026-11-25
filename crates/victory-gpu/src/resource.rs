@@ -1354,18 +1354,90 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Bytes of host copies of textures the title fills that may always be
+/// made ([`room`]).
+#[cfg(windows)]
+const FLOOR: u64 = 2 << 30;
+
+/// The same, when the card does not say its budget.
+#[cfg(windows)]
+const WITHOUT_BUDGET: u64 = 4 << 30;
+
+/// Why [`room`] refused more host copies of textures the title fills, with
+/// the numbers of the rule that refused: the pass over textures picked by
+/// index prints one line of them a window (`draw.rs` `heap_textures`), not
+/// one per texture.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct NoRoom {
+    /// The bytes of host copies of textures the title fills alive then
+    /// ([`KINDS`] 1).
+    filled: u64,
+    /// The card's budget and use of its own memory, then of the PC's memory
+    /// it shares (`crate::host::Host::video_memory`), if it says.
+    card: Option<[u64; 4]>,
+    /// Which rule refused.
+    rule: Rule,
+}
+
+/// The rule [`room`] refused by.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Rule {
+    /// `VICTORY_TEXTURE_BUDGET_MB`: a limit on those copies' bytes.
+    Limit(u64),
+    /// Nine tenths of the card's budget, past [`FLOOR`].
+    Budget,
+    /// The card does not say its budget, and the copies hold
+    /// [`WITHOUT_BUDGET`] bytes.
+    Unsaid,
+}
+
+#[cfg(windows)]
+impl NoRoom {
+    /// The rule that refused and the numbers it refused on: for the line
+    /// that says why textures picked by index wait.
+    pub(crate) fn why(&self) -> String {
+        let filled = self.filled >> 20;
+        let card = match self.card {
+            Some([budget, used, ..]) => format!(
+                "the card: {} MB budget, {} MB in use, {} MB available",
+                budget >> 20,
+                used >> 20,
+                budget.saturating_sub(used) >> 20
+            ),
+            None => "the card does not say its budget".to_owned(),
+        };
+        match self.rule {
+            Rule::Limit(limit) => format!(
+                "VICTORY_TEXTURE_BUDGET_MB allows {} MB of them and {filled} MB are alive; {card}",
+                limit >> 20
+            ),
+            Rule::Budget => format!(
+                "the card is at nine tenths of its budget ({filled} MB of them alive, past the {} MB floor); {card}",
+                FLOOR >> 20
+            ),
+            Rule::Unsaid => format!(
+                "{filled} MB of them alive, past the {} MB floor, and {} MB is all they may hold without a budget from the card: {card}",
+                FLOOR >> 20,
+                WITHOUT_BUDGET >> 20
+            ),
+        }
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
 /// instead). Past the budget the system moves the card's memory into the
-/// PC's, which ended runs 20 and 24.
+/// PC's, which ended runs 20 and 24. `Err` names the rule that refused and
+/// carries its numbers ([`NoRoom::why`]); the rules themselves are as
+/// before.
 #[cfg(windows)]
-pub(crate) fn room() -> bool {
+pub(crate) fn room() -> Result<(), NoRoom> {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1373,14 +1445,32 @@ pub(crate) fn room() -> bool {
     });
     let filled = KINDS[1].load(Relaxed);
     if let Some(limit) = limit {
-        return filled < limit;
+        if filled < limit {
+            return Ok(());
+        }
+        // Asked for only when a rule refuses: the pass asks every pass.
+        let card = crate::host::host().and_then(|h| h.video_memory());
+        return Err(NoRoom { filled, card, rule: Rule::Limit(limit) });
     }
     if filled < FLOOR {
-        return true;
+        return Ok(());
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
-        None => filled < WITHOUT_BUDGET,
+    let card = crate::host::host().and_then(|h| h.video_memory());
+    match card {
+        Some([budget, used, ..]) => {
+            if used < budget / 10 * 9 {
+                Ok(())
+            } else {
+                Err(NoRoom { filled, card, rule: Rule::Budget })
+            }
+        }
+        None => {
+            if filled < WITHOUT_BUDGET {
+                Ok(())
+            } else {
+                Err(NoRoom { filled, card: None, rule: Rule::Unsaid })
+            }
+        }
     }
 }
 
@@ -3406,5 +3496,27 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// The line that says why textures picked by index wait names the rule
+    /// that refused and the numbers it refused on.
+    #[cfg(windows)]
+    #[test]
+    fn the_room_line_names_the_rule_that_refused() {
+        let card = [12 << 30, 11 << 30, 0, 0];
+        let limit = NoRoom { filled: 9 << 30, card: Some(card), rule: Rule::Limit(8 << 30) };
+        let text = limit.why();
+        assert!(text.contains("VICTORY_TEXTURE_BUDGET_MB"), "{text}");
+        assert!(text.contains("allows 8192 MB"), "{text}");
+        assert!(text.contains("9216 MB are alive"), "{text}");
+        assert!(text.contains("12288 MB budget, 11264 MB in use, 1024 MB available"), "{text}");
+        let budget = NoRoom { filled: 9 << 30, card: Some(card), rule: Rule::Budget };
+        let text = budget.why();
+        assert!(text.contains("nine tenths"), "{text}");
+        assert!(text.contains("past the 2048 MB floor"), "{text}");
+        let unsaid = NoRoom { filled: 5 << 30, card: None, rule: Rule::Unsaid };
+        let text = unsaid.why();
+        assert!(text.contains("does not say its budget"), "{text}");
+        assert!(text.contains("4096 MB is all they may hold"), "{text}");
     }
 }
