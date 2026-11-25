@@ -39,7 +39,10 @@ Largest crate. Change it with the pipeline order in mind (`emit::translate`):
 halves (`v_mbcnt`, lane exchange, masks used as data, shared LDS without
 guards). Otherwise they become 32-lane. `VICTORY_WAVE_WIDE=1` opts into the
 riskier widening retry; `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` let
-`victory translate` emulate a smaller host.
+`victory translate` emulate a smaller host. `emit::lanes` holds that analysis
+(`wave_local`, `lane_uniform`, `lds_meetings`) and the per-block "every lane
+runs this" scan (`all_lane_blocks`), which `emit::lower` re-exports; `lower.rs`
+is near its 512 KiB policy limit, so new analysis belongs in its own module.
 
 ## Mesh output counts
 
