@@ -8572,7 +8572,7 @@ impl Host {
         // (`crate::present`). Everything below reads the size, the format and
         // the state of whichever it is, so the fallback is shown exactly as a
         // frame of its size would be.
-        present_window_line((desc.Width as u32, desc.Height as u32), since);
+        present_window_line((desc.Width as u32, desc.Height), since);
         let mut picture = texture;
         let mut picture_state = state;
         let mut picture_this = None;
@@ -8971,7 +8971,7 @@ fn present_window_line(frame: (u32, u32), since: &crate::present::Since) {
     /// Presents between lines, at ~20 fps a line every two seconds.
     const EVERY: u32 = 40;
     static PRESENTS: AtomicU32 = AtomicU32::new(0);
-    if PRESENTS.fetch_add(1, Ordering::Relaxed) % EVERY != 0 {
+    if !PRESENTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(EVERY) {
         return;
     }
     let (width, height) = frame;
