@@ -302,6 +302,16 @@ Card windows are not the lever: `VICTORY_CARD_WINDOWS_MB=3072` gave 2.4 fps
 the default of none, on 5,044 against 4,518 draws a frame
 (`run-20261125-063925.log` against `-062758.log`).
 
+The relay's fetch wait is not queue depth: at 194 ms a frame
+(`run-20261125-095133.log`) its 110–120 ms is the card's work queued ahead of
+the fetch, which goes on the in-order queue's tail at the landing, so a frame's
+card work is waited for once wherever the landing splits it —
+`VICTORY_LATE_WAIT_LISTS=32` takes the wait to 49 ms and the frame to 219 ms
+(the submitting thread's own wait 59 → 123 ms, the card's idle 49 → 73 ms,
+`run-20261125-100317.log`), and `VICTORY_COPY_QUEUE=1` only moves it into
+preparing, 96 → 168 ms, 205 ms a frame (`run-20261125-101119.log`); measured
+25 Nov.
+
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run
