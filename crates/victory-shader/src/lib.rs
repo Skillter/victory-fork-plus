@@ -5,11 +5,15 @@
 //! `XDAT` table before it indexing blobs after it, among them `xbop`
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
+//!
+//! Some containers have no `DXIL` part at all: their program is the `FSPX`
+//! package in the `ACCC` part ([`fspx`]).
 
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+pub mod fspx;
 pub mod gfx10;
 pub mod io;
 pub mod ir;

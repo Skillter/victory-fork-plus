@@ -84,6 +84,20 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// Waits that ended, and the microseconds they slept, since the last call
+/// to [`pacing`] (all threads together). A menu that runs at half its rate
+/// waits two ticks a frame; this is where that shows.
+static PACING: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The frame waits since the last call: how many, and the microseconds they
+/// slept between them.
+pub(crate) fn pacing() -> (u64, u64) {
+    (
+        PACING[0].swap(0, Ordering::Relaxed),
+        PACING[1].swap(0, Ordering::Relaxed),
+    )
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -135,6 +149,16 @@ pub(crate) extern "system" fn wait(
     // time-out shorter than a tick) answer as before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `VICTORY_PACE=none` answers a blocking wait at once: our clock stops
+    // pacing and a title with its own frame limiter paces alone. This is the
+    // experiment that tells a title doubling its frames from one that is slow.
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NONE.get_or_init(|| {
+        std::env::var_os("VICTORY_PACE").is_some_and(|v| v.eq_ignore_ascii_case("none"))
+    }) {
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+        wait = Duration::ZERO;
+    }
     if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
         && limit >= wait
         && tick > last(kind).load(Ordering::Relaxed) + 1
@@ -207,30 +231,45 @@ mod tests {
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
+        // Waits that end on a tick: a 2 ms interval, so that the few waits
+        // below take a tick each. What each returns is asserted, not how
+        // many ticks the machine took to schedule the test: with 16 tests
+        // running beside it, a stall of several intervals is ordinary and
+        // skips ticks (which a late wait is meant to do, `VICTORY_LATE_WAITS`).
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
         let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
+        assert!(second > first, "a wait for the same event takes a tick of its own");
         assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
-        // Tokens count frames, a frame started early on a time-out too.
+        let mut next = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
+        assert_eq!(next, second + 1, "tokens count frames");
+        assert!(LAST[0].load(Ordering::Relaxed) >= 3);
+
+        // A poll that times out, and a frame started early on a time-out:
+        // an interval of two seconds, so that no tick comes while the test
+        // decides, whatever the load. The clock restarts now.
+        assert_eq!(set_interval(null, null, 2_000_000, 1, 0), S_OK);
+        let mut polled = 0;
+        assert_eq!(
+            wait(null, 0, 0, std::ptr::null(), 0, &mut polled),
+            TIMEOUT,
+            "a poll of no time-out answered before its tick came"
+        );
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
         assert_eq!(
             wait(null, 0, 0, std::ptr::null(), flags, &mut early),
             TIMEOUT
         );
-        let mut next = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
-        assert!(LAST[0].load(Ordering::Relaxed) >= 2);
+        assert_eq!(early, next + 1, "a frame begun on a time-out has its token");
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip takes a tick of its own.
         const FLIP: u32 = 2;
         assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
         let mut token = 0;
@@ -244,7 +283,10 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        assert!(
+            flips.windows(2).all(|w| w[1] > w[0]),
+            "a flip wait ended on the tick another ended on: {flips:?}"
+        );
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);

@@ -27,6 +27,25 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that takes the title address out of a buffer view it picks from the view
+/// heap at an index it computes (`RootType::ResourceHeap`): a raw buffer of
+/// [`SLOT_VIEW_ADDRESSES_COUNT`] dwords, two per heap slot, the low 32 bits
+/// of the title address of the buffer view at slot `i` below its bits from
+/// 32 up. Both 0 for a slot that holds no buffer view, or one whose memory
+/// the host does not have: the code then reads no address, rather than one
+/// the host made up.
+/// The console's descriptor holds that address, and the code the title's
+/// ray-tracing programs run takes it as a pointer to the structure behind
+/// the view (`super::USER_VIEW_ADDRESS` names the same dwords of a table,
+/// where the slot is a compile-time constant); the host's own record of a
+/// heap slot (`descriptor::record`) names no address, and where the code's
+/// index is a runtime value the compile has nothing to fold.
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
+/// Dwords of the [`SLOT_VIEW_ADDRESSES`] buffer: two per heap slot, for the
+/// slots [`SLOT_STRIDES_COUNT`] names.
+pub const SLOT_VIEW_ADDRESSES_COUNT: u32 = SLOT_STRIDES_COUNT * 2;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -90,6 +109,8 @@ pub(crate) struct Types {
     pub i1: Ty,
     pub i32: Ty,
     pub f32: Ty,
+    /// `v_cvt_f32_f64` only: nothing else may make a double.
+    pub f64: Ty,
     pub handle: Ty,
     pub props: Ty,
     pub bind: Ty,
@@ -176,6 +197,7 @@ impl Shader {
         let i8 = m.int(8);
         let i32 = m.int(32);
         let f32 = m.float();
+        let f64 = m.double();
         let i8p = m.ptr(i8);
         let handle = m.named_struct("dx.types.Handle", vec![i8p]);
         let props = m.named_struct("dx.types.ResourceProperties", vec![i32, i32]);
@@ -193,6 +215,7 @@ impl Shader {
                 i1,
                 i32,
                 f32,
+                f64,
                 handle,
                 props,
                 bind,
@@ -445,6 +468,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // One interpolation mode per register: D3D interpolates a row one
+        // way (the reads of its elements can ask for two, see
+        // [`container::share_row_interp`]).
+        for elements in [&mut self.inputs, &mut self.outputs, &mut self.prims] {
+            container::share_row_interp(elements);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -779,6 +808,8 @@ impl Shader {
 
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
+            // (`Doubles` is SFI0 bit 0 but ShaderFlags bit 2; dxil.dll
+            // compares both against the module.)
             features |= 0x1;
         }
         if self.flags & flags::STENCIL_REF != 0 {

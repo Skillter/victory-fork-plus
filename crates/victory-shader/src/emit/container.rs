@@ -115,6 +115,88 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// Registers of four components a stage's signature may use (D3D12).
+pub(crate) const SIGNATURE_ROWS: u32 = 32;
+
+/// The elements packed into one register must declare one interpolation
+/// mode: D3D interpolates a row one way, and `dxil.dll` rejects a signature
+/// whose row mixes modes (`signature element ... has interpolation mode
+/// that differs from another element packed into the same row`), the
+/// largest class of invalid DXIL the title's programs hit.
+///
+/// The console interpolated a register channel by channel, per instruction
+/// (`v_interp_*` reads one channel and takes its barycentric from a VGPR),
+/// so its own signature and code ask for two modes in one row, which D3D
+/// cannot express. `shortcut:` the element that owns the row keeps it —
+/// the lowest-column element the program reads, else its lowest-column
+/// element — and an element that cannot take the owner's mode moves to a
+/// register of its own, carrying its column with it, so no read loses the
+/// mode its arithmetic was lowered for. Only `row` may move: the emitted
+/// `loadInput`/`attributeAtVertex` calls name the element id and its
+/// column, and D3D12 links stages by semantic, never by register.
+///
+/// An integer component type cannot be interpolated at all (the validator
+/// rejects modes 2..=7 on one), so such an element is `constant`. A row
+/// holding a system value is not unpacked — D3D supplies that element, the
+/// title does not declare it — so it takes one mode, the flat one when an
+/// integer element is in it. An element the program does not read takes its
+/// row's mode rather than a register, and with no register left the row
+/// falls back to one mode.
+pub(crate) fn share_row_interp(elements: &mut [SigElement]) {
+    let can_take = |e: &SigElement, mode: u8| mode <= 1 || e.comp == 9;
+    for e in elements.iter_mut() {
+        if !can_take(e, e.interp) {
+            e.interp = 1;
+        }
+    }
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut next = rows.last().map_or(0, |&r| r + 1);
+    for row in rows {
+        let mut of: Vec<usize> = (0..elements.len())
+            .filter(|&i| elements[i].row == Some(row))
+            .collect();
+        of.sort_by_key(|&i| (elements[i].col, i));
+        if of.len() < 2 || of.iter().all(|&i| elements[i].interp == elements[of[0]].interp) {
+            continue;
+        }
+        let owner = of
+            .iter()
+            .copied()
+            .find(|&i| elements[i].usage != 0)
+            .unwrap_or(of[0]);
+        let mode = elements[owner].interp;
+        let moves = of
+            .iter()
+            .filter(|&&i| elements[i].interp != mode)
+            .filter(|&&i| elements[i].usage != 0 || !can_take(&elements[i], mode))
+            .count() as u32;
+        // A row holding a system value, or one with no register left,
+        // declares a single mode: the flat one when an integer element is
+        // in it.
+        if of.iter().any(|&i| elements[i].kind != 0) || next + moves > SIGNATURE_ROWS {
+            let flat = of.iter().any(|&i| elements[i].comp != 9);
+            let mode = if flat { 1 } else { mode };
+            for i in of {
+                elements[i].interp = mode;
+            }
+            continue;
+        }
+        for i in of {
+            if i == owner || elements[i].interp == mode {
+                continue;
+            }
+            if elements[i].usage == 0 && can_take(&elements[i], mode) {
+                elements[i].interp = mode;
+            } else {
+                elements[i].row = Some(next);
+                next += 1;
+            }
+        }
+    }
+}
+
 /// The most a mesh shader's outputs may take, in bytes (D3D12).
 pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
 
@@ -399,6 +481,77 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signature element, as the emitter keeps one: `row`/`col` its place
+    /// in the register, `usage` the components read (inputs).
+    fn el(row: Option<u32>, col: u8, cols: u8, interp: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: row.unwrap_or(0),
+            kind: 0,
+            comp: 9,
+            interp,
+            row,
+            col,
+            cols,
+            usage,
+            half: false,
+        }
+    }
+
+    /// D3D interpolates a register one way, so two elements packed into one
+    /// row must declare one interpolation mode; the console interpolated
+    /// channel by channel, so its reads ask for two (245 of the title's
+    /// programs failed validation for mixing them in a row).
+    #[test]
+    fn elements_packed_into_one_row_share_their_interpolation_mode() {
+        // A read of the packed second element (linear, 4) behind an unread
+        // owner (perspective, 2), a row of its own, and one with no
+        // register (a system value).
+        let mut els = [
+            el(Some(3), 0, 2, 2, 0),
+            el(Some(3), 2, 2, 4, 0b0100),
+            el(Some(4), 0, 4, 2, 0),
+            el(None, 0, 3, 3, 0),
+        ];
+        share_row_interp(&mut els);
+        // The row takes the mode the read asked for: the arithmetic of the
+        // element the program reads is what the declaration must match.
+        assert_eq!(els[0].interp, 4, "the unread owner takes the row's mode");
+        assert_eq!(els[1].interp, 4, "the read keeps its own");
+        assert_eq!(els[2].interp, 2, "a row of its own is untouched");
+        assert_eq!(els[3].interp, 3, "no register, untouched");
+        // Two reads that disagree (the console could, D3D cannot): the
+        // element that owns the row, the lowest column, keeps it and the
+        // other read moves to a register of its own, carrying its column,
+        // so neither read loses the mode its arithmetic was lowered for.
+        let mut els = [el(Some(1), 0, 4, 2, 0b1111), el(Some(1), 2, 2, 4, 0b1100)];
+        share_row_interp(&mut els);
+        assert_eq!([els[0].interp, els[1].interp], [2, 4], "both reads keep");
+        assert_eq!([els[0].row, els[1].row], [Some(1), Some(2)], "the second moved");
+        assert_eq!(els[1].col, 2, "a moved element keeps its column");
+        // An integer element cannot be interpolated at all: it is constant,
+        // and a row whose other element interpolates gives it its own.
+        let mut els = [el(Some(0), 0, 2, 2, 0b0011), el(Some(0), 2, 2, 2, 0)];
+        els[1].comp = 5;
+        share_row_interp(&mut els);
+        assert_eq!([els[0].interp, els[1].interp], [2, 1], "the integer is flat");
+        assert_eq!(els[1].row, Some(1), "and unpacked");
+        // With no register left (32 a stage) the row declares one mode, the
+        // flat one when an integer element is in it.
+        let mut els = [el(Some(31), 0, 2, 2, 0b0011), el(Some(31), 2, 2, 4, 0b1100)];
+        share_row_interp(&mut els);
+        assert_eq!([els[0].interp, els[1].interp], [2, 2], "no register left");
+        let mut els = [el(Some(31), 0, 2, 2, 0b0011), el(Some(31), 2, 2, 4, 0b1100)];
+        els[1].comp = 4;
+        share_row_interp(&mut els);
+        assert_eq!([els[0].interp, els[1].interp], [1, 1], "an integer flattens all");
+        // Rows that already agree are left alone, and elements a program
+        // never reads keep their kind's default when their row agrees.
+        let mut els = [el(Some(0), 0, 4, 1, 0), el(Some(0), 2, 2, 1, 0)];
+        share_row_interp(&mut els);
+        assert_eq!([els[0].interp, els[1].interp], [1, 1]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

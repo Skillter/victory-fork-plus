@@ -10,8 +10,11 @@
 //!   value whether anything reads the new one or not).
 //! - [`FOLD`]: integer arithmetic on constants is done here, and identities
 //!   (`x + 0`, `x & -1`, a select between a value and itself, a cast there
-//!   and back, a join of one value) give their operand. Float arithmetic is
-//!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
+//!   and back, a join of one value) give their operand. A float operation is
+//!   never an identity: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
+//!   Two float constants are folded only where the exact result is those
+//!   bits ([`fold_float`]), so no rounding or flush-to-zero mode can tell
+//!   the folded constant from the instruction.
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
 //!   result (a descriptor handle made again in each block, an index clamped
@@ -97,6 +100,27 @@ struct Tree {
     preds: Vec<Vec<usize>>,
 }
 
+/// The comparison that holds exactly when `p` does with its operands
+/// swapped: the same two values, tested the other way round. Every predicate
+/// the translator emits has one.
+fn mirror(p: u8) -> Option<u8> {
+    Some(match p {
+        // Floats: the greater and less bits trade places, the equality,
+        // order and unordered ones stay (`OEQ a, b` is `OEQ b, a`).
+        0..=15 => (p & !6) | (p << 1 & 4) | (p >> 1 & 2),
+        pred::EQ | pred::NE => p,
+        pred::IUGT => pred::IULT,
+        pred::IUGE => pred::IULE,
+        pred::IULT => pred::IUGT,
+        pred::IULE => pred::IUGE,
+        pred::SGT => pred::SLT,
+        pred::SGE => pred::SLE,
+        pred::SLT => pred::SGT,
+        pred::SLE => pred::SGE,
+        _ => return None,
+    })
+}
+
 /// The comparison that holds exactly when `p` does not (floats 0-15,
 /// integers 32-41).
 fn opposite(p: u8) -> u8 {
@@ -141,6 +165,79 @@ fn signed(bits: u32, x: u64) -> i64 {
     } else {
         x as i64
     }
+}
+
+/// The exact result of a float `op` on two single constants, when every
+/// rounding and flush-to-zero mode a console or a host may run gives those
+/// bits. `None` where one could differ:
+///
+/// - a NaN operand (which NaN of two the hardware answers with is its
+///   choice, by operand) or a NaN result;
+/// - a subnormal operand or result (a console may flush it to zero);
+/// - a result that had to round, so that the answer is the mode's;
+/// - a sum or difference whose double form already lost the smaller operand,
+///   which no check on the double can see;
+/// - a zero sum whose sign the mode picks.
+///
+/// The fold therefore asks nothing about the mode where it happens: it
+/// returns a value only where nearest, up, down and toward-zero all give
+/// those bits.
+///
+/// A product of two singles is exact in a double (24 and 24 bits are 48, and
+/// 53 hold them; the product of the two exponents stays inside the double's
+/// range). A sum is not: with exponents more than 53 apart the double rounds
+/// the smaller operand away (`1e20 + 1.0` is `1e20` again), so the single
+/// compared back with it is the same number and the check passes. The
+/// error-free transform of TwoSum (Knuth) recovers what the double dropped;
+/// a nonzero error means the double is not the sum.
+fn fold_float(op: Bin, a: u32, b: u32) -> Option<u32> {
+    let flush = |f: f32| f != 0.0 && f.abs() < f32::MIN_POSITIVE;
+    let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+    if x.is_nan() || y.is_nan() || flush(x) || flush(y) {
+        return None;
+    }
+    let (x, y) = (f64::from(x), f64::from(y));
+    let sum = match op {
+        // A difference is the sum with the second operand negated, and
+        // negating a double is exact in every mode (it flips the zero too,
+        // which is why `-0.0 - +0.0` is `-0.0` and `+0.0 - +0.0` is not).
+        Bin::Add => (x, y),
+        Bin::Sub => (x, -y),
+        Bin::Mul => {
+            let exact = x * y;
+            let single = exact as f32;
+            if f64::from(single) != exact || single.is_nan() || flush(single) {
+                return None;
+            }
+            return Some(single.to_bits());
+        }
+        _ => return None,
+    };
+    let (x, y) = sum;
+    if !x.is_finite() || !y.is_finite() {
+        // An infinity and a finite number sum to the infinity; two infinities
+        // of one sign to it too. Of two signs the sum is a NaN, and which
+        // one is the hardware's.
+        let sum = x + y;
+        if sum.is_nan() {
+            return None;
+        }
+        return Some((sum as f32).to_bits());
+    }
+    let sum = x + y;
+    let t = sum - x;
+    let error = (x - (sum - t)) + (y - t);
+    let single = sum as f32;
+    if error != 0.0 || f64::from(single) != sum || single.is_nan() || flush(single) {
+        return None;
+    }
+    // A zero is `+0.0` under every mode but round-down, except where the
+    // arithmetic fixes it: two zeros of one sign sum to that zero, and a
+    // cancellation or a pair of opposite signs does not.
+    if single == 0.0 && !(x == 0.0 && y == 0.0 && x.is_sign_negative() == y.is_sign_negative()) {
+        return None;
+    }
+    Some(single.to_bits())
 }
 
 /// What `v` stands for after the replacements so far.
@@ -403,6 +500,15 @@ impl Module {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
+    /// A float constant's bits.
+    fn float_k(&self, v: V) -> Option<u32> {
+        let V::Const(i) = v else { return None };
+        match self.consts[i as usize].1 {
+            Const::Float(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
     /// The value instruction `i` is known to have without it, if any: a
     /// constant or an earlier value. May instead give `i` simpler operands
     /// (`changed` says so).
@@ -411,13 +517,20 @@ impl Module {
         match self.insts[i as usize].op {
             Op::Bin(op, a, b) => {
                 // Floats: `x + 0.0`, `x * 1.0` and the like are not `x` for
-                // every `x` (a negative zero, a signalling NaN).
+                // every `x` (a negative zero, a signalling NaN). Two
+                // constants are folded where nothing about them rounds.
+                if self.types[ty.0 as usize] == TypeDef::Float {
+                    let (x, y) = (self.float_k(a)?, self.float_k(b)?);
+                    let bits = fold_float(op, x, y)?;
+                    return Some(self.f32(bits));
+                }
                 let bits = self.int_bits(ty)?;
                 let (ka, kb) = (self.int_k(a).map(|k| k.1), self.int_k(b).map(|k| k.1));
                 let all = mask(bits);
                 if let (Some(x), Some(y)) = (ka, kb) {
                     // A shift by the width or more and a division by zero
-                    // have no defined result: left as they are.
+                    // have no defined result: left as they are, and so is a
+                    // signed division that overflows.
                     let amount = u32::try_from(y).ok().filter(|&y| y < bits);
                     let r = match op {
                         Bin::Add => x.wrapping_add(y),
@@ -431,6 +544,16 @@ impl Module {
                         Bin::AShr => (signed(bits, x) >> amount?) as u64,
                         Bin::UDiv if y != 0 => x / y,
                         Bin::URem if y != 0 => x % y,
+                        Bin::SDiv => {
+                            let q = signed(bits, x).checked_div(signed(bits, y))?;
+                            // The one quotient of the width does not fit
+                            // it again, and the console's answer to it is
+                            // the hardware's.
+                            if q != signed(bits, q as u64) {
+                                return None;
+                            }
+                            q as u64
+                        }
                         _ => return None,
                     };
                     return Some(self.k(ty, bits, r));
@@ -442,7 +565,7 @@ impl Module {
                         Some(0),
                     ) => Some(a),
                     (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
+                    (Bin::Mul | Bin::UDiv | Bin::SDiv, _, Some(1)) => Some(a),
                     (Bin::Mul, Some(1), _) => Some(b),
                     (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
                     (Bin::Mul | Bin::And, Some(0), _) => Some(a),
@@ -597,6 +720,61 @@ impl Module {
                         }
                         None
                     }
+                    // A float rounded toward zero to an integer: exact, so
+                    // the mode cannot matter. Out of the target's range, or
+                    // not a number, the console's answer is the hardware's,
+                    // and those stay.
+                    Cast::FpToSi | Cast::FpToUi => {
+                        let to = self.int_bits(ty)?;
+                        let f = f32::from_bits(self.float_k(x)?).trunc();
+                        let v = f64::from(f);
+                        let (lo, hi) = if op == Cast::FpToSi {
+                            let half = 2f64.powi(to as i32 - 1);
+                            (-half, half)
+                        } else {
+                            (0.0, 2f64.powi(to as i32))
+                        };
+                        if !(v >= lo && v < hi) {
+                            return None;
+                        }
+                        let k = if op == Cast::FpToSi {
+                            f as i64 as u64
+                        } else {
+                            f as u64
+                        };
+                        Some(self.k(ty, to, k))
+                    }
+                    // An integer as a float: folded where the integer is the
+                    // whole of the result, so that no mode of any rounding
+                    // tells them apart. The rounded double of a 64-bit
+                    // integer is a value a single may hold exactly
+                    // (`u64::MAX` and `2^55 + 1` both round to a power of
+                    // two), so the test is on the integer: as many
+                    // significant bits as a single's mantissa holds. And only
+                    // a single is folded: a double, or a half, is not the
+                    // value this would write.
+                    Cast::SiToFp | Cast::UiToFp => {
+                        if self.types[ty.0 as usize] != TypeDef::Float {
+                            return None;
+                        }
+                        let from = self.int_bits(self.type_of(x))?;
+                        let (_, k) = self.int_k(x)?;
+                        let (n, magnitude) = if op == Cast::SiToFp {
+                            let n = signed(from, k);
+                            (n as f64, n.unsigned_abs())
+                        } else {
+                            (k as f64, k)
+                        };
+                        let significant = if magnitude == 0 {
+                            0
+                        } else {
+                            64 - magnitude.leading_zeros() - magnitude.trailing_zeros()
+                        };
+                        if significant > 24 {
+                            return None;
+                        }
+                        Some(self.f32((n as f32).to_bits()))
+                    }
                     _ => None,
                 }
             }
@@ -650,7 +828,12 @@ impl Module {
                 Key::Bin(*op as u8, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
-            Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
+            // A comparison the other way round is the same test: the mirror
+            // predicate on the operands swapped.
+            Op::Cmp(p, a, b) => match mirror(*p) {
+                Some(q) if b < a => Key::Cmp(q, *b, *a),
+                _ => Key::Cmp(*p, *a, *b),
+            },
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
             Op::Call(f, args) => Key::Call(*f, args.clone()),
@@ -1341,6 +1524,288 @@ mod tests {
         m.write();
     }
 
+    /// A float operation of two constants is folded only where its exact
+    /// result is those bits: no rounding, no flush to zero, no NaN.
+    #[test]
+    fn float_constants_fold_only_where_nothing_rounds() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let index = m.i32(0);
+        let f = |m: &mut Module, x: f32| m.f32(x.to_bits());
+        let (two, three) = (f(&mut m, 2.0), f(&mut m, 3.0));
+        let exact = m.bin(b, Bin::Mul, two, three);
+        // 16777216 + 1 is not a single: it would round.
+        let big = f(&mut m, 16_777_216.0);
+        let one = f(&mut m, 1.0);
+        let rounds = m.bin(b, Bin::Add, big, one);
+        // A subnormal operand may be flushed to zero by a console.
+        let tiny = f(&mut m, 1e-40);
+        let flushed = m.bin(b, Bin::Add, tiny, tiny);
+        // Which NaN an operation of a NaN gives is the hardware's choice.
+        let nan = m.f32(f32::NAN.to_bits());
+        let quiet = m.bin(b, Bin::Mul, nan, one);
+        // An overflowing product is an infinity by the mode's rounding.
+        let large = f(&mut m, 1e38);
+        let ten = f(&mut m, 10.0);
+        let over = m.bin(b, Bin::Mul, large, ten);
+        // Of two negative zeros the sum is one, whatever the mode.
+        let zero = f(&mut m, -0.0);
+        let minus = m.bin(b, Bin::Add, zero, zero);
+        // And an infinity and a finite sum to the infinity.
+        let inf = m.f32(f32::INFINITY.to_bits());
+        let still = m.bin(b, Bin::Add, inf, one);
+        for v in [exact, rounds, flushed, quiet, over, minus, still] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        // Folded only: what is left unfolded must still be there to be seen.
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let bits = |m: &Module, n: usize| m.float_k(stores[n][0]);
+        assert_eq!(bits(&m, 0), Some(6.0f32.to_bits()), "2 * 3");
+        assert_eq!(bits(&m, 5), Some(0x8000_0000), "-0 + -0");
+        assert_eq!(bits(&m, 6), Some(f32::INFINITY.to_bits()), "inf + 1");
+        for (n, what) in [
+            (1, "a sum that rounds"),
+            (2, "a flushed operand"),
+            (3, "a NaN operand"),
+            (4, "an overflowing product"),
+        ] {
+            assert!(m.float_k(stores[n][0]).is_none(), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// A double holds every product of two singles, but not every sum: with
+    /// the exponents more than 53 apart the smaller operand leaves the sum
+    /// entirely (`1e20 + 1.0` is `1e20` again), and the check `f64::from(
+    /// single) == exact` cannot see a loss that happened in the double.
+    #[test]
+    fn float_sums_a_double_cannot_hold_are_not_folded() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let index = m.i32(0);
+        let f = |m: &mut Module, x: f32| m.f32(x.to_bits());
+        let (big, one) = (f(&mut m, 1e20), f(&mut m, 1.0));
+        let up = m.bin(b, Bin::Add, big, one);
+        let down = m.bin(b, Bin::Add, one, big);
+        let less = m.bin(b, Bin::Sub, big, one);
+        let less_down = m.bin(b, Bin::Sub, one, big);
+        // The same exponents, and the sum is a single: folded.
+        let (two, three) = (f(&mut m, 2.0), f(&mut m, 3.0));
+        let sum = m.bin(b, Bin::Add, two, three);
+        // 2^24 + 2^24 is exact in a single; 2^24 + 1 is not.
+        let (half, tiny) = (f(&mut m, 16_777_216.0), f(&mut m, 1.0));
+        let odd = m.bin(b, Bin::Add, half, tiny);
+        for v in [up, down, less, less_down, sum, odd] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let bits = |n: usize| m.float_k(stores[n][0]);
+        assert_eq!(bits(4), Some(5.0f32.to_bits()), "2 + 3");
+        for (n, what) in [
+            (0, "1e20 + 1.0"),
+            (1, "1.0 + 1e20"),
+            (2, "1e20 - 1.0"),
+            (3, "1.0 - 1e20"),
+            (5, "2^24 + 1"),
+        ] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// A sum that is zero has two possible signs: a sum of zeros of one sign
+    /// keeps it, and every other zero is `-0.0` under round-down and `+0.0`
+    /// under the other modes.
+    #[test]
+    fn float_zero_sums_fold_only_where_the_sign_is_the_arithmetic() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let index = m.i32(0);
+        let f = |m: &mut Module, x: f32| m.f32(x.to_bits());
+        let (plus, minus) = (f(&mut m, 0.0), f(&mut m, -0.0));
+        let (one, neg_one) = (f(&mut m, 1.0), f(&mut m, -1.0));
+        // `+0.0` with rounding to nearest, `-0.0` with rounding down.
+        let mixed = m.bin(b, Bin::Add, minus, plus);
+        let nothing = m.bin(b, Bin::Sub, plus, plus);
+        let cancel = m.bin(b, Bin::Add, one, neg_one);
+        // One sign only, so it is the arithmetic's and not the mode's.
+        let both = m.bin(b, Bin::Add, minus, minus);
+        let flipped = m.bin(b, Bin::Sub, minus, plus);
+        let kept = m.bin(b, Bin::Add, plus, plus);
+        for v in [mixed, nothing, cancel, both, flipped, kept] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let bits = |n: usize| m.float_k(stores[n][0]);
+        for (n, what) in [(0, "-0.0 + +0.0"), (1, "+0.0 - +0.0"), (2, "1.0 + -1.0")] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        assert_eq!(bits(3), Some(0x8000_0000), "-0.0 + -0.0");
+        assert_eq!(bits(4), Some(0x8000_0000), "-0.0 - +0.0");
+        assert_eq!(bits(5), Some(0), "+0.0 + +0.0");
+        m.write();
+    }
+
+    /// An integer folded to a float is folded only where the float is the
+    /// whole of the integer, and only into a single: the rounded double of a
+    /// 64-bit integer can be a power of two that a single holds exactly
+    /// (`u64::MAX` and `2^55 + 1` both do), so the test is on the integer.
+    #[test]
+    fn integer_to_float_folds_only_whole_integers() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let (f32t, f64t) = (m.float(), m.double());
+        let index = m.i32(0);
+        let wide = m.int(64);
+        let all = m.int_const(wide, -1);
+        let unsigned = m.cast(b, Cast::UiToFp, all, f32t);
+        let above = m.k(wide, 64, (1u64 << 55) + 1);
+        let signed_up = m.cast(b, Cast::SiToFp, above, f32t);
+        let exact = m.k(wide, 64, 1u64 << 55);
+        let whole = m.cast(b, Cast::UiToFp, exact, f32t);
+        // A double is not the single the fold would write.
+        let five = m.i32(5);
+        let doubled = m.cast(b, Cast::SiToFp, five, f64t);
+        let unsigned_doubled = m.cast(b, Cast::UiToFp, five, f64t);
+        for v in [unsigned, signed_up, whole, doubled, unsigned_doubled] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        assert_eq!(
+            m.float_k(stores[2][0]),
+            Some((2f32.powi(55)).to_bits()),
+            "2^55 is a single"
+        );
+        for (n, what) in [
+            (0, "u64::MAX"),
+            (1, "2^55 + 1"),
+            (3, "a signed conversion into a double"),
+            (4, "an unsigned conversion into a double"),
+        ] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// A division and a conversion fold where the instruction's result is
+    /// theirs for every input, and stay where it is not.
+    #[test]
+    fn divisions_and_conversions_fold_only_where_defined() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let (i32t, f32t) = (m.int(32), m.float());
+        let index = m.i32(0);
+        let minus8 = m.i32(-8i32 as u32);
+        let two = m.i32(2);
+        let quotient = m.bin(b, Bin::SDiv, minus8, two);
+        // The one signed division with no result.
+        let least = m.i32(0x8000_0000);
+        let minus_one = m.i32(-1i32 as u32);
+        let overflow = m.bin(b, Bin::SDiv, least, minus_one);
+        let zero = m.i32(0);
+        let by_zero = m.bin(b, Bin::SDiv, minus8, zero);
+        let third = m.f32(3.9f32.to_bits());
+        let truncated = m.cast(b, Cast::FpToSi, third, i32t);
+        // Out of the target's range, and not a number.
+        let huge = m.f32(3e9f32.to_bits());
+        let outside = m.cast(b, Cast::FpToSi, huge, i32t);
+        let nan = m.f32(f32::NAN.to_bits());
+        let nothing = m.cast(b, Cast::FpToSi, nan, i32t);
+        let below = m.f32((-1.0f32).to_bits());
+        let negative = m.cast(b, Cast::FpToUi, below, i32t);
+        let five = m.i32(5);
+        let unsigned = m.cast(b, Cast::UiToFp, five, f32t);
+        let neg_five = m.i32(-5i32 as u32);
+        let signed_back = m.cast(b, Cast::SiToFp, neg_five, f32t);
+        // 16777217 is not a single: the conversion would round.
+        let odd = m.i32(16_777_217);
+        let rounded = m.cast(b, Cast::SiToFp, odd, f32t);
+        for v in [
+            quotient,
+            overflow,
+            by_zero,
+            truncated,
+            outside,
+            nothing,
+            negative,
+            unsigned,
+            signed_back,
+            rounded,
+        ] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let int = |n: usize| m.int_value(stores[n][0]);
+        let float = |n: usize| m.float_k(stores[n][0]);
+        assert_eq!(int(0), Some(-4), "-8 / 2");
+        assert_eq!(int(3), Some(3), "3.9 truncated");
+        assert_eq!(float(7), Some(5.0f32.to_bits()));
+        assert_eq!(float(8), Some((-5.0f32).to_bits()));
+        for (n, what) in [
+            (1, "the overflowing division"),
+            (2, "a division by zero"),
+            (4, "a conversion out of range"),
+            (5, "a conversion of a NaN"),
+            (6, "a conversion below zero"),
+            (9, "a conversion that rounds"),
+        ] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// Two instructions that differ in one operand are two values, and a
+    /// lane mask is an operand like any other.
+    #[test]
+    fn a_different_mask_makes_a_different_value() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let one = m.i32(1);
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![one, one]);
+        let m1 = m.cmp(b, pred::NE, x, y);
+        let m2 = m.cmp(b, pred::IULT, x, y);
+        let old = m.i32(7);
+        let g1 = m.select(b, m1, x, old);
+        let g2 = m.select(b, m2, x, old);
+        let again = m.select(b, m1, x, old);
+        m.call(b, writes, vec![g1, g2]);
+        m.call(b, writes, vec![again, again]);
+        m.terminate(b, Term::Ret);
+        m.optimise(REUSE);
+        let kept = stores(&m, b);
+        assert_ne!(kept[0][0], kept[0][1], "two masks, two values");
+        assert_eq!(kept[1], [g1, g1], "the same mask again is one value");
+        // A comparison the other way round is the same test.
+        let lt = m.cmp(b, pred::IULT, x, y);
+        let gt = m.cmp(b, pred::IUGT, y, x);
+        m.call(b, writes, vec![lt, gt]);
+        m.optimise(REUSE);
+        let kept = stores(&m, b);
+        assert_eq!(kept[2][0], kept[2][1], "u< a, b is u> b, a");
+        m.write();
+    }
+
     /// entry: `c = x < y`, branch to `then` or `other`, which join.
     struct Diamond {
         k: Kit,
@@ -1645,6 +2110,18 @@ mod tests {
                 _ => panic!("a global or function as a value"),
             }
         };
+        // The value an instruction of an integer type reads: exactly the
+        // width of its own type, whatever a model left above it. Every
+        // arm that has an operand of the wrong width would otherwise
+        // answer differently from the constant the pass folds in its
+        // place.
+        let narrow = |vals: &[Option<u64>], v: V| -> u64 {
+            let x = eval(vals, v);
+            match m.int_bits(m.type_of(v)) {
+                Some(bits) => x & mask(bits),
+                None => x,
+            }
+        };
         let (mut b, mut from) = (0usize, usize::MAX);
         for _ in 0..4000 {
             let blk = &m.blocks[b];
@@ -1672,7 +2149,7 @@ mod tests {
                 let float = |x: u64| f32::from_bits(x as u32);
                 let r = match &inst.op {
                     Op::Bin(op, x, y) => {
-                        let (x, y) = (eval(&vals, *x), eval(&vals, *y));
+                        let (x, y) = (narrow(&vals, *x), narrow(&vals, *y));
                         match bits {
                             Some(bits) => {
                                 let r = match op {
@@ -1685,7 +2162,17 @@ mod tests {
                                     Bin::Shl => x << y,
                                     Bin::LShr => x >> y,
                                     Bin::AShr => (signed(bits, x) >> y) as u64,
-                                    _ => panic!("no divisions here"),
+                                    // The optimiser folds neither a division
+                                    // by zero nor a signed one that
+                                    // overflows, so those instructions stay
+                                    // in both modules; any fixed answer
+                                    // here compares equal.
+                                    Bin::UDiv => x.checked_div(y).unwrap_or(0),
+                                    Bin::URem => x.checked_rem(y).unwrap_or(0),
+                                    Bin::SDiv => {
+                                        signed(bits, x).checked_div(signed(bits, y)).unwrap_or(0)
+                                            as u64
+                                    }
                                 };
                                 r & mask(bits)
                             }
@@ -1702,7 +2189,7 @@ mod tests {
                     }
                     Op::Cmp(p, x, y) => {
                         let wide = m.int_bits(m.type_of(*x));
-                        let (x, y) = (eval(&vals, *x), eval(&vals, *y));
+                        let (x, y) = (narrow(&vals, *x), narrow(&vals, *y));
                         let holds = match wide {
                             Some(bits) => {
                                 let (sx, sy) = (signed(bits, x), signed(bits, y));
@@ -1747,6 +2234,31 @@ mod tests {
                             (Cast::ZExt, _, _) => x,
                             (Cast::SExt, Some(f), Some(t)) => signed(f, x) as u64 & mask(t),
                             (Cast::Trunc, _, Some(t)) => x & mask(t),
+                            // The optimiser folds a float rounded to an
+                            // integer only inside the target's range, so
+                            // what it does outside is never compared.
+                            (Cast::FpToSi, _, Some(t)) => {
+                                let f = f32::from_bits(x as u32).trunc();
+                                if (-2147483648.0..2147483648.0).contains(&f) {
+                                    (f as i64) as u64 & mask(t)
+                                } else {
+                                    0
+                                }
+                            }
+                            (Cast::FpToUi, _, Some(t)) => {
+                                let f = f32::from_bits(x as u32).trunc();
+                                if (0.0..4294967296.0).contains(&f) {
+                                    (f as u64) & mask(t)
+                                } else {
+                                    0
+                                }
+                            }
+                            (Cast::SiToFp, Some(f), _) => {
+                                u64::from((signed(f, x) as f32).to_bits())
+                            }
+                            (Cast::UiToFp, Some(f), _) => {
+                                u64::from(((x & mask(f)) as f32).to_bits())
+                            }
                             _ => panic!("a cast the generator does not make"),
                         }
                     }
@@ -1837,6 +2349,12 @@ mod tests {
 
         fn cond(&mut self) -> V {
             let c = self.cur;
+            // Now and then a condition that is already a constant, so the
+            // branch it guards goes one way and the side not taken is dead.
+            if self.next(8) == 0 {
+                let t = self.next(2) == 0;
+                return self.k.m.bool(t);
+            }
             let made = match self.next(6) {
                 0 if !self.conds.is_empty() => {
                     let n = self.next(self.conds.len() as u64) as usize;
@@ -1872,7 +2390,7 @@ mod tests {
             let d = self.next(self.regs.len() as u64) as usize;
             let i32t = self.k.m.int(32);
             let f32t = self.k.m.float();
-            let r = match self.next(14) {
+            let r = match self.next(16) {
                 0..=3 => {
                     let op = [Bin::Add, Bin::Sub, Bin::Mul, Bin::And, Bin::Or, Bin::Xor]
                         [self.next(6) as usize];
@@ -1938,10 +2456,30 @@ mod tests {
                     let g = self.cond();
                     self.k.m.cast(self.cur, Cast::ZExt, g, i32t)
                 }
+                13 => {
+                    // Division and remainder, by a register: zero and the
+                    // overflowing quotient are the cases the optimiser
+                    // refuses to fold and the interpreter's fixed answers.
+                    let op = [Bin::UDiv, Bin::SDiv, Bin::URem][self.next(3) as usize];
+                    let (x, y) = (self.value(), self.value());
+                    self.k.m.bin(c, op, x, y)
+                }
+                14 => {
+                    // Round a float toward zero, then back: the conversion
+                    // folds only where both directions are exact.
+                    let g = self.value();
+                    let f = self.k.m.cast(c, Cast::Bitcast, g, f32t);
+                    let i = self.k.m.cast(c, Cast::FpToSi, f, i32t);
+                    let g = self.k.m.cast(c, Cast::SiToFp, i, f32t);
+                    self.k.m.cast(c, Cast::Bitcast, g, i32t)
+                }
                 _ => {
-                    let x = self.value();
-                    let f = self.k.m.cast(c, Cast::Bitcast, x, f32t);
-                    self.k.m.cast(c, Cast::Bitcast, f, i32t)
+                    // The unsigned pair.
+                    let g = self.value();
+                    let f = self.k.m.cast(c, Cast::Bitcast, g, f32t);
+                    let i = self.k.m.cast(c, Cast::FpToUi, f, i32t);
+                    let g = self.k.m.cast(c, Cast::UiToFp, i, f32t);
+                    self.k.m.cast(c, Cast::Bitcast, g, i32t)
                 }
             };
             self.regs[d] = r;
@@ -2132,5 +2670,170 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    /// One instruction built from constants, stored, so that a run of the
+    /// module reports what it computed.
+    fn fold_case(op: u8, bits: u32, x: u64, y: u64) -> Module {
+        let mut k = kit();
+        let b = k.b;
+        let t = k.m.int(bits);
+        let zero = k.m.int_const(t, 0);
+        let f = k.m.float();
+        let v = match op {
+            0 => {
+                let a = k.m.f32(x as u32);
+                k.m.cast(b, Cast::FpToSi, a, t)
+            }
+            1 => {
+                let a = k.m.f32(x as u32);
+                k.m.cast(b, Cast::FpToUi, a, t)
+            }
+            2 => {
+                let a = k.m.int_const(t, x as i64);
+                k.m.cast(b, Cast::SiToFp, a, f)
+            }
+            3 => {
+                let a = k.m.int_const(t, x as i64);
+                k.m.cast(b, Cast::UiToFp, a, f)
+            }
+            4 | 5 => {
+                let a = k.m.int_const(t, x as i64);
+                let wide = k.m.int(64);
+                if op == 4 {
+                    k.m.cast(b, Cast::ZExt, a, wide)
+                } else {
+                    k.m.cast(b, Cast::SExt, a, wide)
+                }
+            }
+            6 => {
+                let a = k.m.int_const(t, x as i64);
+                let half = k.m.int(bits / 2);
+                k.m.cast(b, Cast::Trunc, a, half)
+            }
+            o => {
+                let (a, z) = (k.m.int_const(t, x as i64), k.m.int_const(t, y as i64));
+                let bin = [Bin::UDiv, Bin::SDiv, Bin::URem, Bin::Mul, Bin::Add][o as usize - 7];
+                k.m.bin(b, bin, a, z)
+            }
+        };
+        k.m.call(b, k.writes, vec![zero, v]);
+        k.m.terminate(b, Term::Ret);
+        k.m
+    }
+
+    /// Every constant fold says what the instruction it replaces says: the
+    /// same program, folded and not, stores the same values.
+    #[test]
+    fn a_fold_from_constants_says_what_the_instruction_says() {
+        let floats = [
+            0u32, 0x8000_0000, 0x3F80_0000, 0xBF80_0000, 0x3F00_0000, 0xBF00_0000,
+            0x4F00_0000, 0xCF00_0000, 0x4F80_0000, 0x4EFF_FFFF, 0x4B80_0001,
+            0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0x0000_0001, 0x8000_0001,
+            0x5F00_0000, 0xDF00_0000, 0x7F7F_FFFF, 0x3FC0_0000, 0x4020_0000,
+            0x4F7F_FFFF, 0x3F80_0001, 0x3400_0000,
+        ];
+        let ints = [
+            0u64, 1, 2, 3, 7, 0xFF, 0x7F, 0x80, 0xFFFF, 0x8000, 0x7FFF,
+            0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0x0100_0001,
+            0xFFFF_FF7F, 0x8000_0001,
+        ];
+        let inputs = [1u32, 2, 3, 4, 5, 6, 7];
+        let (mut cases, mut folded) = (0, 0);
+        // A conversion needs a width to come from or go to; a division or a
+        // sum, only its own.
+        let all = 0..9u8;
+        for &bits in &[8u32, 16, 32] {
+            let m = (1u64 << bits) - 1;
+            for op in all.clone() {
+                let (xs, ys): (&[u64], &[u64]) = match op {
+                    0 | 1 => (&floats.iter().map(|&f| u64::from(f)).collect::<Vec<_>>(), &[0]),
+                    4..=6 => (&ints, &ints),
+                    _ => (&ints, &[0]),
+                };
+                for &x in xs {
+                    for &y in ys {
+                        let (x, y) = (x & if op < 2 { u64::MAX } else { m }, y & m);
+                        let plain = fold_case(op, bits, x, y);
+                        let want = run(&plain, &inputs);
+                        let mut pass = fold_case(op, bits, x, y);
+                        pass.optimise(FOLD);
+                        if pass.blocks[0].body.len() < 2 {
+                            folded += 1;
+                        }
+                        assert_eq!(
+                            run(&pass, &inputs),
+                            want,
+                            "op {op} i{bits} {x:#x} {y:#x}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("{cases} cases, {folded} folded");
+        // The folds are the point: most of these do fold.
+        assert!(folded > 1000, "{folded} of {cases} folded");
+    }
+
+    /// The join reported as folding wrongly: a register that is only ever
+    /// itself round a loop, one the loop computes from it, and a second
+    /// join whose back edge reads that computed value.
+    fn self_join_loop() -> (Module, usize) {
+        let Kit {
+            mut m,
+            b,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (head, exit) = (m.new_block(), m.new_block());
+        let (five, nine, zero, one, four) = (m.i32(5), m.i32(9), m.i32(0), m.i32(1), m.i32(4));
+        m.terminate(b, Term::Br(head));
+        let self_join = m.phi(head, i32t);
+        let counter = m.phi(head, i32t);
+        let reads_it = m.phi(head, i32t);
+        let or = m.bin(head, Bin::Or, self_join, self_join);
+        let next = m.bin(head, Bin::Add, counter, one);
+        let more = m.cmp(head, pred::IULT, next, four);
+        m.terminate(head, Term::CondBr(more, head, exit));
+        m.set_phi(self_join, vec![(five, b), (self_join, head)]);
+        m.set_phi(counter, vec![(zero, b), (next, head)]);
+        m.set_phi(reads_it, vec![(nine, b), (or, head)]);
+        m.call(exit, writes, vec![zero, reads_it]);
+        m.call(exit, writes, vec![one, self_join]);
+        m.terminate(exit, Term::Ret);
+        let V::Inst(reads_it) = reads_it else {
+            panic!("a join")
+        };
+        (m, reads_it as usize)
+    }
+
+    /// The pass replaces the back edge's value with the one the register
+    /// came in with, which is computed before the loop every time round,
+    /// and the two programs store the same values.
+    #[test]
+    fn a_join_folded_to_a_value_from_before_the_loop_stores_the_same() {
+        let (mut plain, reads_it) = self_join_loop();
+        let mut folded = self_join_loop().0;
+        folded.optimise(FOLD);
+        let inputs = [1u32, 2, 3];
+        assert_eq!(
+            run(&folded, &inputs),
+            run(&plain, &inputs),
+            "the folded program stores what the plain one does"
+        );
+        // The shape the report named: the self-join is gone, and the back
+        // edge of the join that read what the loop computed now reads the
+        // value defined before the loop.
+        let five = plain.i32(5);
+        assert_eq!(folded.blocks[1].phis.len(), 2, "the self-join is gone");
+        let Op::Phi(incoming) = &folded.insts[reads_it].op else {
+            panic!("a join")
+        };
+        assert!(
+            incoming.iter().any(|&(v, from)| from == 1 && v == five),
+            "{incoming:?}"
+        );
     }
 }

@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, b, role).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -1113,8 +1113,15 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, in block `at`,
+    /// read as `role` says.
+    fn descriptor(
+        &self,
+        inst: &Inst,
+        op: &Operand,
+        at: usize,
+        role: Role,
+    ) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1124,21 +1131,23 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        self.classify(&words, &mut Vec::new(), &mut known, role)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
-    /// being resolved, `known` holds in every lane that reads them.
+    /// being resolved, `known` holds in every lane that reads them, and
+    /// `role` is what the access reads the descriptor as.
     fn classify(
         &self,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Source, &'static str> {
-        if let Some(source) = self.phi(words, joins, known)? {
+        if let Some(source) = self.phi(words, joins, known, role)? {
             return Ok(source);
         }
-        if let Some(source) = self.select(words, joins, known)? {
+        if let Some(source) = self.select(words, joins, known, role)? {
             return Ok(source);
         }
         let read = |w: &Term| match *w {
@@ -1153,7 +1162,7 @@ impl<'a> Tracer<'a> {
             // Read from the first active lane, as a waterfall loop does: the
             // dwords each lane holds.
             let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+            return self.per_lane(&lanes, joins, known, role);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -1197,11 +1206,110 @@ impl<'a> Tracer<'a> {
             matches!(*w, Term::Value(v)
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
+        if role == Role::Resource
+            && let Some(source) = self.patched(words)
+        {
+            return Ok(source);
+        }
         Err(if words.iter().any(loaded) {
             "a descriptor changed after loading"
         } else {
             "a descriptor neither loaded nor built"
         })
+    }
+
+    /// A buffer descriptor (`V#`: four dwords) loaded from a table and then
+    /// patched: the console's upscaler turns a typed entry into a raw one by
+    /// clearing its stride and rescaling its count (`s_and_b32 s9, s9,
+    /// 0xc000ffff`, then `s_mul_i32 s10, s10, <stride>`, then the format bits
+    /// of dword 3).
+    ///
+    /// A buffer access is lowered as memory at the address its descriptor
+    /// holds, so what the patch must leave alone is that address: dword 0
+    /// whole, and the high half in dword 1. Dwords 2 and 3 may be recomputed
+    /// from the same load, since the count and the format only decide what
+    /// the console answers outside the entry.
+    ///
+    /// Only four dwords are a `V#`: an image `T#` is eight (its format,
+    /// dimensions, mip bounds and `DST_SEL` live in the words the patch
+    /// above touches), and a sampler `S#` is four but is not a resource
+    /// ([`Role::Sampler`]). Both used to be taken as a patched buffer, whose
+    /// patch was then dropped; they are refused instead. An `r128` `T#` is
+    /// four dwords too and is still taken as a buffer.
+    // shortcut: an access the patched count would put outside the entry is
+    // answered with the memory that lies there rather than with zeros, and a
+    // format the patch installs is not applied: the address and the access
+    // form are.
+    fn patched(&self, words: &[Term]) -> Option<Source> {
+        if words.len() != 4 {
+            return None;
+        }
+        let Term::Value(v0) = words[0] else {
+            return None;
+        };
+        let load = self.defs[v0.0 as usize]?;
+        let inst = self.inst(load);
+        if !inst.name().starts_with("s_load_") {
+            return None;
+        }
+        let first = inst.writes.iter().position(|w| w.1 == v0)?;
+        let writes: Vec<Value> = inst.writes.get(first..)?.iter().map(|w| w.1).collect();
+        if writes.len() < words.len() {
+            return None;
+        }
+        // The address's low half is dword 0, which the patch may not touch at
+        // all; its high half keeps the sixteen bits of dword 1.
+        let keeps_high = words[1] == Term::Value(writes[1])
+            || match words[1] {
+                Term::Value(v1) => self.high_half_kept(v1, writes[1]),
+                Term::Const(_) => false,
+            };
+        let rest = words[2..].iter().all(|w| self.traces_to_load(*w, &writes, 8));
+        (keeps_high && rest).then_some(Source::Loaded {
+            load,
+            first: first as u8,
+        })
+    }
+
+    /// `v` is `loaded` with the bits above its low sixteen masked away or
+    /// set: what a patch may do to the high half of an address.
+    fn high_half_kept(&self, v: Value, loaded: Value) -> bool {
+        let one = Term::Value(loaded);
+        let pair = |names: &[&str]| self.sop2(v, names).map(|(_, t)| t);
+        match pair(&["s_and_b32"]) {
+            Some([a, Term::Const(mask)]) if a == one => mask & 0xFFFF == 0xFFFF,
+            Some([Term::Const(mask), b]) if b == one => mask & 0xFFFF == 0xFFFF,
+            _ => match pair(&["s_or_b32"]) {
+                Some([a, Term::Const(bits)]) if a == one => bits & 0xFFFF == 0,
+                Some([Term::Const(bits), b]) if b == one => bits & 0xFFFF == 0,
+                _ => false,
+            },
+        }
+    }
+
+    /// `w` is one of `load`'s dwords or a constant, or scalar arithmetic from
+    /// those alone.
+    fn traces_to_load(&self, w: Term, load: &[Value], depth: u8) -> bool {
+        let Term::Value(v) = w else {
+            return true;
+        };
+        if load.contains(&v) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        !src.is_empty()
+            && src.iter().all(|op| {
+                self.term(inst, op)
+                    .is_some_and(|t| self.traces_to_load(t, load, depth - 1))
+            })
     }
 
     /// The one edge into the join `block` that lanes satisfying `known`
@@ -1296,6 +1404,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
             Term::Value(v) => self.phis[v.0 as usize],
@@ -1326,7 +1435,7 @@ impl<'a> Tracer<'a> {
                 .collect()
         };
         let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| self.classify(&edge(j), joins, known))
+            .map(|j| self.classify(&edge(j), joins, known, role))
             .collect::<Result<_, _>>();
         let source = match args {
             Ok(args) => Ok(Source::Phi { block, args }),
@@ -1336,7 +1445,7 @@ impl<'a> Tracer<'a> {
             // has no lane left that reads it), if that can be named where
             // it is read.
             Err(e) => match self.only_edge(block, known) {
-                Some(j) => match self.classify(&edge(j), joins, known) {
+                Some(j) => match self.classify(&edge(j), joins, known, role) {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
@@ -1354,6 +1463,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Option<Source>, &'static str> {
         let picks: Vec<_> = words
             .iter()
@@ -1392,7 +1502,7 @@ impl<'a> Tracer<'a> {
         };
         let args = [true, false]
             .into_iter()
-            .map(|set| self.classify(&side(set), joins, known))
+            .map(|set| self.classify(&side(set), joins, known, role))
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Select { scc, args: args? }))
@@ -1627,6 +1737,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Source, &'static str> {
         let words = words
             .iter()
@@ -1634,15 +1745,15 @@ impl<'a> Tracer<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let words = &words[..];
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
-            return self.classify(words, joins, known);
+            return self.classify(words, joins, known, role);
         };
         if let Some(source) = self.fetched(words, known)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_select(words, joins, known)? {
+        if let Some(source) = self.lane_select(words, joins, known, role)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_phi(words, joins, known)? {
+        if let Some(source) = self.lane_phi(words, joins, known, role)? {
             return Ok(source);
         }
         let Term::Value(v) = lane else { unreachable!() };
@@ -1724,6 +1835,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Option<Source>, &'static str> {
         let picks: Vec<_> = words
             .iter()
@@ -1772,7 +1884,7 @@ impl<'a> Tracer<'a> {
             .map(|set| {
                 let n = known.len();
                 known.extend(bit.map(|b| (b, set)));
-                let arg = self.per_lane(&side(set), joins, known);
+                let arg = self.per_lane(&side(set), joins, known, role);
                 known.truncate(n);
                 arg
             })
@@ -1822,6 +1934,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        role: Role,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
             Term::Value(v) => self.phis[v.0 as usize],
@@ -1882,7 +1995,7 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.per_lane(&edge, joins, known).map(Some)
+                self.per_lane(&edge, joins, known, role).map(Some)
             } else {
                 Ok(None)
             };
@@ -2790,6 +2903,153 @@ pub(crate) mod tests {
             err,
             ShaderError::Unsupported {
                 offset: 36,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// A SOP2 word, its opcode read from the decoder so that no test spells
+    /// one out. A source of `0xFF` takes the word that follows as its
+    /// literal.
+    fn sop2(name: &str, dst: u8, a: u8, b: u8) -> u32 {
+        let opcode = (0..=u16::MAX)
+            .find(|&opcode| {
+                crate::gfx10::Instruction {
+                    offset: 0,
+                    encoding: crate::gfx10::Encoding::Sop2,
+                    opcode,
+                    words: Vec::new(),
+                }
+                .name()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("no SOP2 opcode named {name}"));
+        // Bit 30 and 31 are what makes a word scalar.
+        0x8000_0000 | (u32::from(opcode) << 23) | (u32::from(dst) << 16) | (u32::from(b) << 8) | u32::from(a)
+    }
+
+    /// The shipped upscaler's compute programs patch a loaded descriptor into
+    /// a raw one before using it: the stride field is cleared, the record
+    /// count rescaled and the format bits of the last dword set. Only the
+    /// address has to survive the patch, and it does.
+    #[test]
+    fn a_descriptor_patched_into_a_raw_one_is_the_one_that_was_loaded() {
+        let words = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0206,
+            0xFA00_0010, // s_load_dwordx4 s[8:11], s[12:13], 0x10
+            sop2("s_and_b32", 9, 9, 0xFF),
+            0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff: no stride
+            sop2("s_mul_i32", 10, 0xFF, 10),
+            4, // s_mul_i32 s10, 4, s10: the count in bytes
+            sop2("s_and_b32", 11, 11, 0xFF),
+            0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+            sop2("s_or_b32", 11, 11, 0xFF),
+            0x3000_0000, // s_or_b32 s11, s11, 0x30000000: raw
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            S_ENDPGM,
+        ];
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        let Source::Loaded { load, first: 0 } = r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        assert_eq!(
+            r.scalar.iter().find(|s| s.0 == load).unwrap().1.offset,
+            0x10
+        );
+    }
+
+    /// An image `T#` is eight dwords, and the patch touches words the
+    /// address does not live in: it is not the four-dword buffer descriptor
+    /// a patch leaves alone, so the descriptor is refused rather than
+    /// reported as the loaded entry with its patch dropped.
+    #[test]
+    fn a_patched_image_descriptor_is_not_a_patched_buffer() {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0101,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+            sop2("s_and_b32", 5, 5, 0xFF),
+            0xC000_FFFF, // s_and_b32 s5, s5, 0xc000ffff: the address's high half
+            sop2("s_and_b32", 6, 6, 0xFF),
+            0x0FFF_FFFF, // s_and_b32 s6, s6, 0x0fffffff: format, dimensions
+            0xF408_0301,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null: the sampler
+            0xF080_0F08,
+            0x0061_0002, // image_sample v[0:3], v[2:3], s[4:11], s[12:15]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor changed after loading",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A sampler `S#` is four dwords too: a patch of one is not a buffer
+    /// descriptor, so it is refused as well.
+    #[test]
+    fn a_patched_sampler_is_not_a_patched_buffer() {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0101,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null: the resource
+            0xF408_0301,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null: the sampler
+            sop2("s_or_b32", 13, 13, 0xFF),
+            0x0100_0000, // s_or_b32 s13, s13, 0x1000000: a filter word patched
+            0xF080_0F08,
+            0x0061_0002, // image_sample v[0:3], v[2:3], s[4:11], s[12:15]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor changed after loading",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A patch of the dword the address starts in is not that descriptor.
+    #[test]
+    fn a_patch_that_moves_the_address_is_refused() {
+        let words = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0206,
+            0xFA00_0010, // s_load_dwordx4 s[8:11], s[12:13], 0x10
+            sop2("s_add_u32", 8, 8, 0xFF),
+            16, // s_add_u32 s8, s8, 16
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 24,
                 what: "a descriptor changed after loading"
             }
         );

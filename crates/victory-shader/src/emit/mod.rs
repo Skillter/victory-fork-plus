@@ -82,12 +82,14 @@
 
 mod bitcode;
 mod container;
+mod counts;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lanes;
 mod lower;
 mod own_bits;
 mod rect;
@@ -114,8 +116,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, SLOT_VIEW_ADDRESSES_COUNT, USER_DATA_SPACE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -337,10 +339,25 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    // A console program is in the `DXIL` part; a package of them, with no
+    // `DXIL` part beside it, is in the `ACCC` one.
+    let native = match (c.part(FourCC::DXIL), c.part(FourCC::ACCC)) {
+        (Some(dxil), _) => crate::native_programs(dxil.data)?,
+        (None, Some(accc)) if fspx_on() => crate::fspx::programs(accc.data, &c)?,
+        (None, Some(_)) => {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a FidelityFX package of programs (VICTORY_FSPX=1 reads them)",
+            });
+        }
+        (None, None) => {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container with neither a DXIL nor an ACCC part",
+            });
+        }
+    };
+    let native = native
         .into_iter()
         .find(|p| {
             matches!(
@@ -1032,6 +1049,216 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `v_cvt_f32_f64`: a console double in a register pair, rounded to a
+    /// float. Three compute shaders stopped at the opcode by name, all of
+    /// them feeding the result to `v_rcp_f32`.
+    #[test]
+    fn a_double_register_pair_rounds_to_a_float() {
+        // v_cvt_f32_f64 v2, v0: v0:v1 is the thread id, read as a double.
+        stores_v1(&[0x7E04_1F00]).unwrap();
+    }
+
+    /// `v_permlanex16_b32`: each lane reads the lane 16 away within its
+    /// 32-lane block, at the offset its half's selector names. One compute
+    /// shader's 64-lane max/min reduction stopped at the opcode by name.
+    #[test]
+    fn a_permutation_across_the_16_lane_halves_reads_the_other_half() {
+        // v_permlanex16_b32 v1, v0, 0, 0
+        stores_v1(&[0xD778_0001, 0x0201_0100]).unwrap();
+    }
+
+    /// A 16-bit interpolation pair: `v_interp_p2_f16` writes one half of its
+    /// destination and keeps the other, so both halves evaluate and the
+    /// export sees the pair's dword. Eight pixel shaders stopped at "the
+    /// first half of an interpolation", reported at the export that consumed
+    /// it, not at the interpolation: `io::tests` pins the recording of the
+    /// first half that fixed them, this pins the lowering.
+    #[test]
+    fn an_f16_interpolation_pair_keeps_its_first_half() {
+        let words = [
+            0x1006_00F0u32,             // v_mul_f32 v3, 0.5, v0
+            0xD742_000A, 0x0002_0600,   // v_interp_p1ll_f16 v10, v3, attr0.x
+            0xD75A_000B, 0x042A_0200,   // v_interp_p2_f16 v11, v1, attr0.x, v10
+            0xF800_180F, 0x0B0B_0B0B,   // exp mrt0, v11, v11, v11, v11 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half,
+        };
+        let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 15, false)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).unwrap();
+    }
+
+    /// Two elements the console packed into one register — a two-wide one
+    /// at column 0 and another behind it at column 2 — read with two
+    /// interpolation modes: `v_interp_p1/p2_f32` of `attr1.z` with linear
+    /// center barycentrics reads the element at column 2 linearly, and the
+    /// one in front of it is never read, so the emitter's per-element modes
+    /// (a read's, or the kind's default of 2) disagreed inside the row.
+    /// D3D interpolates a row one way: `dxil.dll` rejected such a signature
+    /// ("has interpolation mode that differs from another element packed
+    /// into the same row"), which is the largest class of invalid DXIL the
+    /// title's programs hit (245 of them). The second program reads both
+    /// elements, one perspective and one linear, which no single row can
+    /// declare: the read that does not own the row keeps its mode in a
+    /// register of its own.
+    #[test]
+    fn a_packed_row_declares_one_interpolation_mode() {
+        let el = |index, col| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(1),
+            col,
+            cols: 2,
+            usage: 0,
+            half: false,
+        };
+        let input = |mask, attr| crate::native::PsInput {
+            usage: crate::native::Usage::Generic,
+            row: 1,
+            mask,
+            attr,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 1,
+        };
+        // TEXCOORD0 covers channels 0 and 1 of register 1, TEXCOORD7 the
+        // two behind them (the packed layout the console's own signature
+        // declares). Returns the emitted program and its `PSV0`.
+        let emit_with =
+            |inputs: Vec<crate::native::PsInput>, input_addr: u32, words: &[u32]| {
+                let native = super::NativeProgram {
+                    stage: super::HwStage::Ps,
+                    wave64: false,
+                    vgprs: 6,
+                    layout: vec![],
+                    used: vec![],
+                    io: crate::native::StageIo::Ps {
+                        inputs,
+                        input_addr,
+                        db_shader_control: 0,
+                        patches: vec![],
+                    },
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let isg1 =
+                    super::container::signature(&[el(0, 0), el(7, 2)], true);
+                let osg1 = super::container::signature(
+                    &[SigElement {
+                        name: "SV_Target".into(),
+                        index: 0,
+                        kind: 16,
+                        comp: 9,
+                        interp: 0,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        usage: 0,
+                        half: false,
+                    }],
+                    false,
+                );
+                let bytes = crate::dxbc::build(&[
+                    (super::FourCC::ISG1, &isg1),
+                    (super::FourCC::OSG1, &osg1),
+                ]);
+                let c = super::Container::parse(&bytes).unwrap();
+                let p =
+                    crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+                let st = crate::structure::structure(&p).unwrap();
+                let res =
+                    crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+                // The oracle: before the row's modes were shared, dxil.dll
+                // refused both of these programs with the message above.
+                #[cfg(windows)]
+                if let Ok(mut v) = super::validator::Validator::load(
+                    super::validator::Validator::default_path().as_deref(),
+                ) {
+                    v.validate(&mut out.dxil.clone()).unwrap();
+                }
+                let host = super::Container::parse(&out.dxil).unwrap();
+                host.part(super::FourCC::PSV0).unwrap().data.to_vec()
+            };
+        // One read (linear) behind an element nothing reads (its kind's
+        // default is perspective): the row takes the read's mode and the
+        // unread element copies it, so no register is spent.
+        let psv = emit_with(
+            vec![input(0b0100, 1)],
+            1 << 5, // linear center: v0 is i, v1 is j
+            &[
+                0xC808_0600u32, // v_interp_p1_f32 v2, v0, attr1.z
+                0xC809_0601,    // v_interp_p2_f32 v2, v1, attr1.z
+                0xF800_180F,
+                0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                0xBF81_0000,
+            ],
+        );
+        assert_eq!(psv[4 + 31], 2, "both elements stay in register 1");
+        // Two reads that disagree: `attr0.x` perspective (v0, v1) and
+        // `attr1.z` linear (v2, v3). Neither loses its mode, so the second
+        // moves to a register of its own.
+        let psv = emit_with(
+            vec![input(0b0001, 0), input(0b0100, 1)],
+            (1 << 1) | (1 << 5),
+            &[
+                0xC810_0000u32, // v_interp_p1_f32 v4, v0, attr0.x
+                0xC811_0001,    // v_interp_p2_f32 v4, v1, attr0.x
+                0xC814_0602,    // v_interp_p1_f32 v5, v2, attr1.z
+                0xC815_0603,    // v_interp_p2_f32 v5, v3, attr1.z
+                0xF800_180F,
+                0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                0xBF81_0000,
+            ],
+        );
+        assert_eq!(psv[4 + 31], 3, "the second read got a register of its own");
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
@@ -1627,6 +1854,32 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// `v_fma_mixlo_f16` into a register whose old value has no host value
+    /// keeps 0 in the high half, as the other 16-bit writes do, instead of
+    /// refusing the result: the console compiler reuses a register whose
+    /// other half nothing reads again. The title's deferred textured
+    /// material writes the low half of the register a `v_interp_p1ll_f16`
+    /// first half left, then reads that low half alone; its draws were
+    /// dropped (`PS_DeferredTextured_*`, "the first half of an
+    /// interpolation" at its G-buffer export, 2026-11-25). Here the old
+    /// value is an instruction's that does not translate (`v_cvt_f32_f64`),
+    /// which has no host value either.
+    #[test]
+    fn fma_mixlo_into_a_register_without_a_value_keeps_its_low_half() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0x7E04_1F00, // v_cvt_f32_f64 v2, v[0:1] (no host value)
+            0xCC21_0002, // v_fma_mixlo_f16 v2, v0, v1, 0 (f32 sources)
+            0x0202_0300,
+            0x7E06_1702, // v_cvt_f32_f16 v3, v2
+            e0,
+            e1, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

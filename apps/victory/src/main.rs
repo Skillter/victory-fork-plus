@@ -129,13 +129,22 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
-    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`. It has no
+    // CLI and no config, so it settles for stderr; `run` itself starts logging
+    // later, once the config has named the data directory its file belongs in.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
+    if victory_hle::modules::audio::capture::is_child() {
+        victory_core::logging::init_stderr("info");
+        victory_hle::modules::audio::capture::child();
         return Ok(());
     }
     let cli = Cli::parse();
+    // `run` installs logging itself, once the config has named the data
+    // directory its log file belongs in; the subscriber can only be built
+    // once, so every other command settles for stderr here.
+    if !matches!(&cli.command, Command::Run { .. }) {
+        victory_core::logging::init("info");
+    }
     match cli.command {
         Command::Inspect {
             file,

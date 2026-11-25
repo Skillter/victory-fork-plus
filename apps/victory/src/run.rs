@@ -19,6 +19,23 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Logging starts here, after the config has named the data directory
+    // the log belongs in and before anything worth reading happens. A data
+    // directory that cannot hold it (asset policy, permissions) leaves the
+    // run on stderr rather than refusing to start it.
+    match cfg.data_subdir("logs") {
+        Ok(dir) => victory_core::logging::init_run("info", &dir),
+        Err(_) => victory_core::logging::init("info"),
+    }
+    // The run's clock: the shutdown summary states how long the title ran,
+    // and this is the first moment the log can mark as its start.
+    victory_hle::modules::lifecycle::note_run_start();
+    let begun = std::time::SystemTime::now();
+    let started = std::time::Instant::now();
+    // Every way out of this function that returns writes the footer; the ways
+    // that end the process from inside the HLE cannot, and keep the `run
+    // summary:` line of `crates/victory-hle/src/modules/lifecycle.rs`.
+    let mut footer = Footer::new(started, &cfg);
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -26,6 +43,27 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // The title's own facts are read here, before anything is mapped, so the
+    // header states them at the top of the log instead of forty lines in.
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    let manifest_path = title_dir.join("MicrosoftGame.config");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    // A missing manifest leaves id 0 and no storage quota.
+    let title = victory_hle::runtime::Title::from_manifest(&manifest);
+    let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
+    footer.title(title.id);
+    emit_header(
+        &cfg,
+        &Header {
+            exe,
+            hash: &hash,
+            title_id: title.id,
+            manifest: manifest_path.is_file(),
+            storage_mb: title.storage_bytes >> 20,
+            console,
+            begun,
+        },
+    );
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -49,12 +87,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
-    // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
-    let title = victory_hle::runtime::Title::from_manifest(&manifest);
-    let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
         "title          {:08X}, storage {} ({} MB)",
         title.id,
@@ -104,6 +136,7 @@ pub fn run(
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
+        footer.stopped("prepared; not executed");
         return Ok(());
     }
     victory_loader::report_crashes();
@@ -128,7 +161,141 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    footer.stopped(&format!("title exited with {code}"));
     Ok(())
+}
+
+/// The facts the header states, gathered by [`run`] where it learns them.
+struct Header<'a> {
+    exe: &'a Path,
+    hash: &'a str,
+    title_id: u32,
+    manifest: bool,
+    storage_mb: u64,
+    console: Console,
+    begun: std::time::SystemTime,
+}
+
+/// Writes the `RUN` block once, at the top of the log, so two runs of the same
+/// binary can be compared by what they were given.
+fn emit_header(cfg: &victory_core::Config, header: &Header<'_>) {
+    let program = format!("victory {}", env!("CARGO_PKG_VERSION"));
+    let run = victory_core::report::RunHeader {
+        program,
+        build: env!("VICTORY_BUILD").to_owned(),
+        started_utc: victory_core::logging::utc_text(header.begun),
+        started_local: victory_core::logging::local_text(),
+        filter: victory_core::logging::filter_text().to_owned(),
+        cap: victory_core::logging::cap_text().to_owned(),
+        log_file: victory_core::logging::current_log_file().map(Path::to_path_buf),
+        config_file: cfg.source.clone(),
+        game_dir: cfg.game_dir.clone(),
+        exe: header.exe.to_path_buf(),
+        exe_hash: header.hash.to_owned(),
+        title_id: header.title_id,
+        manifest: header.manifest,
+        storage_mb: header.storage_mb,
+        console: match header.console {
+            Console::SeriesX => "series-x".to_owned(),
+            Console::SeriesS => "series-s".to_owned(),
+        },
+        cache_dir: cfg.cache_dir.clone(),
+        data_dir: cfg.data_dir.clone(),
+        env: victory_env(),
+    };
+    victory_core::logging::emit("INFO", &run.render());
+}
+
+/// Every `VICTORY_*` variable that is set, as the user set it.
+///
+/// Only that prefix: a log may say what was asked of it, never what else this
+/// machine has in its environment.
+fn victory_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            name.starts_with("VICTORY_")
+                .then(|| (name, value.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+/// Bytes under `path`; a missing directory is 0.
+fn dir_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Writes the `STOP` block on every way out of [`run`], and installs the
+/// renderer the paths that end the process from inside the HLE use.
+///
+/// `lifecycle::end` (a closed window, the suspend deadline) terminates the
+/// process rather than returning, so this frame is gone by then; it writes the
+/// block from `crates/victory-hle/src/modules/lifecycle.rs` (`last_records`).
+/// That path knows no directories, so the cache sizes are installed here, at
+/// start-up, through [`victory_core::report::set_footer_hook`]: both paths
+/// render through [`victory_core::report::stop_block`], which writes the block
+/// once per process whichever of them is first.
+///
+/// The frame figures are the two metrics the presentation path records:
+/// `frames_n`, counted once per presented frame by `victory_gpu::queue::present`,
+/// and `frame_ms`, observed once per frame. A run that never drew has neither
+/// and prints no fps.
+struct Footer {
+    started: std::time::Instant,
+    reason: String,
+}
+
+/// The title the footer names. A static because the hook that renders it may
+/// run on the thread `lifecycle::end` spawned, after this frame is gone.
+static TITLE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+impl Footer {
+    fn new(started: std::time::Instant, cfg: &victory_core::Config) -> Self {
+        let (cache_dir, data_dir) = (cfg.cache_dir.clone(), cfg.data_dir.clone());
+        victory_core::report::set_footer_hook(Box::new(move |reason, duration| {
+            let mut footer = victory_core::report::RunFooter::from_counters(reason, duration);
+            let title = format!("{:08X}", TITLE_ID.load(std::sync::atomic::Ordering::Relaxed));
+            // A directory that is not there yet is 0 bytes, not an error: the
+            // footer is written on every path, including the ones that failed
+            // before they could make one.
+            footer.cache = vec![
+                ("shaders".to_owned(), dir_size(&cache_dir.join("shaders"))),
+                ("pipelines".to_owned(), dir_size(&cache_dir.join("pipelines"))),
+                ("images".to_owned(), dir_size(&cache_dir.join("images"))),
+                ("storage".to_owned(), dir_size(&data_dir.join(&title).join("storage"))),
+                ("temp".to_owned(), dir_size(&data_dir.join(&title).join("temp"))),
+            ];
+            footer.render()
+        }));
+        Self {
+            started,
+            reason: "the run stopped before the title ended".to_owned(),
+        }
+    }
+
+    fn title(&mut self, id: u32) {
+        TITLE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn stopped(&mut self, reason: &str) {
+        self.reason = reason.to_owned();
+    }
+}
+
+impl Drop for Footer {
+    fn drop(&mut self) {
+        // The same call `lifecycle::end` makes, through the same guard: a run
+        // that returned and a run that was terminated cannot both write it.
+        if let Some(block) = victory_core::report::stop_block(&self.reason, self.started.elapsed()) {
+            victory_core::logging::emit("INFO", &block);
+        }
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

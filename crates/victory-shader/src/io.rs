@@ -396,7 +396,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            push_pair(&mut io, site, interp, attribute);
+                            push_pair(&mut io, site, interp, attribute, false);
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -412,7 +412,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         let interp = halves
                             .pair(&v.src[0], read(2), read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
-                        push_pair(&mut io, site, interp, attribute);
+                        // A 16-bit second half writes one half of its
+                        // destination and keeps the other, which is its first
+                        // half's result: that first half needs a value.
+                        push_pair(&mut io, site, interp, attribute, true);
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
@@ -504,9 +507,12 @@ impl Pair {
 }
 
 /// Records interpolation `pair` at `site`, and its first halves too when
-/// they evaluate on their own (computed barycentrics).
-fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
-    if pair.barycentric.is_none() {
+/// they evaluate on their own (computed barycentrics) or when the second
+/// half keeps the destination half it does not write (`halves`: a 16-bit
+/// pair's result is its old destination's other half, which is the first
+/// half's).
+fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute, halves: bool) {
+    if pair.barycentric.is_none() || halves {
         for &f in &pair.first {
             if !io.interps.iter().any(|(s, _)| *s == f) {
                 io.interps.push((f, Interp::Weighted { attribute }));
@@ -721,6 +727,51 @@ mod tests {
             [
                 ((0, 1), Interp::Weighted { attribute }),
                 ((0, 2), Interp::Weighted { attribute }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_16_bit_pair_records_its_first_half_too() {
+        // A 16-bit second half writes one half of its destination and keeps
+        // the other, which is its first half's result: both are needed even
+        // though the barycentrics are known.
+        let p = program(&[
+            0xD742_000A,
+            0x0002_0103, // v_interp_p1ll_f16 v10, v0, attr3.x high
+            0xD75A_000A,
+            0x042A_0303, // v_interp_p2_f16 v10, v1, attr3.x high, v10
+            S_ENDPGM,
+        ]);
+        let packed = PsInput {
+            row: 3,
+            mask: 0b11,
+            attr: 3,
+            fp16: true,
+            row2: 3,
+            ..TEXCOORD
+        };
+        let io = raise(&p, &pixel(vec![packed], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 3,
+            channel: 0,
+            high: true,
+        };
+        let mut interps = io.interps.clone();
+        interps.sort_by_key(|i| i.0);
+        assert_eq!(
+            interps,
+            [
+                ((0, 0), Interp::Weighted { attribute }),
+                (
+                    (0, 1),
+                    Interp::Interpolated {
+                        attribute,
+                        barycentric: Barycentric::PerspectiveCenter,
+                        first: vec![(0, 0)],
+                    }
+                ),
             ]
         );
     }

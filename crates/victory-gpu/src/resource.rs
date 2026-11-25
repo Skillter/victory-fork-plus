@@ -237,6 +237,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The console formats the host is asked to render to or write as unordered
+/// access, and the host format that stands in for each when it refuses: the
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115) as 8-bit RGBA,
+/// and R9G9B9E5_SHAREDEXP (67) as half float, because the host's own
+/// formats cannot hold those uses ([`target_format`]).
+const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
+
+/// Where console `format` sits in [`STAND_INS`] and the host format that
+/// stands in for it (`DXGI_FORMAT`), if it has one.
+fn stand_in(format: u32) -> Option<(usize, u32)> {
+    STAND_INS
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, (f, _))| f == format)
+        .map(|(i, (_, host))| (i, host))
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -287,7 +305,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
             })
         });
         if refused[i] {
-            return STAND_INS[i].1;
+            return stand_in;
         }
     }
     format
@@ -374,10 +392,33 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes). [`twin_line`] prints the first as
+/// a rate and the other two as totals.
 #[cfg(windows)]
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The depth-twin clause of the frame-rate line, from [`TWINS`] and
+/// [`PLANES`]: two of those counts are swapped every line (a rate), three
+/// are never reset (a total), so the clause names the basis of each. A total
+/// reads as a rate when it sits beside one unmarked.
+#[cfg(windows)]
+pub(crate) fn twin_line(
+    alive: u64,
+    without: u64,
+    into_depth: f64,
+    into_colour: f64,
+    planes: f64,
+    not_given: u64,
+    late: u64,
+) -> String {
+    format!(
+        "depth twins: {alive} alive; per frame: {into_depth:.1} copies into depth textures, \
+         {into_colour:.1} copies into twins, {planes:.1} planes drawn from their twins; so far: \
+         {not_given} times not given back to a twin, {late} times used before the pass, {without} \
+         depth textures left without one"
+    )
+}
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -490,6 +531,7 @@ fn twin_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+        crate::host::note_removal(&e);
     }
     let Some(texture) = texture else {
         TWINS[1].fetch_add(1, Relaxed);
@@ -553,6 +595,7 @@ fn twin_texture(
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+            crate::host::note_removal(&e);
         }
         texture.map(|texture| {
             crate::host::name(&texture, || {
@@ -1161,6 +1204,20 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// How many distinct frames sampled it while its host copy was alive,
+    /// saturating at [`ADMIT_SATURATED`]: 0 never, 1 once, 2 or more often
+    /// ([`admit_step`]).
+    hits: std::sync::atomic::AtomicU8,
+    /// The first and last frames counted in `hits` (the last so that a
+    /// texture sampled twice in one frame counts once).
+    first: std::sync::atomic::AtomicU64,
+    last: std::sync::atomic::AtomicU64,
+    /// When `last` was counted, in the run's own time (`crate::host::now_ms`):
+    /// the frames of [`PROTECTED_FRAMES`] are 10 s only at 60 fps, so
+    /// protection lapses in [`PROTECTED_MS`] as well.
+    sampled_ms: std::sync::atomic::AtomicU64,
+    /// [`Admit`]: 0 unclassified, 1 probation, 2 protected from the sweep.
+    admit: std::sync::atomic::AtomicU8,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1248,6 +1305,22 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    if !same {
+        // Two textures over one address that do not match: the console reads
+        // the one through the other, and the host does not.
+        static SAID: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let at = r.data() as u64;
+        if !said.contains(&at) {
+            said.push(at);
+            tracing::info!(
+                address = format_args!("{at:#x}"),
+                ours = ?r.desc,
+                other = ?o.desc,
+                "two textures hold one address and are not the same shape"
+            );
+        }
+    }
     same.then_some(other)
 }
 
@@ -1405,18 +1478,226 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Frames within which a second sampling protects a texture from the sweep
+/// ([`admit_step`]): a texture the world shows every frame is sampled in
+/// two frames running, a streaming page touched once never is.
+const ADMIT_FRAMES: u64 = 64;
+
+/// `hits` saturates here: a 2-bit count, kept in an `AtomicU8` so that a
+/// texture sampled every frame costs no more than one that never is.
+const ADMIT_SATURATED: u8 = 3;
+
+/// The host copy is on probation: sampled once, so evictable if the card
+/// needs the room ([`admit_step`]).
+const PROBATION: u8 = 1;
+
+/// The host copy is protected from the sweep: sampled again within
+/// [`ADMIT_FRAMES`], so the world is showing it.
+const PROTECTED: u8 = 2;
+
+/// Frames a protected host copy may go unsampled before its protection
+/// lapses ([`protected_at`], [`admit_step`]): 600 frames is 10 s at 60 fps.
+///
+/// A second sample inside [`ADMIT_FRAMES`] protects a copy and `hits` then
+/// saturates, so every later sample answered `PROTECTED` again and nothing
+/// ever gave the protection back: in a long session the set of every texture
+/// ever shown twice filled the budget, `room` then answered `NoRoom` for the
+/// rest of the run and the card could only refuse. Ten seconds is longer
+/// than a scene, a cutscene or a menu lasts, so a texture the world keeps
+/// showing is sampled inside it and stays protected, while the memory of one
+/// scene lapses; it is also far longer than the idle window a sweep waits
+/// out (`IDLE_FRAMES`, `vram_idle_ms`), so a lapsed copy is takeable at once.
+const PROTECTED_FRAMES: u64 = 600;
+
+/// The same window in the run's own time, and the one that usually binds:
+/// 600 frames are 10 s only at 60 fps. The world run in
+/// `run-20261125-055341.log` drew at 8.9 fps (4,936 frames in 556.4 s), so
+/// 600 frames were 67 s: a streaming burst's 2,177 copies stayed protected
+/// for a minute and lapsed together, 1.8 GB the card could not have, while
+/// `room` refused 9,803 slots a window. Lands with the frames
+/// ([`protected_at`]): whichever comes first, as `host::long_ago` does for
+/// the sweep's idle window.
+const PROTECTED_MS: u64 = 10_000;
+
+/// Whether a copy protected by [`admit_step`] still is at `frame` (and
+/// `now_ms`), the frame and the moment last sampled: protection holds while
+/// the texture keeps being sampled inside [`PROTECTED_FRAMES`] **and**
+/// [`PROTECTED_MS`]. Read where protection is asked ([`let_go_idle`],
+/// [`slot_only_idle`], [`let_go_for_room`], [`reclaimable_bytes`],
+/// [`admission`]) rather than stored, so that a texture nothing samples again
+/// lapses without a sample of its own.
+pub(crate) fn protected_at(admit: u8, last: u64, last_ms: u64, frame: u64, now_ms: u64) -> bool {
+    admit == PROTECTED
+        && frame.saturating_sub(last) <= PROTECTED_FRAMES
+        && now_ms.saturating_sub(last_ms) <= PROTECTED_MS
+}
+
+/// Whether `r`'s host copy is protected from the sweep now: the state
+/// [`note_sampled`] last stored and the frame and the moment it counted, read
+/// against the frame running ([`protected_at`]), so that a copy nothing
+/// samples again lapses without a sample of its own.
+#[cfg(windows)]
+fn protected_now(r: &Resource) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    protected_at(
+        r.host.admit.load(Relaxed),
+        r.host.last.load(Relaxed),
+        r.host.sampled_ms.load(Relaxed),
+        crate::frame::current(),
+        crate::host::now_ms(),
+    )
+}
+
+/// The state [`admit_step`] leaves after a frame `frame` sampled the
+/// texture, from the hits it had and the first and last frames counted:
+/// `hits` (saturating), the first frame of the window, and the admission
+/// ([`PROBATION`] or [`PROTECTED`]). A frame that samples it twice counts
+/// once; a first sample puts it on probation; a second inside
+/// [`ADMIT_FRAMES`] of the first protects it; a sample after more than
+/// [`ADMIT_FRAMES`] of none starts the window again, so that a copy sampled
+/// twice long ago is on probation again and only sampling it again now
+/// protects it (`hits` does not decay by itself, [`protected_at`]).
+///
+/// Frequency, not just recency: without this the sweep let a whole world
+/// set go to make room for streaming pages nothing showed twice.
+pub(crate) fn admit_step(hits: u8, first: u64, last: u64, frame: u64) -> (u8, u64, u8) {
+    if hits > 0 && frame.saturating_sub(last) > ADMIT_FRAMES {
+        return (1, frame, PROBATION);
+    }
+    if hits > 0 && frame == last {
+        return (hits, first, if hits >= PROTECTED { PROTECTED } else { PROBATION });
+    }
+    if hits == 0 {
+        (1, frame, PROBATION)
+    } else if hits == 1 {
+        if frame.saturating_sub(first) <= ADMIT_FRAMES {
+            (PROTECTED, first, PROTECTED)
+        } else {
+            (1, frame, PROBATION)
+        }
+    } else {
+        (hits.saturating_add(1).min(ADMIT_SATURATED), first, PROTECTED)
+    }
+}
+
+/// Whether a sweep may let the host copy of a texture go now: it was not
+/// asked for in the idle window, only its title texture holds it (no list,
+/// no slot), and it is not protected ([`PROTECTED`]).
+pub(crate) fn sweepable(idle: bool, strong: usize, references: u32, protected: bool) -> bool {
+    idle && strong == 1 && references == 1 && !protected
+}
+
+/// Whether a copy referenced by one descriptor slot only may be reclaimed
+/// ([`slot_only_idle`]): the slot's own reference does not veto this, and
+/// the caller marks the slot gone first, which leaves [`sweepable`] to take
+/// it.
+fn reclaimable_slot(idle: bool, strong: usize, references: u32, protected: bool) -> bool {
+    idle && strong == 1 && references == 2 && !protected
+}
+
+/// Frames a host copy must also be unasked for before a sweep may take it
+/// ([`long_ago`]'s frame count): a recent use is not enough to keep it, but
+/// a use in the last few frames is.
+const IDLE_FRAMES: u64 = 4;
+
+/// Bytes of host copies of textures the title fills that may always be
+/// made ([`room`]).
+#[cfg(windows)]
+const FLOOR: u64 = 2 << 30;
+
+/// The same, when the card does not say its budget.
+#[cfg(windows)]
+const WITHOUT_BUDGET: u64 = 4 << 30;
+
+/// Why [`room`] refused more host copies of textures the title fills, with
+/// the numbers of the rule that refused: the pass over textures picked by
+/// index prints one line of them a window (`draw.rs` `heap_textures`), not
+/// one per texture.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct NoRoom {
+    /// The bytes of host copies of textures the title fills alive then
+    /// ([`KINDS`] 1).
+    filled: u64,
+    /// The card's budget and use of its own memory, then of the PC's memory
+    /// it shares (`crate::host::Host::video_memory`), if it says.
+    card: Option<[u64; 4]>,
+    /// Which rule refused.
+    rule: Rule,
+}
+
+/// The rule [`room`] refused by.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Rule {
+    /// `VICTORY_TEXTURE_BUDGET_MB`: a limit on those copies' bytes.
+    Limit(u64),
+    /// Past [`room_percent`] percent of the card's budget, past [`FLOOR`].
+    Budget,
+    /// The card does not say its budget, and the copies hold
+    /// [`WITHOUT_BUDGET`] bytes.
+    Unsaid,
+}
+
+#[cfg(windows)]
+impl NoRoom {
+    /// The rule that refused and the numbers it refused on: for the line
+    /// that says why textures picked by index wait.
+    pub(crate) fn why(&self) -> String {
+        let filled = self.filled >> 20;
+        let card = match self.card {
+            Some([budget, used, ..]) => format!(
+                "the card: {} MB budget, {} MB in use, {} MB available",
+                budget >> 20,
+                used >> 20,
+                budget.saturating_sub(used) >> 20
+            ),
+            None => "the card does not say its budget".to_owned(),
+        };
+        let rule = match self.rule {
+            Rule::Limit(limit) => format!(
+                "VICTORY_TEXTURE_BUDGET_MB allows {} MB of them and {filled} MB are alive; {card}",
+                limit >> 20
+            ),
+            Rule::Budget => format!(
+                "the card is at {}% of its budget ({filled} MB of them alive, past the {} MB floor); {card}",
+                room_percent(),
+                FLOOR >> 20
+            ),
+            Rule::Unsaid => format!(
+                "{filled} MB of them alive, past the {} MB floor, and {} MB is all they may hold without a budget from the card: {card}",
+                FLOOR >> 20,
+                WITHOUT_BUDGET >> 20
+            ),
+        };
+        // How far a sweep would get: what the idle copies nothing else
+        // holds would give back now, and what the reclaim path a refusal
+        // takes could. The refusal stands as it is; the line only says
+        // whether the sweep is the rule that must change.
+        let (sweep, slots) = reclaimable_bytes();
+        let sweep = match (sweep, slots) {
+            (0, 0) => "a sweep would reclaim nothing now".to_owned(),
+            (sweep, slots) => format!(
+                "a sweep could let go {} MB now, and {} MB through their slots",
+                sweep >> 20,
+                slots >> 20
+            ),
+        };
+        format!("{rule}; {sweep}")
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// by this process is under [`room_percent`] percent of the budget the
+/// system gives it (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those
+/// copies' bytes instead). Past the budget the system moves the card's
+/// memory into the PC's, which ended runs 20 and 24. `Err` names the rule
+/// that refused and carries its numbers ([`NoRoom::why`]).
 #[cfg(windows)]
-pub(crate) fn room() -> bool {
+pub(crate) fn room() -> Result<(), NoRoom> {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1426,10 +1707,15 @@ pub(crate) fn room() -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        if filled < limit {
+            return Ok(());
+        }
+        // Asked for only when a rule refuses: the pass asks every pass.
+        let card = crate::host::host().and_then(|h| h.video_memory());
+        return Err(NoRoom { filled, card, rule: Rule::Limit(limit) });
     }
     if filled < FLOOR {
-        return true;
+        return Ok(());
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
         // What is kept for card copies of title buffers not made yet
@@ -1754,7 +2040,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1773,12 +2058,18 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+            // A texture the world samples again and again is not swept to
+            // make room for streaming pages nothing shows twice.
+            let protected = protected_now(r);
+            let take = made.as_ref().is_some_and(|(host, _)| {
+                sweepable(
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+                    std::sync::Arc::strong_count(host),
+                    crate::host::references(&host.texture),
+                    protected,
+                )
             });
-            if idle {
+            if take {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -2036,6 +2327,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether the host takes a clear value for a texture with these flags:
+/// `CreateCommittedResource` answers `E_INVALIDARG` for a clear value on a
+/// texture that is neither a render target nor a depth target (only those
+/// two flags have an optimised clear). The console ignores the pointer, so
+/// the title passes one for every texture it fills: the description says
+/// `flags: 0` and the create was refused whole.
+fn takes_clear_value(flags: u32) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    flags & (TARGET | DEPTH) != 0
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2096,7 +2399,7 @@ fn host_texture_as(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && takes_clear_value(d.flags)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2229,6 +2532,52 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Diagnostics: what lives in `this`'s memory besides it. `alias_of` looks
+/// only at an equal address and the same shape, so a texture the title
+/// presents and a texture it renders to that differ in height (1080 over
+/// 1088, scanout padding) or in format are two textures here and the same
+/// memory there.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn overlaps(this: This) -> String {
+    let Some((start, d)) = texture_memory(this) else {
+        return String::from("not a texture");
+    };
+    let at = start as u64;
+    let end = at.saturating_add(footprint(&d).map_or(0, |f| f.size).max(1));
+    let written = TARGETS_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&at);
+    let mut said = vec![format!(
+        "itself {at:#x} {}x{} f{} mips {} layers {} flags {:#x} {}",
+        d.width,
+        d.height,
+        d.format,
+        d.mip_levels,
+        d.depth_or_array_size,
+        d.flags,
+        if written { "host rendered" } else { "from its memory" }
+    )];
+    for other in textures().iter().copied() {
+        let other = other as This;
+        if other == this {
+            continue;
+        }
+        let Some((p, o)) = texture_memory(other) else {
+            continue;
+        };
+        let os = p as u64;
+        let oend = os.saturating_add(footprint(&o).map_or(0, |f| f.size).max(1));
+        if os < end && at < oend {
+            said.push(format!(
+                "{os:#x} {}x{} f{} mips {} layers {} flags {:#x}",
+                o.width, o.height, o.format, o.mip_levels, o.depth_or_array_size, o.flags
+            ));
+        }
+    }
+    said.join("; ")
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -2291,6 +2640,11 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            hits: std::sync::atomic::AtomicU8::new(0),
+            first: std::sync::atomic::AtomicU64::new(0),
+            last: std::sync::atomic::AtomicU64::new(0),
+            sampled_ms: std::sync::atomic::AtomicU64::new(0),
+            admit: std::sync::atomic::AtomicU8::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2548,8 +2902,8 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 #[cfg(windows)]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// See [`PLACED_TWINS`].
-#[cfg(windows)]
+/// See [`PLACED_TWINS`], for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2583,20 +2937,42 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+fn placed_key(desc: &[u32; 14]) -> [u32; 14] {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut key = *desc;
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
     // them each got a resource and a host copy of their own, on a card
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
-    let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
+    key
+}
+
+/// The resource of a texture placed at `address` with resource description
+/// `desc` (as words), if one was made ([`texture_at`] makes it); never makes
+/// one. For the reclaim path, which must not allocate while the card is
+/// full.
+#[cfg(windows)]
+pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let key = placed_key(desc);
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, key))
+        .map(|&r| r as This)
+}
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let raw = *desc;
+    let key = placed_key(desc);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -2875,6 +3251,48 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// The console's shared exponent target (67) stands in as half float, not
+    /// as the UNORM of the same shape: the exposure chain's values past 1.0
+    /// are what the UNORM format clamps. Half float is also a render target
+    /// and a typed unordered access format on every host, so the stand-in
+    /// needs no capability check of its own.
+    #[test]
+    fn the_shared_exponent_target_stands_in_as_half_float() {
+        const HALF_FLOAT: u32 = 10;
+        const UNORM: u32 = 11;
+        assert_eq!(stand_in(67), Some((2, HALF_FLOAT)));
+        assert_ne!(stand_in(67), Some((2, UNORM)), "UNORM clamps every HDR value to 1.0");
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
+            };
+            assert_eq!(HALF_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT.0 as u32);
+            assert_eq!(UNORM, DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32);
+        }
+        // The 16-bit colour formats stand in as 8-bit RGBA; a format the host
+        // renders to as it is has no stand-in.
+        assert_eq!(stand_in(86), Some((0, 28)));
+        assert_eq!(stand_in(115), Some((1, 28)));
+        assert_eq!(stand_in(10), None);
+        assert_eq!(stand_in(28), None);
+    }
+
+    #[test]
+    fn a_clear_value_goes_only_to_a_target() {
+        // CreateCommittedResource refuses a clear value on a texture that is
+        // neither a render target nor a depth target: the title passes one
+        // for every texture it fills, and those creates came back
+        // E_INVALIDARG (the console ignores the pointer).
+        assert!(!takes_clear_value(0));
+        assert!(!takes_clear_value(4)); // unordered access only
+        assert!(!takes_clear_value(8 | 4)); // no shader access
+        assert!(takes_clear_value(1)); // render target
+        assert!(takes_clear_value(2)); // depth
+        assert!(takes_clear_value(1 | 4));
+        assert!(takes_clear_value(2 | 8));
     }
 
     #[test]
@@ -3986,5 +4404,218 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// The line that says why textures picked by index wait names the rule
+    /// that refused and the numbers it refused on.
+    #[cfg(windows)]
+    #[test]
+    fn the_room_line_names_the_rule_that_refused() {
+        let card = [12 << 30, 11 << 30, 0, 0];
+        let limit = NoRoom { filled: 9 << 30, card: Some(card), rule: Rule::Limit(8 << 30) };
+        let text = limit.why();
+        assert!(text.contains("VICTORY_TEXTURE_BUDGET_MB"), "{text}");
+        assert!(text.contains("allows 8192 MB"), "{text}");
+        assert!(text.contains("9216 MB are alive"), "{text}");
+        assert!(text.contains("12288 MB budget, 11264 MB in use, 1024 MB available"), "{text}");
+        let budget = NoRoom { filled: 9 << 30, card: Some(card), rule: Rule::Budget };
+        let text = budget.why();
+        assert!(text.contains("90% of its budget"), "{text}");
+        assert!(text.contains("past the 2048 MB floor"), "{text}");
+        let unsaid = NoRoom { filled: 5 << 30, card: None, rule: Rule::Unsaid };
+        let text = unsaid.why();
+        assert!(text.contains("does not say its budget"), "{text}");
+        assert!(text.contains("4096 MB is all they may hold"), "{text}");
+    }
+
+    /// Frequency admission: a texture sampled once is on probation and the
+    /// sweep may take it; sampled again inside the frame window it is
+    /// protected; a second sample too late starts the window again; two
+    /// samples in one frame count once; the count saturates.
+    #[test]
+    fn one_sample_is_probation_and_two_in_the_window_protect() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 10);
+        assert_eq!((hits, first, admit), (1, 10, PROBATION));
+        // The same frame again: still one hit on probation.
+        assert_eq!(admit_step(hits, first, 10, 10), (1, 10, PROBATION));
+        // The next frame, inside the window: protected.
+        let (hits, first, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, first, admit), (PROTECTED, 10, PROTECTED));
+        // Later samples stay protected and saturate.
+        let (hits, _, admit) = admit_step(hits, first, 11, 12);
+        assert_eq!((hits, admit), (ADMIT_SATURATED, PROTECTED));
+        let mut last = 12;
+        for frame in 13..40 {
+            let (h, _, a) = admit_step(hits, first, last, frame);
+            assert_eq!((h, a), (ADMIT_SATURATED, PROTECTED));
+            last = frame;
+        }
+    }
+
+    /// A second sample outside the window does not protect: the window
+    /// starts again at the later frame, still on probation.
+    #[test]
+    fn a_second_sample_outside_the_window_restarts_on_probation() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 0);
+        assert_eq!((hits, first, admit), (1, 0, PROBATION));
+        let late = ADMIT_FRAMES + 1;
+        assert_eq!(admit_step(hits, first, 0, late), (1, late, PROBATION));
+        // And the frame just inside the window would have protected it.
+        assert_eq!(admit_step(1, 0, 0, ADMIT_FRAMES), (PROTECTED, 0, PROTECTED));
+    }
+
+    /// Protection lapses: a copy protected at frame 10 that nothing samples
+    /// again is on probation by frame 700, and the sweep may take it; one
+    /// sampled inside the window is still protected, and a single sample
+    /// after the lapse does not protect it again (a saturated `hits` alone
+    /// used to protect it forever, which filled the budget in a long run).
+    #[test]
+    fn protection_lapses_when_nothing_samples_the_copy() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 10);
+        assert_eq!((hits, first, admit), (1, 10, PROBATION));
+        let (hits, first, admit) = admit_step(hits, first, 10, 12);
+        assert_eq!((hits, admit), (PROTECTED, PROTECTED), "sampled again: the world shows it");
+        // Read where the sweep asks: inside the window it holds, in frames
+        // and in the run's own time.
+        let at = 12 + PROTECTED_FRAMES;
+        assert!(protected_at(admit, 12, 200, at, 200 + PROTECTED_MS));
+        assert!(!sweepable(true, 1, 1, protected_at(admit, 12, 200, at, 200 + PROTECTED_MS)));
+        // 688 frames on, nothing has sampled it: the sweep may take it.
+        let at = 700;
+        let protected = protected_at(admit, 12, 200, at, 200 + 11_500);
+        assert!(!protected, "a copy nothing sampled for 688 frames is still protected");
+        assert!(sweepable(true, 1, 1, protected), "the sweep cannot take a lapsed copy");
+        assert!(reclaimable_slot(true, 1, 2, protected), "reclaim cannot take a lapsed copy");
+        // Sampled once after the lapse: the window starts again, so one
+        // sample does not re-protect a texture the run has not shown for
+        // ten seconds.
+        assert_eq!(admit_step(hits, first, 12, at), (1, at, PROBATION));
+        // And a texture the world keeps showing never lapses: every frame
+        // inside the window keeps it protected and saturated.
+        let (mut h, mut l) = (hits, 12);
+        for frame in 13..1_000 {
+            let (nh, _, na) = admit_step(h, first, l, frame);
+            assert_eq!(na, PROTECTED, "frame {frame}");
+            (h, l) = (nh, frame);
+        }
+        assert_eq!(h, ADMIT_SATURATED);
+    }
+
+    /// The window is the shorter of `PROTECTED_FRAMES` and `PROTECTED_MS`:
+    /// 600 frames are 10 s only at 60 fps, and the run these numbers come
+    /// from drew at 8.9 fps, where 600 frames were 67 s and a minute of
+    /// every texture ever shown stayed protected (2,177 copies, 1.8 GB,
+    /// lapsing together) while the card refused 9,803 slots a window.
+    #[test]
+    fn protection_lapses_in_the_runs_time_too() {
+        let (hits, first, _) = admit_step(0, 0, 0, 10);
+        let (hits, _, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, admit), (PROTECTED, PROTECTED));
+        // 100 frames of an 8.9 fps run: past 10 s, so protection is over
+        // though the frames alone still say it holds.
+        let frame = 11 + 100;
+        assert!(frame - 11 <= PROTECTED_FRAMES, "the frames alone still hold");
+        assert!(!protected_at(admit, 11, 1_000, frame, 11_200), "11.2 s on, the run says no");
+        // Inside both windows it holds.
+        assert!(protected_at(admit, 11, 1_000, frame, 10_900), "9.9 s on: both hold");
+        // Inside the time, past the frames: over too.
+        let late = 11 + PROTECTED_FRAMES + 1;
+        assert!(!protected_at(admit, 11, 1_000, late, 10_900), "the frames say no");
+    }
+
+    /// A copy sampled twice, then left alone for longer than the admission
+    /// window but less than the lapse window, is on probation again: `hits`
+    /// does not decay by itself, and one sample after a gap used to answer
+    /// `PROTECTED` from the count alone, so a single touch every few seconds
+    /// kept a copy for the rest of the run.
+    #[test]
+    fn a_gap_longer_than_the_window_spends_the_count() {
+        let (hits, first, _) = admit_step(0, 0, 0, 10);
+        let (hits, first, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, admit), (PROTECTED, PROTECTED));
+        // Sampled again 100 frames later: inside the lapse window (600
+        // frames), outside the admission window (64).
+        let late = 11 + 100;
+        assert!(late - 11 > ADMIT_FRAMES && late - 11 <= PROTECTED_FRAMES);
+        assert_eq!(admit_step(hits, first, 11, late), (1, late, PROBATION));
+        // Two samples now protect it again.
+        let (hits, first, admit) = admit_step(1, late, late, late + 1);
+        assert_eq!((hits, admit), (PROTECTED, PROTECTED));
+        // The pass that keeps being drawn every frame keeps its count.
+        let (hits, first, _) = admit_step(hits, first, late + 1, late + 2);
+        assert_eq!((hits, first), (ADMIT_SATURATED, late));
+    }
+
+    /// The admission line counts the copies the sweep could ever take: a
+    /// texture the title fills, which the host never wrote. A render target
+    /// or a depth texture sampled by a later pass is held by the slots and
+    /// lists that name it, not by the sweep: it is in no figure of the line,
+    /// whatever the frames did to its admission state.
+    #[test]
+    fn the_admission_line_counts_no_copy_the_host_wrote() {
+        // Sampled twice, then left alone: the state it is in does not put it
+        // in the line.
+        let (hits, first, _) = admit_step(0, 0, 0, 10);
+        let (hits, first, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, first, admit), (PROTECTED, 10, PROTECTED));
+        assert_eq!(admission_slot(true, true, protected_at(admit, 11, 200, 12, 300)), None);
+        assert_eq!(
+            admission_slot(
+                true,
+                true,
+                protected_at(admit, 11, 200, 11 + PROTECTED_FRAMES + 1, 11_000)
+            ),
+            None
+        );
+        // A buffer is not a texture the title fills.
+        assert_eq!(admission_slot(false, false, true), None);
+        // The two splits of the line, for the copies the sweep manages.
+        assert_eq!(admission_slot(true, false, true), Some(0));
+        assert_eq!(admission_slot(true, false, false), Some(2));
+    }
+
+    /// A copy a descriptor slot shows is not swept (its reference is 2, not
+    /// 1); the reclaim path may take it once the slot is marked gone
+    /// (`texture_slot_gone`, which leaves the sweep's reference of 1), and a
+    /// protected copy is taken by neither.
+    #[test]
+    fn a_slot_reference_vetoes_the_sweep_but_not_the_reclaim() {
+        assert!(sweepable(true, 1, 1, false), "idle, only the resource holds it");
+        assert!(!sweepable(false, 1, 1, false), "used this pass: never taken");
+        assert!(!sweepable(true, 2, 1, false), "a list holds it: never taken");
+        assert!(!sweepable(true, 1, 2, false), "a slot holds it: the sweep does not take it");
+        assert!(reclaimable_slot(true, 1, 2, false), "a slot alone holds it: reclaim may");
+        assert!(!reclaimable_slot(false, 1, 2, false), "used this pass: never taken");
+        assert!(!reclaimable_slot(true, 1, 3, false), "a list too: never taken");
+        assert!(!reclaimable_slot(true, 1, 2, true), "protected: never taken");
+        // The slot marked gone leaves the sweep's reference of 1.
+        assert!(sweepable(true, 1, 1, false), "reclaimed after `texture_slot_gone`");
+    }
+
+    /// Two of the depth-twin counts are swapped every line and three are
+    /// never reset: the clause states each count's basis, so a total is not
+    /// read as a rate (`PLANES[1]` and `PLANES[2]` only grow).
+    #[cfg(windows)]
+    #[test]
+    fn twin_line_marks_the_counts_that_never_reset() {
+        let line = twin_line(47, 0, 0.0, 1.0, 1.0, 1726, 1728);
+        assert_eq!(line.matches("per frame").count(), 1, "{line}");
+        let Some((rates, totals)) = line.split_once("so far") else {
+            panic!("counts that never reset are not marked `so far`: {line}");
+        };
+        for rate in ["1.0 copies into twins", "1.0 planes drawn from their twins"] {
+            assert!(rates.contains(rate), "{rate} is not in the per-frame part: {line}");
+        }
+        // Each total follows the mark, and no total is stated as a rate.
+        let totals_expected = [
+            "1726 times not given back",
+            "1728 times used before the pass",
+            "0 depth textures",
+        ];
+        for total in totals_expected {
+            assert!(totals.contains(total), "{total} is not in the `so far` part: {line}");
+            assert!(!rates.contains(total), "{total} reads as a rate: {line}");
+        }
+        assert!(rates.contains("per frame:"), "the rates are not named: {line}");
     }
 }

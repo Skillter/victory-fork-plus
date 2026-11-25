@@ -10,7 +10,20 @@
 //! per level, counted in bytes), with at most the staging buffer's worth of
 //! compressed source in flight. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
-//! destination (an address, or physical pages). Completion is what stays
+//! destination (an address, or physical pages). Files are read through second
+//! handles that leave the Windows file cache out: the package is 208 GB and
+//! the title's working set is its GPU memory living in host RAM, so passing
+//! every byte through the cache costs more than the read. A handle takes one
+//! read at a time, so each file carries a pool of them; reads are positioned
+//! through `OVERLAPPED`, so a worker never moves a file pointer another worker
+//! is reading from, and a read waits for itself and not for the handle. A
+//! compressed block's length is not a sector multiple, so a request is read as
+//! the whole sectors that hold it and copied out of them. Only a file the host
+//! would not open unbuffered goes through the title's cached handle, and the
+//! five-second line counts that. `VICTORY_DSTORAGE_WORKERS` (default
+//! `min(64, 4 x cores)`) and
+//! `VICTORY_DSTORAGE_STAGING_MB` (default the console's 32) bound the pool and
+//! the compressed bytes in flight. Completion is what stays
 //! in order: a status entry is written once every request enqueued before
 //! it on its queue has finished, with the first failure (in queue order)
 //! since the previous status entry, or success.
@@ -18,15 +31,17 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
+use super::files::host;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
@@ -218,11 +233,18 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. `VICTORY_DSTORAGE_STAGING_MB`
+/// wins over the title's number: it is the only bound on compressed bytes in
+/// flight, so it is the switch to raise when the five-second line shows waits
+/// for staging while the pool is idle.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        let mut lanes = scheduler.lock();
+        match staging_override() {
+            Some(mb) => tracing::info!(staging = mb, "dstorage: staging buffer size from the switch"),
+            None => lanes.staging = u64::from(size),
+        }
     }
     S_OK
 }
@@ -259,7 +281,135 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
+    /// The title's handle, opened with the title's own flags: buffered, and
+    /// the fallback for a request an unbuffered read cannot serve.
     file: std::fs::File,
+    /// A second handle on the same file, opened without the file cache. The
+    /// package is 208 GB: read through the cache, every byte of it evicts the
+    /// title's working set, which is its GPU memory living in host RAM.
+    direct: Option<Direct>,
+}
+
+/// An unbuffered handle of a file: no file cache, and overlapped, so the
+/// offset comes from the `OVERLAPPED` of each read and a read waits for
+/// itself, never for the handle's other reads.
+struct DirectFile(std::fs::File);
+
+impl DirectFile {
+    fn handle(&self) -> *mut c_void {
+        self.0.as_raw_handle()
+    }
+}
+
+/// The handles a file's reads go through, and the workers waiting for one.
+///
+/// They leave the file cache out: the package is 208 GB, and read through the
+/// cache every byte of it evicts the title's working set, which is its GPU
+/// memory living in host RAM. Each is positioned, so it carries no file
+/// pointer, and each serves one read at a time, so the pool is what puts
+/// reads at the drive together (36 KiB reads on a 990 EVO Plus: one handle
+/// served 64 workers at 171 MB/s, eight at 255, and asynchronous reads on one
+/// at 365).
+struct Direct {
+    /// Handles no read is using. Never empty for long: a lease returns its own.
+    free: Mutex<Vec<DirectFile>>,
+    /// A lease returned a handle.
+    returned: Condvar,
+}
+
+/// Unbuffered handles per file: the knee of that curve, and eight reads at the
+/// drive from every file the title streams from.
+const HANDLES: usize = 8;
+
+impl Direct {
+    fn new(files: Vec<DirectFile>) -> Direct {
+        Direct {
+            free: Mutex::new(files),
+            returned: Condvar::new(),
+        }
+    }
+
+    /// One handle for the length of a read, waiting when every other is out.
+    fn lease(&self) -> Lease<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(file) = free.pop() {
+                return Lease {
+                    direct: self,
+                    file: Some(file),
+                };
+            }
+            free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A file's unbuffered handle, held for the length of one read and given back
+/// to the pool when dropped, whatever the read did.
+struct Lease<'a> {
+    direct: &'a Direct,
+    file: Option<DirectFile>,
+}
+
+impl std::ops::Deref for Lease<'_> {
+    type Target = DirectFile;
+
+    fn deref(&self) -> &DirectFile {
+        // A lease always holds a handle; `Drop` takes it out.
+        self.file.as_ref().expect("a lease holds a handle")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        self.direct
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(file);
+        self.direct.returned.notify_one();
+    }
+}
+
+/// The unbuffered handles for the file `path` names, `HANDLES` of them at most;
+/// `None` when the host refuses even one (a file system or a share that does
+/// not allow it). Reads then stay buffered, and the five-second line counts
+/// them.
+fn direct_handles(path: *const u16) -> Option<Direct> {
+    let first = direct_handle(path)?;
+    let mut files = vec![first];
+    while files.len() < HANDLES {
+        match direct_handle(path) {
+            Some(file) => files.push(file),
+            None => break,
+        }
+    }
+    Some(Direct::new(files))
+}
+
+/// One handle the file cache stays out of.
+fn direct_handle(path: *const u16) -> Option<DirectFile> {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
+    let handle = super::files::CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        NO_BUFFERING | OVERLAPPED,
+        std::ptr::null_mut(),
+    );
+    if handle as isize == -1 {
+        tracing::debug!("dstorage: no unbuffered handle for a file; its reads stay buffered");
+        return None;
+    }
+    // SAFETY: a handle we just opened and nobody else owns.
+    Some(DirectFile(unsafe { std::fs::File::from_raw_handle(handle) }))
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -334,6 +484,47 @@ struct Scheduler {
 const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
+/// The alignment an unbuffered read needs: the sector, which the console's
+/// package layout follows (a 512-byte host sector divides it).
+const SECTOR: usize = 4096;
+/// `FILE_FLAG_NO_BUFFERING`: the drive is asked directly, and the cache is not
+/// filled. Offsets, lengths and buffer addresses must be on a sector.
+const NO_BUFFERING: u32 = 0x2000_0000;
+/// `FILE_FLAG_OVERLAPPED`: a read carries its own offset and its own
+/// completion, so reads on one handle do not queue at the file object. Without
+/// it Windows serialises every read on the handle at queue depth one, whatever
+/// the pool, and `seek_read` is the only positioned read that works.
+const OVERLAPPED: u32 = 0x4000_0000;
+/// A per-worker read buffer above this size is not kept: that request gets one
+/// of its own, so one large read does not pin memory in every worker.
+const SCRATCH_KEEP: usize = 4 << 20;
+/// Workers started, for the five-second line.
+static WORKERS: AtomicU64 = AtomicU64::new(0);
+
+/// The staging budget, when `VICTORY_DSTORAGE_STAGING_MB` says it must differ
+/// from the console's: the budget bounds the compressed bytes in flight, so a
+/// run whose line shows workers waiting for staging can raise it without a
+/// rebuild.
+fn staging_override() -> Option<u64> {
+    std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb << 20)
+}
+
+/// The pool's size: `VICTORY_DSTORAGE_WORKERS`, else four per core up to 64.
+/// A worker waits on its own read, so the pool is what keeps the drive busy
+/// while other workers inflate.
+fn worker_count() -> usize {
+    let default = std::thread::available_parallelism()
+        .map_or(16, |n| n.get().saturating_mul(4).min(64));
+    std::env::var("VICTORY_DSTORAGE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
@@ -355,6 +546,12 @@ struct Lanes {
     /// running them.
     done: (u64, u64, std::time::Duration),
     refused: u64,
+    /// The same window's high-water marks: requests started, staging bytes
+    /// held, and requests running at once. High water is what tells the line
+    /// whether the budget or the pool was the limit, not the average.
+    started: u64,
+    staged_high: u64,
+    running_high: usize,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
@@ -406,13 +603,16 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_override().unwrap_or(STAGING),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
                     lane_now: [0; 3],
                     done: Default::default(),
                     refused: 0,
+                    started: 0,
+                    staged_high: 0,
+                    running_high: 0,
                     bcpack: Default::default(),
                     since: None,
                 }),
@@ -422,7 +622,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -431,6 +631,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
+        WORKERS.store(started as u64, Ordering::Relaxed);
         tracing::info!(workers = started, "dstorage: workers");
     });
     Some(scheduler)
@@ -521,7 +722,7 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
+    /// Counts a finished request; every 5 s one line sums the window up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
@@ -541,23 +742,55 @@ impl Lanes {
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
-            let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
-            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
-                requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
-                staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
-                waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
-            );
+            let window = self.window(elapsed);
+            if window.reads > 0 || window.finished > 0 || window.waiting > 0 {
+                tracing::info!(
+                    requests = window.finished,
+                    reads = window.reads,
+                    mb_per_s = format_args!("{:.1}", window.mb_per_s()),
+                    read_mb_per_s = format_args!("{:.1}", window.read_mb_per_s()),
+                    staging_waits = window.staging_waits,
+                    buffered_reads = window.buffered,
+                    widened_reads = window.widened,
+                    "{}",
+                    window.sentence()
+                );
+            }
             self.done = Default::default();
             self.bcpack = Default::default();
+            self.refused = 0;
+            self.started = 0;
+            self.staged_high = self.staged;
+            self.running_high = 0;
             self.since = None;
+        }
+    }
+
+    /// The window's numbers, taking the counters the workers add to.
+    fn window(&mut self, elapsed: std::time::Duration) -> Window {
+        let (reads, read_bytes, read_ns, read_worst_ns) = READS.take();
+        let (_, inflate_bytes, inflate_ns, _) = INFLATED.take();
+        Window {
+            elapsed,
+            reads,
+            read_bytes,
+            read_ns,
+            read_worst_ns,
+            buffered: BUFFERED.swap(0, Ordering::Relaxed),
+            widened: WIDENED.swap(0, Ordering::Relaxed),
+            started: self.started,
+            finished: self.done.0,
+            bytes: self.done.1,
+            busy_ns: self.done.2.as_nanos() as u64,
+            staging_waits: self.refused,
+            staged_high: self.staged_high,
+            staging: self.staging,
+            running_high: self.running_high,
+            waiting: self.lanes.values().map(|l| l.reads.len()).sum(),
+            inflate_bytes,
+            inflate_ns,
+            bcpack_bytes: self.bcpack.0,
+            bcpack_ns: self.bcpack.1.as_nanos() as u64,
         }
     }
 
@@ -571,6 +804,7 @@ impl Lanes {
             .filter(|(_, l)| l.class == class)
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
+        let running: usize = self.lanes.values().map(|l| l.running.len()).sum();
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
@@ -582,6 +816,9 @@ impl Lanes {
         lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
+        self.started += 1;
+        self.staged_high = self.staged_high.max(self.staged);
+        self.running_high = self.running_high.max(running + 1);
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -635,6 +872,103 @@ impl Lanes {
             }
         }
         lane.flush();
+    }
+}
+
+/// What one five-second window did, in the numbers that tell a
+/// staging-starved run from a thread-starved or disk-limited one: staging
+/// high water against the budget, running high water against the pool, and
+/// the share of the window workers spent waiting for the drive.
+#[derive(Default)]
+struct Window {
+    elapsed: std::time::Duration,
+    /// File reads, the bytes they were asked for, and the time they took.
+    reads: u64,
+    read_bytes: u64,
+    read_ns: u64,
+    read_worst_ns: u64,
+    /// Reads that went through the title's buffered handle instead.
+    buffered: u64,
+    /// Reads served by reading the sectors that hold them.
+    widened: u64,
+    started: u64,
+    finished: u64,
+    /// Destination bytes written, and worker time spent on the requests.
+    bytes: u64,
+    busy_ns: u64,
+    staging_waits: u64,
+    staged_high: u64,
+    staging: u64,
+    running_high: usize,
+    waiting: usize,
+    inflate_bytes: u64,
+    inflate_ns: u64,
+    bcpack_bytes: u64,
+    bcpack_ns: u64,
+}
+
+impl Window {
+    fn secs(&self) -> f64 {
+        self.elapsed.as_secs_f64().max(1e-6)
+    }
+
+    /// Destination bytes per second: what the title got.
+    fn mb_per_s(&self) -> f64 {
+        self.bytes as f64 / 1e6 / self.secs()
+    }
+
+    /// Bytes per second off the file: what the drive gave.
+    fn read_mb_per_s(&self) -> f64 {
+        self.read_bytes as f64 / 1e6 / self.secs()
+    }
+
+    /// Worker-time in `ns` as a count of workers.
+    fn workers(&self, ns: u64) -> f64 {
+        ns as f64 / 1e9 / self.secs()
+    }
+
+    /// The line: one sentence, the shape the rest of the log uses, because
+    /// the numbers only mean something together (a wait for staging with an
+    /// idle pool is a different fault from a busy pool reading slowly).
+    fn sentence(&self) -> String {
+        let count = self.reads;
+        let mean_ms = self.read_ns as f64 / 1e6 / count.max(1) as f64;
+        let pool = WORKERS.load(Ordering::Relaxed).max(1) as f64;
+        let busy = self.workers(self.busy_ns);
+        format!(
+            "dstorage: last {secs:.1} s: {read_mb:.0} MB read in {count} reads ({read_rate:.1} MB/s), \
+             {mb:.0} MB written at {rate:.1} MB/s, {started} requests started and {finished} finished; \
+             a read took {mean_ms:.1} ms on average and {worst:.1} ms at worst, {buffered} through the \
+             file cache, {widened} through a sector window; staging peaked at {staged:.1} MB of \
+             {budget:.1} MB with {waits} waits, {running} requests ran at once of {pool:.0} workers \
+             ({busy:.2} busy, {reading:.2} waiting on the drive); {waiting} requests were queued; \
+             zlib made {zlib:.0} MB in {zlib_workers:.2} workers of time, BCPack {bcpack:.0} MB in \
+             {bcpack_workers:.2} workers",
+            secs = self.secs(),
+            read_mb = self.read_bytes as f64 / 1e6,
+            count = count,
+            read_rate = self.read_mb_per_s(),
+            mb = self.bytes as f64 / 1e6,
+            rate = self.mb_per_s(),
+            started = self.started,
+            finished = self.finished,
+            mean_ms = mean_ms,
+            worst = self.read_worst_ns as f64 / 1e6,
+            buffered = self.buffered,
+            widened = self.widened,
+            staged = self.staged_high as f64 / 1e6,
+            budget = self.staging as f64 / 1e6,
+            waits = self.staging_waits,
+            running = self.running_high,
+            pool = pool,
+            busy = busy,
+            reading = self.workers(self.read_ns),
+            waiting = self.waiting,
+            zlib = self.inflate_bytes as f64 / 1e6,
+            zlib_workers = self.workers(self.inflate_ns),
+            bcpack = self.bcpack_bytes as f64 / 1e6,
+            bcpack_workers = self.workers(self.bcpack_ns),
+        )
     }
 }
 
@@ -850,8 +1184,30 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
+/// Reads, inflates and/or unpacks, and writes one request, on the worker's own
+/// reused buffers.
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
+    let result = execute_with(request, &mut scratch);
+    keep(&mut scratch);
+    SCRATCH.with_borrow_mut(|slot| *slot = scratch);
+    result
+}
+
+/// Drops what a request grew past the size worth keeping before the buffers go
+/// back to the worker's slot. The copy buffer is as wide as the widest window
+/// its worker ever read, and every worker keeps its own: one large read would
+/// pin that memory in all of them for the rest of the run, which is why a
+/// buffer past `SCRATCH_KEEP` goes and the next request allocates what it
+/// needs. The read buffer needs no such rule: `read_source` reads a source
+/// larger than `SCRATCH_KEEP` into a buffer of its own.
+fn keep(scratch: &mut Scratch) {
+    if scratch.packed.capacity() > SCRATCH_KEEP {
+        scratch.packed = Vec::new();
+    }
+}
+
+fn execute_with(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -901,13 +1257,16 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, &mut scratch.read, &mut scratch.packed)
+        .map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let intermediate = &mut scratch.packed;
+        let len = request.intermediate_size as usize;
+        intermediate.resize(len, 0);
+        let n = inflate(&source, intermediate).map_err(|hr| fail(hr, "zlib"))?;
+        intermediate.truncate(n);
+        Cow::Borrowed(&intermediate[..])
     } else {
         source
     };
@@ -930,6 +1289,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+    let started = std::time::Instant::now();
+    let result = inflate_into(source, out);
+    INFLATED.add(result.unwrap_or(0), started.elapsed());
+    result
+}
+
+fn inflate_into(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
     thread_local! {
         static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
             std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
@@ -1013,48 +1379,368 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Per-worker buffers, reused between requests: the aligned buffer an
+/// unbuffered read needs, the zlib intermediate, and the buffer a read into an
+/// unaligned destination goes through. Taken out of the thread's slot while a
+/// request runs and put back afterwards, so a stream of requests allocates
+/// once.
+#[derive(Default)]
+struct Scratch {
+    read: Aligned,
+    packed: Vec<u8>,
+}
+
+thread_local! {
+    /// A worker runs one request at a time, so one set of buffers per worker.
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+/// Bytes for an unbuffered read. The OS wants the buffer itself on a sector
+/// boundary, so the allocation carries a spare sector and the part handed out
+/// starts at the first aligned address in it.
+#[derive(Default)]
+struct Aligned {
+    bytes: Vec<u8>,
+    /// Where in `bytes` the aligned part starts: fixed for one allocation.
+    start: usize,
+}
+
+impl Aligned {
+    /// Room for `len` bytes, on a sector boundary. The buffer only grows, by a
+    /// quarter, so requests of one size allocate once.
+    fn prepare(&mut self, len: usize) -> &mut [u8] {
+        let need = len + SECTOR;
+        if self.bytes.len() < need {
+            let grow = need + need / 4;
+            self.bytes = vec![0; grow];
+            self.start = sector_shift(self.bytes.as_ptr() as usize);
+        }
+        &mut self.bytes[self.start..self.start + len]
+    }
+}
+
+/// How far into a buffer the first sector boundary is. Every byte address has
+/// one and the caller keeps a sector spare, so this cannot fail the way
+/// `align_offset` can (it answers `usize::MAX` when no offset would do).
+fn sector_shift(address: usize) -> usize {
+    (SECTOR - address % SECTOR) % SECTOR
+}
+
+/// Whether an address is one an unbuffered read accepts.
+fn sector_aligned(address: usize) -> bool {
+    address.is_multiple_of(SECTOR)
+}
+
+/// Whether a request is on the sectors the drive takes: its file offset and
+/// its length are both multiples of `SECTOR`. Such a read lands in the
+/// destination itself; anything else is read as the sectors that hold it. A
+/// compressed block's length is where its stream ends, so it almost never is:
+/// the run that reported 2211 reads "through the file cache" had 2211 of 2211
+/// off a sector and 79 of 79 files open unbuffered.
+fn unbuffered_fits(offset: u64, size: usize) -> bool {
+    offset.is_multiple_of(SECTOR as u64) && size.is_multiple_of(SECTOR)
+}
+
+/// One counter set: how many, how many bytes, how long in all, and the worst
+/// single one. Workers add to it; the five-second line takes it.
+struct Meter {
+    count: AtomicU64,
+    bytes: AtomicU64,
+    ns: AtomicU64,
+    worst_ns: AtomicU64,
+}
+
+impl Meter {
+    const fn new() -> Meter {
+        Meter {
+            count: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+            worst_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn add(&self, bytes: usize, spent: std::time::Duration) {
+        let ns = spent.as_nanos() as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.ns.fetch_add(ns, Ordering::Relaxed);
+        self.worst_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// `(count, bytes, ns, worst ns)`, starting the next window at zero.
+    fn take(&self) -> (u64, u64, u64, u64) {
+        (
+            self.count.swap(0, Ordering::Relaxed),
+            self.bytes.swap(0, Ordering::Relaxed),
+            self.ns.swap(0, Ordering::Relaxed),
+            self.worst_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+/// File reads, and zlib output with the time it took.
+static READS: Meter = Meter::new();
+static INFLATED: Meter = Meter::new();
+/// Reads that stayed on the title's buffered handle: a file the host would not
+/// open unbuffered, or an unbuffered read the host refused. Everything else is
+/// read through the pool, a sector window at a time when the request is not on
+/// one.
+static BUFFERED: AtomicU64 = AtomicU64::new(0);
+/// Reads widened to the whole sectors that hold them: a compressed block ends
+/// where its stream does, which is never a sector boundary.
+static WIDENED: AtomicU64 = AtomicU64::new(0);
+
+/// A compressed request's source: borrowed from title memory or from the
+/// worker's read buffer, or a buffer of its own when it is too large to keep.
+fn read_source<'a>(
+    request: &Request,
+    read: &'a mut Aligned,
+    copy: &mut Vec<u8>,
+) -> Result<Cow<'a, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
+    if size <= SCRATCH_KEEP {
+        let out = read.prepare(size);
+        read_into(request, out, copy)?;
+        return Ok(Cow::Borrowed(&*out));
+    }
     let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    read_into(request, &mut bytes, copy)?;
     Ok(Cow::Owned(bytes))
 }
 
-/// Nanoseconds workers spent reading files, for the debug summary.
-static READING: AtomicU64 = AtomicU64::new(0);
-
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` (the source size) from the request's file or memory, through
+/// one of the handles that leave the file cache out. `copy` takes a read whose
+/// request is not the whole sectors a drive takes, or whose destination is not
+/// on a sector boundary.
+fn read_into(request: &Request, out: &mut [u8], copy: &mut Vec<u8>) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = unsafe { &(*request.source.cast::<Instance<File>>()).state };
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
+    let result = match &file.direct {
+        Some(direct) => read_direct(direct, &file.file, request.offset, out, copy),
+        None => read_cached(&file.file, request.offset, out),
     };
-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    READS.add(if result.is_ok() { out.len() } else { 0 }, started.elapsed());
     result
+}
+
+/// A read the file cache serves, for a file the host would not open unbuffered
+/// or one whose unbuffered read failed. The five-second line counts these.
+fn read_cached(file: &std::fs::File, offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
+    BUFFERED.fetch_add(1, Ordering::Relaxed);
+    read_span(file, offset, out)
+}
+
+/// Reads `out` at `offset` through one of the file's unbuffered handles, and
+/// falls back to the title's cached one when the host refuses the read (the
+/// drive takes whole sectors, so a request that ends at the file's last,
+/// partial one has no window).
+fn read_direct(
+    direct: &Direct,
+    cached: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+    copy: &mut Vec<u8>,
+) -> Result<(), HRESULT> {
+    let leased = {
+        let lease = direct.lease();
+        sectors(&lease, cached, offset, out, copy)
+    };
+    match leased {
+        Ok(()) => Ok(()),
+        // The file ends inside the request, and the sector it ends in has
+        // already been asked of the cached handle: reading the whole request
+        // again through it would spend a cached read to learn the same thing.
+        Err(END_OF_FILE) => Err(END_OF_FILE),
+        Err(hr) => {
+            tracing::debug!(
+                offset,
+                len = out.len(),
+                hr = format_args!("{hr:#010x}"),
+                "dstorage: an unbuffered read failed; the cached handle serves it"
+            );
+            read_cached(cached, offset, out)
+        }
+    }
+}
+
+/// The unbuffered read: `out` starts on a sector and holds whole sectors, or
+/// else the sectors that hold the request are read into `copy` and the request
+/// is copied out of them. Every byte asked for comes from the right place,
+/// once, and an unbuffered read needs the buffer, the offset and the length on
+/// a sector boundary.
+fn sectors(
+    file: &DirectFile,
+    cached: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+    copy: &mut Vec<u8>,
+) -> Result<(), HRESULT> {
+    let len = out.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if sector_aligned(out.as_ptr() as usize) && unbuffered_fits(offset, len) {
+        let got = read_span_direct(file, cached, offset, out)?;
+        return if got == len { Ok(()) } else { Err(END_OF_FILE) };
+    }
+    let start = offset & !(SECTOR as u64 - 1);
+    let end = (offset + len as u64).div_ceil(SECTOR as u64) * SECTOR as u64;
+    let window = aligned_in(copy, (end - start) as usize);
+    let got = read_span_direct(file, cached, start, window)?;
+    let skip = (offset - start) as usize;
+    if skip + len > got {
+        return Err(END_OF_FILE);
+    }
+    out.copy_from_slice(&window[skip..skip + len]);
+    WIDENED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The first `len` bytes of an address in `copy` that is on a sector
+/// boundary: `copy` grows to hold `len` plus one sector of slack, so the
+/// window always exists.
+fn aligned_in(copy: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if copy.len() < len + SECTOR {
+        copy.resize(len + SECTOR, 0);
+    }
+    let start = sector_shift(copy.as_ptr() as usize);
+    &mut copy[start..start + len]
+}
+
+/// Fills `out` from `offset` in one handle, a call at a time. A short read is
+/// the end of the file, and so is a buffered read of nothing.
+fn read_span(file: &std::fs::File, offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        match file.seek_read(&mut out[done..], offset + done as u64) {
+            Ok(0) => return Err(END_OF_FILE),
+            Ok(n) => done += n,
+            Err(error) => return Err(from_win32(&error)),
+        }
+    }
+    Ok(())
+}
+
+/// `OVERLAPPED` (winnt.h): the offset a positioned read asks for, and where
+/// the host keeps the transfer it is running. A read on a handle opened
+/// `FILE_FLAG_OVERLAPPED` takes its offset from here, never from a file
+/// pointer, and its byte count from `GetOverlappedResult`.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut c_void,
+}
+
+impl Overlapped {
+    /// The structure one read at `offset` hands the host.
+    fn at(offset: u64) -> Overlapped {
+        Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            event: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// `ERROR_IO_PENDING`: the host has the read and will finish it.
+const IO_PENDING: i32 = 997;
+/// `ERROR_HANDLE_EOF`: the read starts at or past the end of the file.
+const HANDLE_EOF: i32 = 38;
+
+type ReadFileFn = extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut Overlapped) -> i32;
+type GetOverlappedResultFn = extern "system" fn(*mut c_void, *mut Overlapped, *mut u32, i32) -> i32;
+
+/// One read of `out` at `offset` through an unbuffered handle, waiting for it.
+/// Returns the bytes read, which is 0 at the end of the file.
+///
+/// `std::fs::File::seek_read` is not this: it hands the host an `OVERLAPPED` of
+/// its own on the stack and never waits for `ERROR_IO_PENDING`, so on an
+/// overlapped handle a read that is merely queued is reported as a failure.
+fn read_at(file: &DirectFile, offset: u64, out: &mut [u8]) -> Result<usize, HRESULT> {
+    // A request's length is a `u32` and a sector window is bounded by one; a
+    // longer buffer is read in pieces by the caller.
+    let len = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let read: ReadFileFn = host!("kernel32.dll", "ReadFile": ReadFileFn);
+    let mut over = Overlapped::at(offset);
+    // The handle is ours, `out` holds `len` bytes, and `over` outlives the
+    // read, which has completed by the time this returns.
+    let queued = read(file.handle(), out.as_mut_ptr(), len, std::ptr::null_mut(), &mut over);
+    if queued == 0 {
+        let error = std::io::Error::last_os_error();
+        // Queued, not failed: the wait below is the read.
+        if error.raw_os_error() != Some(IO_PENDING) {
+            return Err(from_win32(&error));
+        }
+    }
+    let moved: GetOverlappedResultFn = host!("kernel32.dll", "GetOverlappedResult": GetOverlappedResultFn);
+    let mut done = 0;
+    // The last argument is the wait a pending read needs.
+    let ok = moved(file.handle(), &mut over, &mut done, 1);
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(HANDLE_EOF) => Ok(0),
+            _ => Err(from_win32(&error)),
+        };
+    }
+    Ok(done as usize)
+}
+
+/// Fills `out` from `offset` through an unbuffered handle, a call at a time,
+/// returning how many bytes the file held there.
+///
+/// A read the drive will not take — the sector the file's last bytes end in,
+/// which an unbuffered read may neither start nor finish inside — is what ends
+/// a request in a file whose length is not a sector multiple. The cached handle
+/// finishes the span from where the unbuffered one stopped: it is the only one
+/// that reads that sector, and the count it leaves is what says the request is
+/// past the end of the file. `END_OF_FILE` is the caller's to report, never
+/// `ERROR_INVALID_PARAMETER` from the read that could not start there.
+fn read_span_direct(
+    file: &DirectFile,
+    cached: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        match read_at(file, offset + done as u64, &mut out[done..]) {
+            Ok(0) => return Ok(done),
+            Ok(n) => done += n,
+            Err(hr) if done > 0 => {
+                tracing::debug!(
+                    offset,
+                    done,
+                    len = out.len(),
+                    hr = format_args!("{hr:#010x}"),
+                    "dstorage: the file ends inside the read; the cached handle finishes it"
+                );
+                if read_span(cached, offset + done as u64, &mut out[done..]).is_ok() {
+                    return Ok(out.len());
+                }
+                return Ok(done);
+            }
+            Err(hr) => return Err(hr),
+        }
+    }
+    Ok(done)
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1328,6 +2014,11 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        // The host's `OVERLAPPED`: the offset a read asks for is at 0x10, and
+        // nothing of ours may sit between it and the host's own fields.
+        assert_eq!(size_of::<Overlapped>(), 0x20);
+        assert_eq!(std::mem::offset_of!(Overlapped, offset), 0x10);
+        assert_eq!(std::mem::offset_of!(Overlapped, event), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -1460,6 +2151,9 @@ mod tests {
             lane_now: [0; 3],
             done: Default::default(),
             refused: 0,
+            started: 0,
+            staged_high: 0,
+            running_high: 0,
             bcpack: Default::default(),
             since: None,
         }
@@ -1793,5 +2487,328 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn only_sector_aligned_requests_land_in_the_destination_itself() {
+        assert!(unbuffered_fits(0, 0), "nothing to read needs no alignment");
+        assert!(unbuffered_fits(0, SECTOR));
+        assert!(unbuffered_fits(SECTOR as u64 * 7, 2 * SECTOR));
+        assert!(!unbuffered_fits(1, SECTOR), "an offset inside a sector");
+        assert!(!unbuffered_fits(0, 1000), "a length that ends inside a sector");
+        assert!(!unbuffered_fits(SECTOR as u64, SECTOR - 1));
+    }
+
+    #[test]
+    fn the_read_buffer_is_aligned_and_reused() {
+        let mut aligned = Aligned::default();
+        let first = aligned.prepare(1000).as_ptr();
+        assert!(sector_aligned(first as usize));
+        assert_eq!(aligned.prepare(1000).as_ptr(), first, "the same size reuses the buffer");
+        let grown = aligned.prepare(100_000);
+        assert_eq!(grown.len(), 100_000);
+        assert!(sector_aligned(grown.as_ptr() as usize));
+    }
+
+    /// A pool of handles `direct_handles` opened over a temp file, and the
+    /// cached handle a title open would also have: nothing here needs the title.
+    fn direct_file(bytes: &[u8]) -> (tempfile::TempDir, std::fs::File, Direct) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let direct = direct_handles(wide.as_ptr()).expect("this volume takes unbuffered reads");
+        let cached = std::fs::File::open(&path).unwrap();
+        (dir, cached, direct)
+    }
+
+    /// A buffer and the offset of a destination in it that is guaranteed not to
+    /// start on a sector, whatever the allocator handed back.
+    fn off_a_sector(len: usize) -> (Vec<u8>, usize) {
+        let bytes = vec![0xAAu8; len + SECTOR];
+        let skew = usize::from(sector_aligned(bytes.as_ptr() as usize));
+        assert!(
+            !sector_aligned(bytes.as_ptr() as usize + skew),
+            "a destination off a sector"
+        );
+        (bytes, skew)
+    }
+
+    #[test]
+    fn the_copy_for_an_unaligned_destination_starts_on_a_sector() {
+        // The unbuffered handle reads straight into the buffer, so the buffer
+        // must start on a sector boundary — a `Vec`'s own pointer need not.
+        // Lengths either side of the kept-scratch size exercise both the reuse
+        // and the growth path.
+        let mut copy = Vec::new();
+        for len in [1, SECTOR, SECTOR + 1, SCRATCH_KEEP, SCRATCH_KEEP + 1] {
+            let window = aligned_in(&mut copy, len);
+            assert_eq!(window.len(), len);
+            assert_eq!(
+                window.as_ptr() as usize % SECTOR,
+                0,
+                "a {len}-byte copy must start on a sector"
+            );
+        }
+    }
+
+    #[test]
+    fn unbuffered_reads_serve_on_sector_requests_and_widen_the_rest() {
+        let contents = pattern(3 * SECTOR);
+        let (_dir, cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+
+        // A destination that is whole sectors, on an offset that is one, is
+        // the buffer the read lands in.
+        let out = scratch.read.prepare(contents.len());
+        sectors(&direct.lease(), &cached, 0, out, &mut scratch.packed).unwrap();
+        assert_eq!(out, &contents[..]);
+
+        // A destination off a sector boundary goes through the copy buffer,
+        // which must still hold every byte.
+        let mut unaligned = vec![0u8; contents.len() + 1];
+        sectors(&direct.lease(), &cached, 0, &mut unaligned[1..], &mut scratch.packed).unwrap();
+        assert_eq!(&unaligned[1..], &contents[..]);
+        assert_eq!(unaligned[0], 0, "the byte before the destination is untouched");
+
+        // A compressed block: an offset inside a sector and a length that ends
+        // inside one. The sectors that hold it are read and the request copied
+        // out of them, which is what every compressed request needs.
+        let mut block = [0u8; 1000];
+        sectors(&direct.lease(), &cached, 5000, &mut block, &mut scratch.packed).unwrap();
+        assert_eq!(block, contents[5000..6000]);
+
+        // Past the end is the end of the file, and nothing is written: the
+        // buffer still holds what the earlier read left in it.
+        let before = out[..SECTOR].to_vec();
+        let tail = scratch.read.prepare(SECTOR);
+        assert_eq!(
+            sectors(&direct.lease(), &cached, contents.len() as u64, tail, &mut scratch.packed),
+            Err(END_OF_FILE)
+        );
+        assert_eq!(tail, &before[..]);
+    }
+
+    /// A large batch of requests, run the way the pool runs them: every byte
+    /// asked for arrives, once, in the right place, whatever the request's
+    /// alignment and however many requests share the file.
+    #[test]
+    fn a_batch_of_requests_gets_every_byte_once_and_in_place() {
+        use std::sync::Arc;
+        // Bytes are their own address, so a read that lands elsewhere cannot
+        // pass, and the file is whole sectors plus a tail a window must not
+        // read past.
+        let len = 1 << 20;
+        let contents: Vec<u8> = (0..len).map(|i| (i as u8) ^ (i >> 7) as u8).collect();
+        let (_dir, cached, direct) = direct_file(&contents);
+        let direct = Arc::new(direct);
+
+        // Requests of every shape: whole sectors, a block that ends anywhere,
+        // a destination off a sector, and a request that starts inside one.
+        const LARGEST: usize = 256 * 1024 + 3;
+        let shapes: [(usize, usize, usize); 6] = [
+            (0, 3 * SECTOR, 0),
+            (SECTOR, 40_000, 0),
+            (7, 1000, 0),
+            (3 * SECTOR + 1, 2 * SECTOR + 5, 1),
+            (0, 1, 0),
+            (5 * SECTOR, LARGEST, 3),
+        ];
+        // Every request plus the sectors its window may widen to ends inside
+        // the file, so a window never runs into the end of it.
+        let room = len - (LARGEST + 8 * SECTOR);
+        let mut workers = Vec::new();
+        for (t, _) in (0..8).enumerate() {
+            let direct = Arc::clone(&direct);
+            let cached = cached.try_clone().unwrap();
+            let expected = contents.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut copy = Vec::new();
+                let mut reads = 0;
+                for i in 0..64 {
+                    let (offset, ask, skew) = shapes[(i + t) % shapes.len()];
+                    let at = (i * SECTOR * 7 + offset) % room;
+                    let mut buffer = vec![0xAAu8; ask + skew + 1];
+                    let out = &mut buffer[skew..skew + ask];
+                    sectors(&direct.lease(), &cached, at as u64, out, &mut copy).unwrap();
+                    assert_eq!(
+                        out,
+                        &expected[at..at + ask],
+                        "request {i} on thread {t} at {at} for {ask} bytes"
+                    );
+                    assert!(
+                        buffer[..skew].iter().all(|&b| b == 0xAA)
+                            && buffer[skew + ask..].iter().all(|&b| b == 0xAA),
+                        "a request wrote outside its destination"
+                    );
+                    reads += 1;
+                }
+                reads
+            }));
+        }
+        let reads: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(reads, 8 * 64, "every request ran");
+    }
+
+    #[test]
+    fn the_window_line_says_where_the_reads_went() {
+        let window = Window {
+            elapsed: Duration::from_secs(5),
+            reads: 100,
+            read_bytes: 50_000_000,
+            read_ns: 1_000_000_000,
+            read_worst_ns: 40_000_000,
+            buffered: 3,
+            widened: 97,
+            started: 100,
+            finished: 100,
+            bytes: 120_000_000,
+            busy_ns: 2_500_000_000,
+            staging_waits: 7,
+            staged_high: 32 << 20,
+            staging: STAGING,
+            running_high: 8,
+            waiting: 2,
+            inflate_bytes: 120_000_000,
+            inflate_ns: 1_000_000_000,
+            bcpack_bytes: 0,
+            bcpack_ns: 0,
+        };
+        let line = window.sentence();
+        assert!(line.starts_with("dstorage: last 5.0 s: "), "{line}");
+        // The numbers a run needs to tell the three faults apart are there:
+        // the rate, the staging high water against its budget, the pool's
+        // high water, and the share of the window spent waiting on the drive.
+        assert!(line.contains("50 MB read in 100 reads (10.0 MB/s)"), "{line}");
+        assert!(line.contains("24.0 MB/s"), "{line}");
+        assert!(line.contains("staging peaked at 33.6 MB of 33.6 MB with 7 waits"), "{line}");
+        assert!(line.contains("8 requests ran at once"), "{line}");
+        assert!(line.contains("10.0 ms on average and 40.0 ms at worst"), "{line}");
+        assert!(line.contains("3 through the file cache"), "{line}");
+        assert!(line.contains("97 through a sector window"), "{line}");
+        assert!(line.contains("2 requests were queued"), "{line}");
+    }
+
+    #[test]
+    fn an_unbuffered_handle_leaves_the_cache_and_takes_overlapped_reads() {
+        // Both flags decide the read path: without `NO_BUFFERING` the 208 GB
+        // package fills the cache and evicts the title's working set, and
+        // without `OVERLAPPED` each read on a handle waits for the one before
+        // it, so the pool is queue depth `HANDLES` and not one per worker.
+        let flags = NO_BUFFERING | OVERLAPPED;
+        assert_eq!(NO_BUFFERING & OVERLAPPED, 0, "two different flags");
+        assert_eq!(flags & NO_BUFFERING, NO_BUFFERING);
+        assert_eq!(flags & OVERLAPPED, OVERLAPPED);
+    }
+
+    #[test]
+    fn an_unbuffered_read_takes_its_offset_and_waits_for_itself() {
+        // The handle is opened for overlapped I/O, so the offset is the
+        // `OVERLAPPED`'s and the wait is the read's own: this serves a read
+        // that `seek_read` would report as pending (a failure) on it.
+        let contents = pattern(3 * SECTOR);
+        let (_dir, _cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+        let out = scratch.read.prepare(SECTOR);
+        assert_eq!(read_at(&direct.lease(), 2 * SECTOR as u64, out), Ok(SECTOR));
+        assert_eq!(out, &contents[2 * SECTOR..]);
+        // At the end of the file the read moves nothing and says so.
+        let end = scratch.read.prepare(SECTOR);
+        assert_eq!(read_at(&direct.lease(), contents.len() as u64, end), Ok(0));
+    }
+
+    /// An unbuffered read wants the buffer itself on a sector boundary, and a
+    /// title destination need not be on one: the read goes through a buffer
+    /// that is, and every byte asked for still arrives.
+    #[test]
+    fn a_destination_off_a_sector_is_served_through_an_aligned_buffer() {
+        let contents = pattern(8 * SECTOR);
+        let (_dir, cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+        let (mut bytes, skew) = off_a_sector(2 * SECTOR);
+        let destination = &mut bytes[skew..skew + 2 * SECTOR];
+        sectors(&direct.lease(), &cached, (2 * SECTOR) as u64, destination, &mut scratch.packed)
+            .unwrap();
+        assert_eq!(destination, &contents[2 * SECTOR..4 * SECTOR]);
+        assert!(
+            bytes[..skew].iter().all(|&b| b == 0xAA)
+                && bytes[skew + 2 * SECTOR..].iter().all(|&b| b == 0xAA),
+            "a read wrote outside its destination"
+        );
+    }
+
+    /// The same through the title's own queue: a destination off a sector is a
+    /// request that succeeds, not `ERROR_INVALID_PARAMETER` (0x80070057).
+    #[test]
+    fn a_request_into_a_destination_off_a_sector_serves() {
+        let contents = pattern(4 * SECTOR);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let (mut buffer, skew) = off_a_sector(2 * SECTOR);
+        let destination = buffer.as_mut_ptr().cast::<u8>().wrapping_add(skew);
+        let r = request(0, destination.cast(), 2 * SECTOR, file, SECTOR as u64, 2 * SECTOR);
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(&buffer[skew..skew + 2 * SECTOR], &contents[SECTOR..3 * SECTOR]);
+        void(queue, 0x40);
+    }
+
+    /// A file's length need not be a sector multiple. A request that starts on
+    /// a sector and runs past the end reads the sectors the file has, and then
+    /// asks for a length the drive will not take: the tail comes through the
+    /// cached handle and the request is owed `END_OF_FILE`, never the sector
+    /// error a read that could not start inside the last sector would give.
+    #[test]
+    fn a_sector_request_across_the_end_of_a_part_sector_file_is_the_end_of_the_file() {
+        let contents = pattern(3 * SECTOR + 100);
+        let (_dir, cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+
+        let out = scratch.read.prepare(4 * SECTOR);
+        assert_eq!(
+            sectors(&direct.lease(), &cached, 0, out, &mut scratch.packed),
+            Err(END_OF_FILE)
+        );
+        assert_eq!(&out[..contents.len()], &contents[..], "every byte the file holds arrived");
+
+        // A request whose last byte is the file's last byte is inside the file,
+        // so it serves: the sector it ends in came through the cached handle.
+        let mut tail = [0u8; 100];
+        sectors(&direct.lease(), &cached, (3 * SECTOR) as u64, &mut tail, &mut scratch.packed)
+            .unwrap();
+        assert_eq!(tail, contents[3 * SECTOR..]);
+    }
+
+    /// The same through the title's queue, which is where the wrong error
+    /// (0x80070057) was the title's to see.
+    #[test]
+    fn a_request_across_the_end_of_a_part_sector_file_reports_the_end() {
+        let contents = pattern(3 * SECTOR + 100);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; 4 * SECTOR];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), out.len(), file, 0, 4 * SECTOR));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+        void(queue, 0x40);
+    }
+
+    /// A copy buffer is as wide as the widest window its worker ever read, and
+    /// every worker keeps its own: past `SCRATCH_KEEP` it goes instead of being
+    /// pinned in all of them for the rest of the run.
+    #[test]
+    fn a_copy_buffer_past_the_kept_size_is_not_kept() {
+        let mut scratch = Scratch { packed: vec![0u8; 1000], ..Scratch::default() };
+        keep(&mut scratch);
+        assert_eq!(scratch.packed.capacity(), 1000, "a small copy buffer stays");
+        scratch.read.prepare(SCRATCH_KEEP);
+        let read = scratch.read.bytes.len();
+        scratch.packed = vec![0u8; 2 * SCRATCH_KEEP];
+        keep(&mut scratch);
+        assert_eq!(scratch.packed.capacity(), 0, "a copy buffer past the kept size goes");
+        assert_eq!(scratch.read.bytes.len(), read, "the read buffer keeps its size");
     }
 }

@@ -8,9 +8,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -30,6 +31,21 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
 
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
+
+/// When the run began, for the summary [`end`] logs.
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// Notes the moment the run began, so the end-of-run summary can state how
+/// long the title ran. Called once by `victory run`, after logging is set up;
+/// a second call keeps the first moment, so nothing can shorten the run's
+/// recorded duration.
+pub fn note_run_start() {
+    let _ = STARTED.set(Instant::now());
+}
+
+fn started() -> Option<&'static Instant> {
+    STARTED.get()
+}
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -212,7 +228,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         if let Some(then) = then.take() {
             then();
         }
-        end();
+        end(how);
     };
     let late = finish.clone();
     // Not on the calling thread: titles hand the suspend to their window
@@ -285,10 +301,68 @@ pub fn wait_for_previous() {
     }
 }
 
-fn end() {
+/// The last line of a run: how it ended, and how long the title ran.
+///
+/// The 5 s lines of `victory_gpu::host` only describe their own window, and
+/// the last of them can be minutes old, so a log that stops at a shutdown
+/// message says nothing about the run as a whole. Emitted inside [`end`],
+/// before the process is terminated: a line written after the hard exit would
+/// never be written at all.
+fn summary(how: &str) {
+    let secs = started().map_or(0.0, |start| start.elapsed().as_secs_f64());
+    // Read straight from the queue: this crate already depends on
+    // `victory-gpu`, and the counter is a relaxed load of a static.
+    let frames = victory_gpu::queue::presented();
+    if frames > 0 && secs > 0.0 {
+        let fps = frames as f64 / secs;
+        tracing::info!(
+            "run summary: {how}; the title ran {secs:.1} s, {frames} frames ({fps:.1} fps)"
+        );
+    } else {
+        tracing::info!("run summary: {how}; the title ran {secs:.1} s");
+    }
+}
+
+/// Writes the records an end of a run leaves - the summary line and the
+/// process's one `STOP` block - and says whether this call wrote them.
+///
+/// The suspend routines returning and the deadline that stops waiting for them
+/// both reach [`end`], and the process is terminated rather than returned
+/// from, so nothing here can be asked afterwards which of them ended the run:
+/// `victory_gpu::report::stop_block` renders the block once per process and
+/// tells the later caller there is nothing left to say, and that caller writes
+/// no second summary either.
+///
+/// Everything the block reads is a static of `victory_core` (the meter and the
+/// `logging` warning watches), so it is written even though the GPU layer may
+/// already have let go of its arenas. The `STOP cache` sizes come from the
+/// writer `victory run` installed at start-up
+/// ([`victory_core::report::set_footer_hook`]), so this path and the one that
+/// returns from `run` render the same block; no device object is asked for
+/// anything.
+fn last_records(how: &str) -> bool {
+    let duration = started().map_or(Duration::ZERO, |start| start.elapsed());
+    let Some(block) = victory_gpu::report::stop_block(how, duration) else {
+        return false;
+    };
+    summary(how);
+    // One record, however many lines: `emit` writes each of them to the log
+    // file and to stderr and ignores the level filter, so `grep '^STOP '`
+    // returns the whole footer even in a run with the log turned down.
+    victory_gpu::logging::emit("INFO", &block);
+    true
+}
+
+fn end(how: &str) {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    last_records(how);
+    // `victory_core::logging` buffers nothing: each event reaches the file
+    // as it is logged (`logging::Locked` writes the `File` directly,
+    // crates/victory-core/src/logging.rs:183), and stderr is unbuffered. This
+    // flush is the last guard before the hard exit, not the only one.
+    let _ = std::io::stderr().flush();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
@@ -329,6 +403,41 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn the_run_start_is_noted_once() {
+        note_run_start();
+        let noted = *started().expect("noted");
+        note_run_start();
+        // A second note keeps the first moment, so the summary cannot be
+        // made to understate how long the title ran.
+        assert_eq!(*started().expect("still noted"), noted);
+    }
+
+    /// The suspend routines and the deadline that stops waiting for them both
+    /// reach [`end`], and `end` cannot return to be asked how often it ran:
+    /// the records are written by [`last_records`], which says once that it
+    /// wrote them and nothing after that. The block it writes is the footer
+    /// `victory run` writes, rendered from the counters this path still has.
+    #[test]
+    fn the_two_ends_of_a_suspend_write_one_stop_block() {
+        note_run_start();
+        assert!(
+            last_records("title suspended"),
+            "the first end writes the run's last records"
+        );
+        assert!(
+            !last_records("title did not finish suspending in time"),
+            "the deadline that ends the process after the routines must not write a second STOP block"
+        );
+        let text = victory_gpu::report::RunFooter::from_counters(
+            "title suspended",
+            Duration::from_secs(2),
+        )
+        .render();
+        assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
+        assert!(text.contains("\"title suspended\""), "{text}");
     }
 
     #[test]

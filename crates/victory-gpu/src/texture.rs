@@ -496,6 +496,40 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// The most staging buffers may hold in system RAM (`VICTORY_STAGING_MB`,
+/// default 6 GiB): past it the coldest no list holds are let go even if
+/// recently used, so a re-admit still copies from RAM (a 0.5 MB DMA) rather
+/// than decoding and detiling title memory again (measured ~87-120 MB/s).
+/// Generous by default: the point is a ceiling, not a small cache.
+fn staging_ceiling() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6144)
+    }) << 20
+}
+
+/// The entries to let go to bring `total` bytes under `ceiling` (each
+/// `(used, bytes, held)`): coldest first, never one a list holds (`held`),
+/// stopping when the rest fit. Pure, so the ceiling is tested without a
+/// device.
+fn to_ceiling(entries: &[(u64, u64, bool)], total: u64, ceiling: u64) -> Vec<usize> {
+    if total <= ceiling {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..entries.len()).filter(|&i| !entries[i].2).collect();
+    order.sort_unstable_by_key(|&i| entries[i].0);
+    let mut drop = Vec::new();
+    let mut left = total;
+    for i in order {
+        if left <= ceiling {
+            break;
+        }
+        left = left.saturating_sub(entries[i].1);
+        drop.push(i);
+    }
+    drop
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -529,8 +563,33 @@ pub(crate) fn let_go_idle() {
         }
         keep
     });
+    // A ceiling on what staging holds in system RAM: past it the coldest
+    // buffers no list holds go, even if recently used, so a re-admit still
+    // copies from RAM rather than detiling title memory again.
+    let ceiling = staging_ceiling();
+    let total = STAGED[1].load(Relaxed);
+    if total > ceiling {
+        let entries: Vec<(u64, u64, bool, usize)> = map
+            .iter()
+            .map(|(&key, s)| (s.used.load(Relaxed), s.bytes, Arc::strong_count(s) > 1, key))
+            .collect();
+        let flat: Vec<(u64, u64, bool)> = entries.iter().map(|&(u, b, h, _)| (u, b, h)).collect();
+        for i in to_ceiling(&flat, total, ceiling) {
+            if let Some(s) = map.remove(&entries[i].3) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+            }
+        }
+    }
     if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went} staging buffers of textures let go ({} KiB), idle or past the staging ceiling, held by no list",
+                bytes >> 10
+            )
+        });
     }
 }
 
@@ -1268,105 +1327,148 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     Some((size as u64, committed(s.memory, size)))
 }
 
-/// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// Runs of title memory the kernel has called committed, `(start, end)`,
+/// sorted and disjoint. A run holds until the runtime maps or unmaps inside
+/// it ([`remapped`]).
+///
+/// The kernel's answer costs the committed run it walks: 0.3-0.7 µs for one
+/// 4 KiB page, 1.1-1.8 µs for a 1.2 GB reservation with nothing in it, and
+/// 3.0-4.5 ms inside a 1.2 GB committed block (measured here by
+/// `what_a_committed_question_costs`). A question asked of every slot of a
+/// title texture is therefore asked once per run and answered from this
+/// table after: 170 MB of a committed block is one call of 1.1 ms the first
+/// time and 0.12 µs a question after, not the 41.7 ms of 43,520 one-byte
+/// reads through the kernel that answered it a page at a time, each
+/// faulting the page it asked about back in (`run-20261125-151659.log`
+/// asked about 478,920 such pages in one 5 s window).
+static RUNS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The most runs kept: past it the table is emptied rather than grown, and
+/// the next questions re-derive it (a run is worth one kernel call).
+const MAX_RUNS: usize = 4096;
+
+/// A run shorter than this is not kept: the question costs 0.7 µs a call
+/// there, and the title's blocks are megabytes.
+const SHORT_RUN: usize = 64 << 10;
+
+/// Whether `[at, at + len)` is committed memory the process may read
+/// (streamed textures may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
-    }
     if len == 0 {
         return true;
     }
-    let (there, of) = readable(at as usize, len, true);
-    there == of
+    let start = at as usize;
+    committed_bytes(start, start.saturating_add(len)) == len as u64
 }
 
-/// Whether the two questions above and below are put to `VirtualQuery`, as
-/// they were (`VICTORY_COMMITTED_QUERY=1`). `VirtualQuery` answers with the
-/// length of the run of pages in the same state, which it finds by walking
-/// the page tables to the run's end: 8.8 ms for one question in the title's
-/// 1.1 GB block (round 6). The pass over the heap's views asks three or
-/// more of them for every texture slot that is due, 3,000 slots a frame
-/// when the card has no room (run 75): that pass then ran 208-264 ms, and
-/// while it ran the submitting thread's write-watch askings waited behind
-/// the walks (run 76: 8-22 askings a frame of 6-21 ms each, 46-172 ms).
-fn by_query() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
-}
-
-/// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
-/// can be read, and how many there are; with `all`, it stops at the first
-/// that cannot. One question to the kernel for up to 256 pages at once
-/// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
-/// page not in the working set may still be there (never touched, or
-/// trimmed), and a one-byte read through the kernel says.
-/// A page that is committed and may not be read counts as not there, which
-/// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+/// How many bytes of `[start, end)` the kernel calls committed and readable.
+///
+/// One question per run of pages in one state, remembered so the next
+/// question about the same run is free. The table is held across the
+/// question, so a run the runtime maps or unmaps cannot be entered after
+/// the drop that named it ([`remapped`]) — the two take the same lock.
+fn committed_bytes(start: usize, end: usize) -> u64 {
     const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
-    let of = last - first + 1;
-    let mut there = 0;
-    // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
-    let mut page = first;
-    while page <= last {
-        let n = (last - page + 1).min(info.len());
-        for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut there = 0u64;
+    let mut there_pages = 0u64;
+    let mut at = start;
+    let mut calls = 0u64;
+    let mut known = 0u64;
+    while at < end {
+        // The part of the span a run already holds.
+        if let Some(&(_, run_end)) = runs.iter().find(|&&(a, b)| a <= at && at < b) {
+            let stop = run_end.min(end);
+            there += (stop - at) as u64;
+            there_pages += (stop.saturating_sub(1) / KERNEL_PAGE - at / KERNEL_PAGE + 1) as u64;
+            known += (stop - at) as u64;
+            at = stop;
+            continue;
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        // One question: the run of pages in one state that holds `at`.
+        // SAFETY: plain data the kernel fills in about our own process.
+        let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+            unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe {
+            windows_sys::Win32::System::Memory::VirtualQuery(
+                at as *const _,
+                &mut info,
+                size_of_val(&info),
             )
-        } != 0;
-        for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
-                there += 1;
-            } else if all {
-                return (there, of);
-            }
+        };
+        calls += 1;
+        if n == 0 {
+            break;
         }
-        page += n;
+        let base = info.BaseAddress as usize;
+        let stop = base.saturating_add(info.RegionSize);
+        if stop <= at {
+            break; // the kernel would not advance: no more of the span to ask about
+        }
+        // Its protection too: a placeholder or a guard is committed memory
+        // that may not be read.
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+        let readable = info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
+        if readable {
+            let stop = stop.min(end);
+            there += (stop - at) as u64;
+            there_pages += (stop.saturating_sub(1) / KERNEL_PAGE - at / KERNEL_PAGE + 1) as u64;
+            note_run(&mut runs, base, base.saturating_add(info.RegionSize));
+        }
+        at = stop.min(end);
     }
-    (there, of)
+    let pages = (end.saturating_sub(1) / KERNEL_PAGE)
+        .saturating_sub(start / KERNEL_PAGE)
+        .saturating_add(1) as u64;
+    crate::fault::question(pages, pages.saturating_sub(there_pages), calls, known);
+    there
 }
 
-fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let mut p = at as usize;
-    let end = p + len;
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
-            return false;
-        }
-        p = info.BaseAddress as usize + info.RegionSize;
+/// Notes `[base, end)` committed in `runs`, merged with the runs it joins
+/// and capped at [`MAX_RUNS`]. A short run is not worth a table entry: its
+/// question is 0.7 µs, and one of ours (`crate::fault`'s test buffer, a
+/// host copy) is not a title block asked about every frame.
+fn note_run(runs: &mut Vec<(usize, usize)>, base: usize, end: usize) {
+    if end.saturating_sub(base) < SHORT_RUN {
+        return;
     }
-    true
+    if runs.iter().any(|&(a, b)| a <= base && end <= b) {
+        return;
+    }
+    if runs.len() >= MAX_RUNS {
+        runs.clear();
+    }
+    runs.push((base, end));
+    runs.sort_unstable();
+    // The runs a new one joins or swallows are one run.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(a, b) in runs.iter() {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    *runs = merged;
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: what the
+/// kernel answered about there is no longer true, so no run over it holds.
+/// Called from `crate::watch::title_memory_remapped`, which the two take
+/// one lock over (see [`committed_bytes`]).
+pub(crate) fn remapped(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    runs.retain(|&(a, b)| b <= at || a >= end);
 }
 
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// answer is none without a look at the pages between (two questions for
+/// the slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
@@ -1375,47 +1477,28 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
-    if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
-            // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
-        }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        // By page, cut to the range.
+        return committed_bytes(start, end).min(len as u64);
     }
-    let (mut p, mut there) = (start, 0u64);
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
-        if n == 0 || next <= p {
-            break;
+    // By 64 KiB block, one page asked of each: the title's memory is
+    // mapped in blocks of that size (the console's page), and the
+    // answer is a measure of how much of a texture has arrived, not a
+    // promise that every byte can be read (the upload reads through the
+    // kernel). By page, a texture half there cost a failed kernel read
+    // for each of its missing pages, every frame it stayed due: 1,663
+    // textures "uploaded in part" kept the pass over the heap's views at
+    // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+        if committed(lo as *const u8, 1) {
+            there += (hi - lo) as u64;
         }
-        if info.State == MEM_COMMIT {
-            there += (next - p) as u64;
-        }
-        p = next;
+        block = block.saturating_add(BLOCK);
     }
     there
 }
@@ -1610,5 +1693,206 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod committed_cost_tests {
+    use std::time::Instant;
+
+    /// What a committed question costs, measured here: one `VirtualQuery`
+    /// per run of pages in one state, the same question from the runs
+    /// already known, and the one-byte read through the kernel that
+    /// answered it a page at a time before.
+    ///
+    /// `cargo test -p victory-gpu --lib --locked what_a_committed_question_costs -- --ignored --nocapture`
+    ///
+    /// The kernel's answer costs the committed run it walks; the one-byte
+    /// read cost the page it asked about, and faulted it back in. The `fault`
+    /// line counted up to 478,920 of those in one 5 s window
+    /// (`run-20261125-151659.log`).
+    #[test]
+    #[ignore = "allocates 1.1 GB and empties the working set: run by hand"]
+    fn what_a_committed_question_costs() {
+        use windows_sys::Win32::System::Memory::*;
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const BIG: usize = 0x4600_0000; // 1.1 GB, the title's block
+        const SPAN: usize = 170 << 20;
+        // SAFETY: our own reservation, released before the test returns.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), BIG, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), BIG, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(1, 4096);
+            base
+        };
+        let query = |at: *const u8| {
+            // SAFETY: plain data the call fills in.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+            (n, info.RegionSize)
+        };
+        const N: usize = 10_000;
+        let started = Instant::now();
+        let mut region = 0;
+        for i in 0..N {
+            region = query(base.wrapping_add((i * 4096) % BIG)).1;
+        }
+        let per = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        println!("VirtualQuery inside a {:.1} GB committed region: {per:.2} us a call, region {region} bytes", BIG as f64 / 1e9);
+        // A span of that region: the question once, then from the table.
+        let at = base.wrapping_add(BIG / 2);
+        super::remapped(at as usize, SPAN);
+        let first = Instant::now();
+        let there = super::committed_bytes(at as usize, at as usize + SPAN);
+        let first = first.elapsed();
+        println!("the committed question over 170 MB of a committed block: {:.2} ms, {there} bytes there", first.as_secs_f64() * 1e3);
+        let again = Instant::now();
+        for _ in 0..100 {
+            assert_eq!(super::committed_bytes(at as usize, at as usize + SPAN), there);
+        }
+        println!("the same question from the table, 100 times: {:.3} ms", again.elapsed().as_secs_f64() * 1e3);
+        // The old page-by-page path over the same 170 MB, both cold and hot.
+        // SAFETY: our own process; this reads and writes nothing.
+        unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+        let started = Instant::now();
+        let mut pages = 0u64;
+        let mut byte = [0u8; 1];
+        for page in 0..SPAN / 4096 {
+            // SAFETY: our own committed range; the kernel reads one byte of it.
+            let page_at = unsafe { at.add(page * 4096) };
+            if crate::host::read_into(page_at, &mut byte) {
+                pages += 1;
+            }
+        }
+        println!(
+            "the same range read a page at a time through the kernel: {:.1} ms for {} pages, {pages} of them not zero",
+            started.elapsed().as_secs_f64() * 1e3,
+            SPAN / 4096
+        );
+        // One query a region over the whole span.
+        let walked = Instant::now();
+        let (mut p, mut end) = (at as usize, at as usize + SPAN);
+        let mut asked = 0;
+        while p < end {
+            let (n, size) = query(p as *const u8);
+            if n == 0 || size == 0 {
+                break;
+            }
+            asked += 1;
+            end = end.min(p + size);
+            p += size;
+        }
+        println!("VirtualQuery over the same 170 MB span: {asked} calls, {:.2} ms", walked.elapsed().as_secs_f64() * 1e3);
+        // SAFETY: our own reservation, released whole.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+        // The same question where nothing is committed: a placeholder, as
+        // the title's streaming views are until their pages arrive.
+        // SAFETY: our own reservation.
+        let free = unsafe {
+            let free = VirtualAlloc(std::ptr::null(), BIG, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!free.is_null());
+            free
+        };
+        let started = Instant::now();
+        for i in 0..N {
+            query(free.wrapping_add((i * 4096) % BIG));
+        }
+        println!(
+            "VirtualQuery in a {:.1} GB reservation, nothing committed: {:.2} us a call",
+            BIG as f64 / 1e9,
+            started.elapsed().as_nanos() as f64 / N as f64 / 1e3
+        );
+        // SAFETY: our own reservation, released whole.
+        assert_ne!(unsafe { VirtualFree(free.cast(), 0, MEM_RELEASE) }, 0);
+        // A small committed region: is the cost the region or the call?
+        // SAFETY: our own allocation.
+        let small = unsafe {
+            let small = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!small.is_null());
+            small
+        };
+        let started = Instant::now();
+        for _ in 0..N {
+            query(small);
+        }
+        println!("VirtualQuery in one committed 4 KiB page: {:.3} us a call", started.elapsed().as_nanos() as f64 / N as f64 / 1e3);
+        // SAFETY: our own allocation, released whole.
+        assert_ne!(unsafe { VirtualFree(small.cast(), 0, MEM_RELEASE) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod committed_tests {
+    use super::{committed, remapped};
+
+    /// A run of committed pages is asked about once and answered from the
+    /// table after, and a run the runtime maps or unmaps is asked about
+    /// again: the answer the kernel gave about there no longer holds.
+    ///
+    /// This is the whole cost argument for the table: the question is one
+    /// `VirtualQuery` per run, and the kernel's answer costs the committed
+    /// run it walks (3,048 µs inside a 1.2 GB committed block, 0.7 µs in one
+    /// page: `what_a_committed_question_costs`).
+    #[test]
+    fn a_run_is_asked_about_once_and_a_mapped_range_again() {
+        use windows_sys::Win32::System::Memory::*;
+        const HEAD: usize = 16 << 20;
+        const TAIL: usize = 16 << 20;
+        // SAFETY: our own reservation, released before the test returns; the
+        // committed part is ours alone.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), HEAD + TAIL, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(7, HEAD);
+            // What is there, what is not, and a span over the seam of the two.
+            assert!(committed(base, HEAD), "the committed head");
+            assert!(!committed(base.add(HEAD), TAIL), "the reserved tail");
+            assert!(!committed(base.add(HEAD - 4096), 8192), "a span over the seam");
+            // The same questions again, at no cost to the kernel.
+            let before = crate::fault::kernel_questions();
+            for _ in 0..100 {
+                assert!(committed(base, HEAD));
+                assert!(committed(base.add(HEAD / 2), 4096));
+            }
+            assert_eq!(crate::fault::kernel_questions(), before, "a run already answered");
+            // The tail becomes committed: the question is asked again, and
+            // says so.
+            assert_eq!(VirtualAlloc(base.add(HEAD).cast(), TAIL, MEM_COMMIT, PAGE_READWRITE), base.add(HEAD).cast());
+            remapped(base.add(HEAD) as usize, TAIL);
+            assert!(committed(base.add(HEAD), TAIL), "the tail after it was committed");
+            assert!(committed(base, HEAD + TAIL), "and the whole of it");
+            // What the runtime unmaps is not there any more, whatever the
+            // table held.
+            assert_ne!(VirtualFree(base.add(HEAD).cast(), TAIL, MEM_DECOMMIT), 0);
+            remapped(base.add(HEAD) as usize, TAIL);
+            assert!(!committed(base, HEAD + TAIL), "the span the runtime took away");
+            assert!(committed(base, HEAD), "the part of it that stayed");
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod staging_ceiling_tests {
+    use super::to_ceiling;
+
+    /// Past the ceiling the coldest buffers no list holds go, coldest
+    /// first, until the rest fit; a buffer a list holds is never taken,
+    /// however cold, and nothing is taken under the ceiling.
+    #[test]
+    fn the_ceiling_takes_the_coldest_not_held() {
+        // `(used, bytes, held)`: the second is the coldest, but a list holds
+        // it, so it is passed over.
+        let entries = [(10, 100, false), (1, 100, true), (5, 100, false), (7, 100, false)];
+        // 400 bytes against a 250 ceiling: the coldest not held (5) and the
+        // next (7) leave 200, under the ceiling.
+        assert_eq!(to_ceiling(&entries, 400, 250), vec![2, 3]);
+        assert!(to_ceiling(&entries, 400, 400).is_empty(), "under the ceiling");
+        // A list holds the only buffer: it goes regardless of the ceiling.
+        assert!(to_ceiling(&[(1, 400, true)], 400, 0).is_empty(), "held");
     }
 }

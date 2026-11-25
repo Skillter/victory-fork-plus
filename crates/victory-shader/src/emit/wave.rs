@@ -53,6 +53,8 @@ impl Op {
             "v_or_b32" => Op::Or,
             "v_and_b32" => Op::And,
             "v_xor_b32" => Op::Xor,
+            // `v_add_f64` is absent on purpose: a sum of doubles is not the sum of its
+            // dwords (a carry crosses the pair), so a per-lane model cannot follow one.
             _ => return None,
         })
     }
@@ -229,6 +231,15 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
             }
         }
     }
+}
+
+/// The lane a `v_permlanex16_b32` reads: the other 16-lane group of the lane's own
+/// 32-lane block, at the position its own group names — `lo` for lanes 0-15, `hi` for
+/// lanes 16-31. Both are 4-bit instruction fields, so the read cannot leave the block.
+fn permlane_x16_lane(l: u32, lo: u32, hi: u32) -> u32 {
+    let other = (l & !31) | ((l & 16) ^ 16);
+    let pick = (if l & 16 == 0 { lo } else { hi }) & 15;
+    other | pick
 }
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
@@ -586,24 +597,17 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .collect()
             }
             ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+                // Each lane reads the other 16-lane group of its own 32-lane
+                // block, at the field its own group names.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) => {
-                        let s = u64::from(s1) | u64::from(s2) << 32;
-                        (0..wave)
-                            .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
-                                let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
-                            })
-                            .collect()
-                    }
+                    (Some(s1), Some(s2)) => (0..wave)
+                        .map(|l| a[permlane_x16_lane(l, s1, s2) as usize])
+                        .collect(),
                     _ => vec![Sym::Unknown; wave as usize],
                 }
             }
@@ -1120,6 +1124,30 @@ mod tests {
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
         let (found, _) = shape(&words(quads, pairs));
         assert_eq!(found, None);
+    }
+
+    /// A lane's pick is the 4-bit field its own 16-lane group names, not nibble `l` of the
+    /// pair: `v_permlanex16_b32 v1, v0, 3, 5` sends lanes 0-15 to their partner's lane 3 and
+    /// lanes 16-31 to lane 5. The packed-nibble reading instead gives lane 5 lane 0 and keeps
+    /// the second field for lanes 16 and up, so a mask prediction built from it names a
+    /// different lane than the program the lowering emits reads.
+    #[test]
+    fn a_permlane_pick_is_the_field_of_the_lanes_own_group() {
+        assert_eq!(permlane_x16_lane(0, 3, 5), 19);
+        assert_eq!(permlane_x16_lane(5, 3, 5), 19);
+        assert_eq!(permlane_x16_lane(15, 3, 5), 19);
+        assert_eq!(permlane_x16_lane(16, 3, 5), 5);
+        assert_eq!(permlane_x16_lane(20, 3, 5), 5);
+        assert_eq!(permlane_x16_lane(31, 3, 5), 5);
+        // The upper block of a console wave reads within itself.
+        assert_eq!(permlane_x16_lane(40, 3, 5), 51);
+        assert_eq!(permlane_x16_lane(63, 3, 5), 37);
+        // Selectors are 4-bit fields, so a wider one cannot leave the group.
+        assert_eq!(permlane_x16_lane(0, 0xFF, 0xFF), 31);
+        // Both selectors zero: the partner lane, the form the archive uses.
+        assert_eq!(permlane_x16_lane(0, 0, 0), 16);
+        assert_eq!(permlane_x16_lane(16, 0, 0), 0);
+        assert_eq!(permlane_x16_lane(63, 0, 0), 32);
     }
 
     #[test]

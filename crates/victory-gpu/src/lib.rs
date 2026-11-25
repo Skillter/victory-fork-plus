@@ -8,12 +8,12 @@
 //!
 //! [`device`] is the device object titles create, [`dxgi`] its adapter side,
 //! [`resource`] heaps and resources, [`fence`] fences, [`queue`] command
-//! queues, [`list`] command allocators and lists, [`descriptor`]
-//! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
-//! [`signature`] command signatures, [`pipeline`] pipeline states,
+//! queues and the console's `Present` packet (shown through a swap chain
+//! `host` creates on first use), [`list`] command allocators and lists,
+//! [`descriptor`] descriptor heaps, [`root`] root signatures, [`query`] query
+//! heaps, [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees.
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -31,7 +31,11 @@ mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod fault;
 pub mod fence;
+#[cfg(windows)]
+mod flow;
 pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
@@ -44,6 +48,7 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+mod present;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
@@ -71,6 +76,16 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+
+/// The records of a run, for the parts of the layer that end it.
+///
+/// `victory-hle`'s `lifecycle::end` leaves the process itself (the title asked,
+/// or its suspend routines returned), so the `STOP` block cannot be written by
+/// the binary's own shutdown; and that crate does not depend on `victory-core`.
+/// The block is still built and rendered in `victory_core::report`, by
+/// [`victory_core::report::RunFooter`], so there is one set of lines and one
+/// place that formats them.
+pub use victory_core::{logging, report};
 
 #[cfg(windows)]
 pub use host::on_failure;

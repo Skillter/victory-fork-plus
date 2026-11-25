@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -35,29 +36,33 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
-    free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
+    /// The dynamic slots (view heaps only): the bump cursor and the runs
+    /// given back ([`Ring`]). Taken a whole list at a time ([`DynamicList`]):
+    /// the drawing thread never locks this per table. Shared with
+    /// [`RINGS`], so that a list gives a run back to this ring and not to one
+    /// made where this heap stood.
+    ring: std::sync::Arc<Mutex<Ring>>,
+    /// This heap's identity (`ident`), which the runs a list holds of it name
+    /// ([`Region::heap`]): a counter, so that a heap released and another
+    /// made at its address is another heap, and a stale run is drained onto
+    /// its own or onto nothing.
+    ident: usize,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer view at each title slot,
+    /// two dwords each (low, high), for shaders that read the address out of
+    /// a descriptor they pick by an index they compute
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload buffer of
+    /// `SLOT_VIEW_ADDRESSES_COUNT` dwords, its GPU address and its mapping.
+    /// Zero where the slot holds no buffer view, or one whose memory the
+    /// host does not have: a shader reads no address there rather than one
+    /// the host made up, and the title's own gate on the descriptor decides
+    /// what to do with that (the console's descriptor would hold none
+    /// either).
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -407,6 +412,22 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Ranges kept until a pass takes them.
+pub(crate) const RANGE_CAP: usize = 1 << 18;
+
+/// Ranges of memory dropped because a pass did not take them before
+/// [`RANGE_CAP`] filled, since the last window line about them (the pass
+/// takes them: `draw.rs` `heap_textures`). [`STALE`] 2 holds the count
+/// since the start.
+pub(crate) static RANGES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// What the queue costs: 16 bytes a range, 4 MiB at `RANGE_CAP`. (It was
+// 512 KiB at 32,768, and a 7.5-minute run dropped 131,072 ranges of 131,072:
+// the queue filled between passes and every range in it was thrown away.
+// The array is a `Vec`: growth leaves up to as much again spare.)
+const _: () = assert!(RANGE_CAP * size_of::<(u64, u64)>() == 4 << 20);
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -448,8 +469,6 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -463,10 +482,11 @@ pub(crate) fn remapped(at: usize, len: usize) {
         last.1 = end;
         return;
     }
-    if ranges.len() >= MOST {
+    if ranges.len() >= RANGE_CAP {
         // No pass runs (no shader that picks textures by index is bound):
         // the slots there are looked at when they are due, as before.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        RANGES_DROPPED.fetch_add(ranges.len() as u64, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));
@@ -715,7 +735,8 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 }
 
 /// Buffer views left null because the host would refuse them
-/// ([`buffer_view_ok`]), since the start.
+/// ([`buffer_view_ok`]), since the start: their reasons are counted apart
+/// (`REFUSED_REASONS`) and each is logged once.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the host device is gone, and why (the first time it is asked
@@ -800,6 +821,19 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// The most views the retail title has been seen to ask for: its heap of
+/// 1,245,184 (run 2026-11-25 15:30), past a host capped at
+/// [`PORTABLE_VIEWS`], which left 507,329 of its slots unserved.
+const TITLE_VIEWS: u32 = 1_245_184;
+
+/// The views a host heap must hold to serve every slot [`TITLE_VIEWS`]
+/// names: the title's own, the ring's past them, and the null slot at the
+/// end. 1,507,329 slots of 32 bytes are 48.2 MB of descriptor memory, 16.2
+/// more than a heap capped at [`PORTABLE_VIEWS`]; a host that took 1,507,328
+/// descriptors before the null slot was added (this card, run 11) takes it,
+/// and one that does not falls back to the cap.
+const WANTED_VIEWS: u32 = TITLE_VIEWS + DYNAMIC + 1;
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -828,15 +862,34 @@ pub(crate) fn probe_view_limit() {
                         NodeMask: 0,
                     })
             };
+            if let Err(e) = &made {
+                // Which size the card refuses, and in its own words: the
+                // probe's fallback is the next size down.
+                tracing::info!(count, error = %e, "a view heap of {count} views is not made");
+            }
             made.is_ok()
         };
         let views = if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
+        } else if fits(WANTED_VIEWS) {
+            // The card takes what the title asks for, and no more: one power
+            // of two below the aim is not the answer, since 1,245,184 title
+            // slots fit under it while a heap of 2^21 does not.
+            WANTED_VIEWS
         } else {
             PORTABLE_VIEWS
         };
+        let step = u64::from(
+            // SAFETY: a live device.
+            unsafe {
+                host.device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            },
+        );
         tracing::info!(
             views,
+            bytes = u64::from(views) * step,
+            step,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
@@ -853,7 +906,13 @@ pub(crate) fn probe_view_limit() {
 /// cutscene (a frame asks for up to 16,000 tables while the frame before
 /// still holds its own; a draw refused its table read slots never made
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
-/// table past them is made afresh in these slots like any other.
+/// table past them is made afresh in these slots like any other. Growing
+/// past 2^18 is not open to us: a capped heap is made at the host's whole
+/// limit, so a bigger ring takes slots the title's own views need, and those
+/// would read null. Run 2026-11-25 04:38 ran 2^18 out all the same (4,359
+/// draws a frame lost their table, 256 host lists in the air): a refusal now
+/// waits for the flights that hold the rest of the ring before it counts
+/// (`make_room`).
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
@@ -901,9 +960,17 @@ impl HostHeap {
             let fitted = if count + extra <= null {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                // shortcut: descriptors past the host's limit are left out; a
+                // title that reaches them needs remapping. The slots the ring
+                // covers read a live table of some draw's, which is not the
+                // null slot the others read: `mirror` names the highest index
+                // the title asked for.
+                let band = size - (null - extra);
+                let nulled = count.saturating_sub(null);
+                tracing::warn!(
+                    count,
+                    "host view heap capped at {size}; {band} title slots the ring covers read a live table, and {nulled} past {null} read a null slot"
+                );
                 null - extra
             };
             match make(size) {
@@ -943,6 +1010,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEW_ADDRESSES_COUNT) * 4;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "title address by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -953,10 +1033,10 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            ring: std::sync::Arc::new(Mutex::new(Ring::new(extra))),
+            ident: next_ident(),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -974,6 +1054,8 @@ impl HostHeap {
                 spans
             },
         };
+        // The ring the 5 s line and a refusal name (`dynamic_line`, `gauge`)
+        // counts itself, so nothing is said about it here.
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -983,6 +1065,10 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // Its runs are given back by its identity while it is alive
+        // ([`release_dynamic`]); after it is dropped the reference no longer
+        // upgrades and a stale run is forgotten.
+        register(h.ident, h.count, &h.ring);
         Some(h)
     }
 
@@ -1047,10 +1133,506 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// The dynamic slots of a view heap: a bump cursor that walks the ring once,
+/// and the runs lists gave back, taken again from the front.
+///
+/// A list is given one run at a time and steps through it itself
+/// ([`DynamicList`]), so what it asks for costs arithmetic on its own run and
+/// never a walk of the ring: the walk touched up to 262 KiB with the lock
+/// every table needs held, per draw.
+struct Ring {
+    /// The first slot not handed out since the ring was made.
+    at: u32,
+    /// Slots in the ring: [`DYNAMIC`] in view heaps.
+    capacity: u32,
+    /// Runs given back, first and length: ascending, never adjacent.
+    runs: Vec<(u32, u32)>,
+    /// Free slots: the cursor's tail and the runs. With fewer than a table
+    /// needs nothing is looked at. Once the world had taken them all, every
+    /// later table of the frame searched every slot before it was refused.
+    free: u32,
+    /// The shortest run asked for since slots were last given back that none
+    /// held (`u32::MAX`: none). Until something is given back the free runs
+    /// only shrink, so a run of that length or longer is refused without a
+    /// search: enough slots were free, but in pieces, and every such table
+    /// walked the whole ring before it was refused (0.33 ms each with
+    /// 131,072 slots, 1.0 s of the recording threads in a frame that refused
+    /// 3,143, run 45).
+    refused: u32,
+    /// Slots this looked at and runs it read, for the test that says a run of
+    /// allocations does not walk the ring.
+    #[cfg(test)]
+    steps: u64,
+}
+
+impl Ring {
+    fn new(capacity: u32) -> Self {
+        Ring {
+            at: 0,
+            capacity,
+            runs: Vec::new(),
+            free: capacity,
+            refused: u32::MAX,
+            #[cfg(test)]
+            steps: 0,
+        }
+    }
+
+    /// `n` consecutive free slots, as (first, length): the cursor's tail
+    /// first, then the runs given back, shortest search first.
+    fn take(&mut self, n: u32) -> Option<(u32, u32)> {
+        if n == 0 || n > self.capacity || self.free < n {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+        // A table of the length that last found nothing (and every longer
+        // one) is refused without the search: they have only got rarer.
+        if n >= self.refused {
+            return None;
+        }
+        if self.at + n <= self.capacity {
+            let first = self.at;
+            self.at += n;
+            self.free -= n;
+            return Some((first, n));
+        }
+        for k in 0..self.runs.len() {
+            #[cfg(test)]
+            {
+                self.steps += 1;
+            }
+            let (first, len) = self.runs[k];
+            if len < n {
+                continue;
+            }
+            if len == n {
+                self.runs.remove(k);
+            } else {
+                self.runs[k] = (first + n, len - n);
+            }
+            self.free -= n;
+            return Some((first, n));
+        }
+        self.refused = n;
+        None
+    }
+
+    /// Slots `first` on, `len` of them, free again: merged with the runs
+    /// around them, which a list gives back one after another. Returns the
+    /// slots it credited: all of them, unless some were free already.
+    ///
+    /// A run is given back once, whole. Slots that are free already are
+    /// neither credited nor put in the runs again (a second credit would leave
+    /// `free` past `capacity`, and `take` would hand the slots of one run to
+    /// two lists), and neither are the slots the cursor has not handed out:
+    /// each give-back is credited for the slots that came back, never for the
+    /// run it merges into.
+    fn give_back(&mut self, first: u32, len: u32) -> u32 {
+        let end = first.saturating_add(len).min(self.capacity).min(self.at);
+        let mut credited = 0;
+        let mut at = first;
+        while at < end {
+            match self.next_run(at) {
+                Some((start, run_end)) if start < end => {
+                    if start > at {
+                        self.credit(at, start - at);
+                        credited += start - at;
+                    }
+                    at = run_end;
+                }
+                _ => {
+                    self.credit(at, end - at);
+                    credited += end - at;
+                    at = end;
+                }
+            }
+        }
+        credited
+    }
+
+    /// The first span at or after `at` that a run given back made free: where
+    /// it starts (never below `at`) and where it ends.
+    fn next_run(&self, at: u32) -> Option<(u32, u32)> {
+        let k = self.runs.partition_point(|&(first, len)| first + len <= at);
+        let &(first, len) = self.runs.get(k)?;
+        Some((first.max(at), first + len))
+    }
+
+    /// Slots `first` on, `len` of them, free: counted once and merged with
+    /// the runs next to them.
+    fn credit(&mut self, first: u32, len: u32) {
+        self.refused = u32::MAX;
+        self.free += len;
+        debug_assert!(
+            self.free <= self.capacity,
+            "the ring credited more slots than it holds: {} of {}",
+            self.free,
+            self.capacity
+        );
+        let mut first = first;
+        let mut len = len;
+        if let Some(k) = self.runs.partition_point(|&(f, _)| f < first).checked_sub(1) {
+            let (before, before_len) = self.runs[k];
+            if before + before_len == first {
+                self.runs.remove(k);
+                first = before;
+                len += before_len;
+            }
+        }
+        let at = self.runs.partition_point(|&(f, _)| f < first);
+        if let Some(&(after, after_len)) = self.runs.get(at)
+            && first + len == after
+        {
+            len += after_len;
+            self.runs.remove(at);
+        }
+        self.runs.insert(at, (first, len));
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+    }
+}
+
+/// Identities handed to host heaps ([`HostHeap::ident`]): a counter, never an
+/// address, so that a heap the title released and another it made at the same
+/// address are two heaps and a run of one is never drained onto the other.
+static IDENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn next_ident() -> usize {
+    IDENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The rings of the host heaps alive, by identity: the title slots each heap's
+/// ring starts after, and a reference that does not upgrade once the heap is
+/// gone. A list gives its runs back by the identity it took them under
+/// ([`DynamicList::drain`]), so the slots of a run never land in a heap the
+/// run was not taken from; a heap released meanwhile takes nothing.
+/// (The runs used to name the heap's address, and nothing was given back at
+/// all: the run's address was not the title heap's, which is what the release
+/// path looked up.)
+static RINGS: Mutex<Vec<(usize, u32, std::sync::Weak<Mutex<Ring>>)>> = Mutex::new(Vec::new());
+
+/// Registers `ring` as the ring of host heap `ident`, which starts at `count`
+/// title slots ([`HostHeap::new`]).
+fn register(ident: usize, count: u32, ring: &std::sync::Arc<Mutex<Ring>>) {
+    let mut live = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    live.retain(|(_, _, ring)| ring.strong_count() > 0);
+    live.push((ident, count, std::sync::Arc::downgrade(ring)));
+}
+
+/// The ring of host heap `ident`, if it is still alive, and the title slots it
+/// starts after.
+fn registered(ident: usize) -> Option<(u32, std::sync::Arc<Mutex<Ring>>)> {
+    let live = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, count, ref ring) = live.iter().find(|&&(id, _, _)| id == ident)?;
+    Some((count, ring.upgrade()?))
+}
+
+/// `n` slots of `ring` from host index `first` (a [`DynamicList::drain`]
+/// named) are free again, `count` the title slots the ring starts after.
+fn give_back(ring: &Mutex<Ring>, count: u32, first: u32, n: u32) {
+    let Some(at) = first.checked_sub(count) else {
+        return;
+    };
+    let credited = ring.lock().unwrap_or_else(|e| e.into_inner()).give_back(at, n);
+    if credited < n {
+        // A run given back twice (a list drained twice, or with a length it
+        // no longer holds) is credited once: the ring is not left with slots
+        // it does not have, and no table is served one of them twice.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(first, n, credited, "a run of dynamic slots was given back twice");
+        });
+    }
+}
+
+/// Gives back `n` dynamic slots of the host heap whose identity is `ident`,
+/// from host index `first` (a [`DynamicList::drain`] named), free for another
+/// list's run ([`crate::descriptor::release_dynamic`]). A heap that is gone
+/// takes nothing: the run it was given is forgotten with it.
+pub(crate) fn release_dynamic(ident: usize, first: u32, n: u32) {
+    if let Some((count, ring)) = registered(ident) {
+        give_back(&ring, count, first, n);
+    }
+}
+/// The dynamic ring, counted in every build: a table refused is a draw
+/// without its descriptors, and nothing else said so in a release run (run
+/// 2026-11-25 04:38: one line for the first of 4,359 draws a frame).
+/// Tables asked, refused and draws dropped for want of one, and refusals a
+/// wait for the card answered, since the last 5 s line.
+static DYN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+const DYN_ASKED: usize = 0;
+const DYN_REFUSED: usize = 1;
+const DYN_DROPPED: usize = 2;
+const DYN_ROOM_MADE: usize = 3;
+
+/// The dynamic slots of every view heap alive: free, in all its rings, and how
+/// many rings there are.
+///
+/// Counted from the rings rather than kept as slots are handed out and given
+/// back: a counter credited with each run a list gave back credited the merged
+/// run whole, and stood at 1.31 billion free of 262,144 after a world scene
+/// (run 2026-11-25 05:53); a heap let go also left its slots in the total.
+fn gauge() -> (u64, u64, u64) {
+    gauge_of(live_rings().into_iter())
+}
+
+/// The rings of every view heap alive: a heap let go is not one of them.
+fn live_rings() -> Vec<std::sync::Arc<Mutex<Ring>>> {
+    let rings = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    rings.iter().filter_map(|(_, _, ring)| ring.upgrade()).collect()
+}
+
+/// [`gauge`] of the rings given.
+fn gauge_of(rings: impl Iterator<Item = std::sync::Arc<Mutex<Ring>>>) -> (u64, u64, u64) {
+    let (mut free, mut slots, mut count) = (0u64, 0u64, 0u64);
+    for ring in rings {
+        let ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+        free += u64::from(ring.free);
+        slots += u64::from(ring.capacity);
+        count += 1;
+    }
+    (free, slots, count)
+}
+
+/// How long a refusal waits before it asks the card to finish the
+/// submissions in the air, so the lists behind them give their runs back.
+/// One ask is one wait for the card (3.5-17.6 ms a frame of them in run
+/// 2026-11-25 04:38), so a refusal storm asks four times a second at most,
+/// never once per draw.
+const ROOM_EVERY_US: u64 = 250_000;
+
+/// How long a refusal waits before it is said: twelve lines in a 5 s window
+/// at most, whatever the storm, and the 5 s line carries the totals.
+const SAY_EVERY_US: u64 = 400_000;
+
+/// Whether `every` has passed since `last` (`u64::MAX`: never), or it is
+/// the first.
+fn due(last: u64, now: u64, every: u64) -> bool {
+    last == u64::MAX || now.saturating_sub(last) >= every
+}
+
+/// Asks the card to finish the submissions in the air, so that the lists
+/// behind them give their runs back ([`crate::host::settle_now`] →
+/// `tables_done` → [`HostHeap::release`]): one wait for the card, at most
+/// one per [`ROOM_EVERY_US`], and never from inside a submission (the draw
+/// path records, it does not submit). True when it asked, so the caller
+/// tries its table again.
+fn make_room() -> bool {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if !crate::host::late() {
+        // Nothing is in the air: a submission's slots were given back when
+        // it ran, before the title's next call returned.
+        return false;
+    }
+    let now = crate::host::now_us();
+    let last = LAST.load(Relaxed);
+    if !due(last, now, ROOM_EVERY_US) || LAST.compare_exchange(last, now, AcqRel, Relaxed).is_err() {
+        return false;
+    }
+    crate::host::settle_now(crate::host::WHY_DYNAMIC);
+    DYN[DYN_ROOM_MADE].fetch_add(1, Relaxed);
+    true
+}
+
+/// A table the ring had no room for, said with the room it had and what
+/// holds the rest: the line the [`std::sync::Once`] here printed once in a
+/// whole run.
+fn refused_line(n: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = crate::host::now_us();
+    let last = LAST.load(Relaxed);
+    if !due(last, now, SAY_EVERY_US) {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let (free, slots, rings) = gauge();
+    tracing::warn!(
+        n,
+        free,
+        slots,
+        rings,
+        in_air = crate::host::lists_in_air(),
+        "no free dynamic descriptor slots: a table is not made, and the draw goes without it"
+    );
+}
+
+/// A draw is dropped for want of a dynamic slot ([`crate::draw`]): counted
+/// for the 5 s line, where the refusal behind it is named.
+pub(crate) fn note_dropped_draw() {
+    DYN[DYN_DROPPED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The dynamic ring every 5 s, in every build: the slots free, the tables
+/// asked and refused, the draws that went without them, and the refusals a
+/// wait for the card answered.
+pub(crate) fn dynamic_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (free, slots, rings) = gauge();
+    if slots == 0 {
+        // No view heap yet, or a run that made none.
+        return;
+    }
+    let [asked, refused, dropped, answered] = DYN.each_ref().map(|c| c.swap(0, Relaxed));
+    let per_frame = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "dynamic descriptor slots: {free} of {slots} free in {rings} view heap(s), {:.1} % used; per frame: {:.0} tables \
+         asked, {:.0} refused ({:.0} draws dropped for want of one), {:.0} refusals a wait for the card answered; \
+         {} lists in the air",
+        100.0 * slots.saturating_sub(free) as f64 / slots as f64,
+        per_frame(asked),
+        per_frame(refused),
+        per_frame(dropped),
+        per_frame(answered),
+        crate::host::lists_in_air()
+    );}
+
+/// A run of dynamic slots one list holds: `first` to `end` of the host heap
+/// whose identity is `heap` (by host heap, so that a heap released and another
+/// made at its address is another heap), with `next` the slot its next table
+/// starts at.
+struct Region {
+    heap: usize,
+    first: u32,
+    next: u32,
+    end: u32,
+}
+
+/// The dynamic slots one list holds ([`HostHeap::dynamic`]): runs of its view
+/// heap's ring, given back as a whole when the list's submission has run or
+/// the list is released. A run is taken once and stepped through here, so a
+/// table costs the list an add.
+#[derive(Default)]
+pub(crate) struct DynamicList {
+    regions: Vec<Region>,
+}
+
+impl DynamicList {
+    /// The run this list holds that takes `n` more slots of heap `heap` and
+    /// the slot they start at, or `None` for the caller to reserve one.
+    fn step(&mut self, heap: usize, n: u32) -> Option<u32> {
+        let region = self.regions.last_mut()?;
+        if region.heap != heap || region.next + n > region.end {
+            return None;
+        }
+        let at = region.next;
+        region.next = at + n;
+        Some(at)
+    }
+
+    /// `n` consecutive dynamic slots of `heap`: the first's host index, taken
+    /// until [`DynamicList::drain`].
+    fn alloc(&mut self, heap: &HostHeap, n: u32) -> Option<u32> {
+        let id = heap.ident();
+        if let Some(first) = self.step(id, n) {
+            return Some(first);
+        }
+        // A run twice the size of the last one, up to a page of slots, so
+        // that a list of many tables does not ask for a run per table; and
+        // never past what a table can be.
+        let held = self
+            .regions
+            .last()
+            .filter(|region| region.heap == id)
+            .map_or(0, |region| region.end - region.first);
+        let len = n.max(held.min(GROWTH));
+        // Room for the table but not for the run it would like (other lists
+        // are holding slots): take its slots alone rather than refuse a table
+        // the ring could hold.
+        let (first, len) = match heap.reserve(len) {
+            Some(taken) => taken,
+            None if len > n => heap.reserve(n)?,
+            None => return None,
+        };
+        // Next to the run the list already holds: grown in place, so that a
+        // list that outgrows its run keeps one run.
+        match self.regions.last_mut() {
+            Some(region) if region.heap == id && region.end == first => {
+                region.end += len;
+                let at = region.next;
+                region.next = at + n;
+                Some(at)
+            }
+            _ => {
+                self.regions.push(Region {
+                    heap: id,
+                    first,
+                    next: first + n,
+                    end: first + len,
+                });
+                Some(first)
+            }
+        }
+    }
+
+    /// Gives every run back, as (host heap identity, first slot, slots). The
+    /// caller releases them ([`crate::descriptor::release_dynamic`]): the
+    /// heap may be gone by then, and a heap made at its address since is
+    /// another identity, so nothing lands in it.
+    pub(crate) fn drain(&mut self) -> Vec<(usize, u32, u32)> {
+        self.regions
+            .drain(..)
+            .map(|region| (region.heap, region.first, region.end - region.first))
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+}
+
+/// The most slots one reservation grows to: a list of small tables asks the
+/// ring again once per this many slots, not once per table.
+const GROWTH: u32 = 4096;
+
 impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// This heap as a list's run names it (see [`Region::heap`]): its
+    /// identity, not its address, so that a stale run of a heap the title
+    /// released is never drained onto a heap made at the same address.
+    fn ident(&self) -> usize {
+        self.ident
+    }
+
+    /// `len` slots of the ring as (host index, length), to be given back with
+    /// [`HostHeap::release`].
+    fn reserve(&self, len: u32) -> Option<(u32, u32)> {
+        let (first, len) = self
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(len)?;
+        Some((self.count + first, len))
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only) for `list`, taken
+    /// until it gives them back ([`DynamicList::drain`]): the first's host
+    /// index.
+    pub(crate) fn dynamic_in(&self, list: &mut DynamicList, n: u32) -> Option<u32> {
+        self.take_slots(n, Some(list))
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only) held for the
+    /// heap's life (the memory directory's views): the first's host index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.take_slots(n, None)
+    }
+
+    /// `n` slots of the ring for `list`, or for the heap's life: the first's
+    /// host index.
+    fn alloc_in(&self, n: u32, list: &mut Option<&mut DynamicList>) -> Option<u32> {
+        match list {
+            Some(list) => list.alloc(self, n),
+            None => self.reserve(n).map(|(first, _)| first),
+        }
+    }
+
+    fn take_slots(&self, n: u32, list: Option<&mut DynamicList>) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -1058,48 +1640,28 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
+        DYN[DYN_ASKED].fetch_add(1, Ordering::Relaxed);
+        let mut list = list;
+        let mut made = self.alloc_in(n, &mut list);
+        if made.is_none() && list.is_some() && make_room() {
+            // The submissions that had run gave their lists' runs back: the
+            // table the ring refused a moment ago fits now. The ring is the
+            // same ring, so no slot is served that was not made for a table.
+            made = self.alloc_in(n, &mut list);
         }
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
-            return None;
-        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+        {
+            use crate::copystat::{C, add};
+            if made.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        if made.is_none() {
+            DYN[DYN_REFUSED].fetch_add(1, Ordering::Relaxed);
+            refused_line(n);
+        }
+        made
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1117,6 +1679,17 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the table of view addresses by title slot (view
+    /// heaps).
+    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
+        self.addresses.as_ref().map(|s| s.1)
+    }
+
+    /// That table's buffer, for a list to hold.
+    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        self.addresses.as_ref().map(|s| &s.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1603,6 +2176,17 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The address the console's descriptor holds: where the view
+            // reads title memory, or 0. One aligned eight-byte store, so a
+            // shader reads either address and never half of one.
+            let address = slot_address(view);
+            // SAFETY: inside the mapping, eight bytes per slot; a shader
+            // reads it while we write (either value is one the slot had).
+            unsafe { (*data as *mut u64).add(index as usize).write_volatile(address) };
+        }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -1617,24 +2201,6 @@ impl HostHeap {
                 .insert(index);
         }
         stale
-    }
-
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
-    ///
-    /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
-        }
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2138,6 +2704,16 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// The title address the console's descriptor for `view` holds: where the
+/// part of the buffer the view reads begins, or 0 where the slot holds
+/// something other than a buffer view the host has the memory of
+/// ([`buffer_range`]). A shader that picks a descriptor from the heap by an
+/// index it computes reads it ([`HostHeap::note_buffer`],
+/// `victory_shader::emit::SLOT_VIEW_ADDRESSES`).
+fn slot_address(view: Option<&View>) -> u64 {
+    view.and_then(buffer_range).map_or(0, |(at, _)| at)
+}
+
 /// The title memory the host slot of buffer view `view` is made on
 /// (address, bytes): the whole buffer the view is of, which is what
 /// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
@@ -2351,41 +2927,241 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
         .flatten()
 }
 
-/// Whether the host accepts a buffer view with these fields of a buffer of
-/// `width` bytes. It removes the device for one it does not (view creation
-/// returns nothing), and the console is laxer: the title's heap holds
-/// views past their memory's end, of no elements, of typeless formats
-/// without the raw flag, with strides the host has no structured buffers
-/// for. Since every buffer view of the heap is made for shaders that pick
-/// them by index, one such view ended the run (2026-11-24, run 10).
-fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
-    use crate::resource::family;
-    let f = format.0 as u32;
-    let element = if raw {
-        // raw: R32 typeless, counted in dwords, starting on 16 bytes
-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
-            return false;
+/// Why the host takes no buffer view of a descriptor, counted apart from the
+/// others (`REFUSED_REASONS`) and logged once in its own words
+/// ([`refusal`]). The console is laxer than the host on every one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// No elements, and a descriptor of a dimension that is not a buffer's:
+    /// the host has no buffer to work an element of.
+    NoElements,
+    /// No elements, and the host copy the view is of declares no bytes: there
+    /// is no rest of it to read.
+    NoLength,
+    /// A raw view that is not R32 typeless without a stride.
+    RawShape,
+    /// A raw view that does not begin on 16 bytes.
+    RawStart,
+    /// A structured view of a stride the host has no structured buffers for.
+    StructuredShape,
+    /// A typed view of a format the host has no element size for.
+    TypedFormat,
+    /// A view past the end of its buffer's host copy.
+    PastTheEnd,
+}
+
+impl Refused {
+    /// Every reason, in the order `REFUSED_REASONS` counts them.
+    const ALL: [Refused; 7] = [
+        Refused::NoElements,
+        Refused::NoLength,
+        Refused::RawShape,
+        Refused::RawStart,
+        Refused::StructuredShape,
+        Refused::TypedFormat,
+        Refused::PastTheEnd,
+    ];
+    const COUNT: usize = Refused::ALL.len();
+
+    /// What the reason is, in the log's words.
+    fn name(self) -> &'static str {
+        match self {
+            Refused::NoElements => "a view of no elements whose descriptor is not a buffer's",
+            Refused::NoLength => "a view of no elements of a buffer that declares no bytes",
+            Refused::RawShape => "a raw view that is not R32 typeless without a stride",
+            Refused::RawStart => "a raw view that does not begin on 16 bytes",
+            Refused::StructuredShape => "a structured view of a stride the host does not take",
+            Refused::TypedFormat => "a typed view of a format with no element size",
+            Refused::PastTheEnd => "a view past the end of its buffer",
         }
-        4
-    } else if stride > 0 {
+    }
+}
+
+/// Buffer views left null, by reason, since the start ([`REFUSED_VIEWS`] is
+/// their total and the frame line prints these).
+static REFUSED_REASONS: [std::sync::atomic::AtomicU64; Refused::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; Refused::COUNT];
+
+/// The reasons already logged, one line each: the counters say how many.
+static REFUSED_LOGGED: [std::sync::Once; Refused::COUNT] = [const { std::sync::Once::new() }; Refused::COUNT];
+
+/// Whether the host accepts a buffer view with these fields of a buffer of
+/// `width` bytes, or why it does not ([`Refused`], counted and logged
+/// apart). It removes the device for a view it does not take (view creation
+/// returns nothing), and the console is laxer: the title's heap holds views
+/// past their memory's end, of no elements, of typeless formats without the
+/// raw flag, with strides the host has no structured buffers for. Since every
+/// buffer view of the heap is made for shaders that pick them by index, one
+/// such view ended the run (2026-11-24, run 10).
+fn buffer_view_ok(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> Result<(), Refused> {
+    let element = buffer_element(format, stride, raw)?;
+    if raw && !first.is_multiple_of(4) {
+        return Err(Refused::RawStart);
+    }
+    if count == 0 {
+        return Err(Refused::NoElements);
+    }
+    match first.checked_add(u64::from(count)).and_then(|end| end.checked_mul(element)) {
+        Some(end) if end <= width => Ok(()),
+        _ => Err(Refused::PastTheEnd),
+    }
+}
+
+/// Bytes per element of a buffer view of these fields, or why the host takes
+/// no such view: the format, the stride and the raw flag are all the element
+/// is worked out from.
+fn buffer_element(format: DXGI_FORMAT, stride: u32, raw: bool) -> Result<u64, Refused> {
+    use crate::resource::family;
+    if raw {
+        // raw: R32 typeless, counted in dwords, starting on 16 bytes
+        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 {
+            return Err(Refused::RawShape);
+        }
+        return Ok(4);
+    }
+    if stride > 0 {
         // structured: no format, a stride the host takes
         if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
-            return false;
+            return Err(Refused::StructuredShape);
         }
-        u64::from(stride)
-    } else {
-        // typed: a format with a size that is not typeless
-        let typeless = family(f) == f && family(f + 1) == f;
-        match crate::resource::element(f) {
-            Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
-            _ => return false,
-        }
+        return Ok(u64::from(stride));
+    }
+    // typed: a format with a size that is not typeless
+    let f = format.0 as u32;
+    let typeless = family(f) == f && family(f + 1) == f;
+    match crate::resource::element(f) {
+        Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => Ok(bytes),
+        _ => Err(Refused::TypedFormat),
+    }
+}
+
+/// The elements a buffer view of no elements has: the console's reads the
+/// rest of the buffer the view is of. The host takes no view of none (it
+/// removes the device for one), and one left null reads as zeros where the
+/// title's buffer is (`null_for`), so the length is worked out instead:
+/// from `first` to the end of the buffer, which lies `offset` bytes into a
+/// host copy `width` bytes wide. `len` is the bytes the title declares its
+/// buffer; a placed buffer the title describes none wide (run 2026-11-25
+/// 15:30: `of the buffer 0x3f07b080+0`, its copy 182,452,224 bytes) declares
+/// none, and the copy is then the only end there is. `None` if nothing is
+/// left.
+fn elements_left(first: u64, element: u64, offset: u64, len: u64, width: u64) -> Option<u32> {
+    let end = if len == 0 { width } else { offset.saturating_add(len).min(width) };
+    let bytes = end.checked_sub(first.checked_mul(element)?)?;
+    // A view of more than a u32 of elements covers all the host can name.
+    (bytes >= element).then(|| u32::try_from(bytes / element).unwrap_or(u32::MAX))
+}
+
+/// The elements a buffer view is made with: a view of no elements is the
+/// console's for the rest of its buffer ([`elements_left`]), any other keeps
+/// its count. `buffer` says whether the descriptor's dimension is a buffer's
+/// (a descriptor of another dimension has no elements to read past, and its
+/// fields are another's), and the host copy the view is on is `offset` bytes
+/// in, `len` bytes of a buffer, `width` bytes wide.
+///
+/// `Err` where there is nothing to work the rest out from and the view stays
+/// null for a reason of its own: a host copy of no bytes at all has no rest,
+/// and a view that begins past its copy's end has none either.
+#[allow(clippy::too_many_arguments)]
+fn view_count(
+    buffer: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    offset: u64,
+    len: u64,
+    width: u64,
+) -> Result<u32, Refused> {
+    if count > 0 || !buffer {
+        return Ok(count);
+    }
+    let Ok(element) = buffer_element(format, stride, raw) else {
+        // Not a shape the host takes a view of: `buffer_view_ok` names why.
+        return Ok(0);
     };
-    count > 0
-        && first
-            .checked_add(u64::from(count))
-            .and_then(|end| end.checked_mul(element))
-            .is_some_and(|end| end <= width)
+    match elements_left(first, element, offset, len, width) {
+        Some(left) => Ok(left),
+        None if width == 0 => Err(Refused::NoLength),
+        None => Err(Refused::PastTheEnd),
+    }
+}
+
+/// Counts a buffer view left null, and logs the first of its reason: the
+/// fields that decided it and the buffer it is of, in `buffer` (address and
+/// bytes).
+#[allow(clippy::too_many_arguments)]
+fn refused(
+    why: Refused,
+    unordered: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+    buffer: (u64, u64),
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REFUSED_VIEWS.fetch_add(1, Relaxed);
+    REFUSED_REASONS[why as usize].fetch_add(1, Relaxed);
+    REFUSED_LOGGED[why as usize].call_once(|| {
+        tracing::warn!(
+            "{}",
+            refusal(why, unordered, format, first, count, stride, raw, width, buffer)
+        )
+    });
+}
+
+/// The line a buffer view left null is logged with, once per reason: what
+/// the host would not take, the fields that decided it, and the buffer it is
+/// of.
+#[allow(clippy::too_many_arguments)]
+fn refusal(
+    why: Refused,
+    unordered: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+    buffer: (u64, u64),
+) -> String {
+    format!(
+        "buffer view the host would refuse left null: {reason}; {}format={format} first={first} \
+         count={count} stride={stride} raw={raw} width={width}, of the buffer {address:#x}+{bytes}",
+        if unordered { "unordered; " } else { "" },
+        reason = why.name(),
+        format = format.0,
+        address = buffer.0,
+        bytes = buffer.1,
+    )
+}
+
+/// Buffer views left null, by reason, as the frame line prints them; `None`
+/// when none was.
+pub(crate) fn refused_census() -> Option<String> {
+    by_reason(Refused::ALL.map(|why| REFUSED_REASONS[why as usize].load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// [`refused_census`] of counts in [`Refused::ALL`]'s order.
+fn by_reason(counts: [u64; Refused::COUNT]) -> Option<String> {
+    let parts: Vec<String> = Refused::ALL
+        .iter()
+        .zip(counts)
+        .filter(|&(_, n)| n > 0)
+        .map(|(why, n)| format!("{} {n}", why.name()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 fn buffer_srv(
@@ -2445,17 +3221,33 @@ fn buffer_srv(
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "buffer view the host would refuse left null"
-        );
+    // A view of no elements is the console's for the rest of its buffer (see
+    // `elements_left`); a host copy of no bytes has no rest, and the view
+    // stays null for that reason of its own.
+    let count = match view_count(
+        desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER,
+        desc.Format,
+        first,
+        count,
+        stride,
+        raw,
+        offset,
+        len,
+        width,
+    ) {
+        Ok(count) => count,
+        Err(why) => {
+            // The console's "no elements is the rest of its buffer" has no
+            // rest to give here: the copy declares no bytes, or the view
+            // begins past its end.
+            buffer.NumElements = 0;
+            refused(why, false, desc.Format, first, 0, stride, raw, width, (address, len));
+            return None;
+        }
+    };
+    buffer.NumElements = count;
+    if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        refused(why, false, desc.Format, first, count, stride, raw, width, (address, len));
         return None;
     }
     // The console has no component mapping; one the host does not know is the default's.
@@ -2548,17 +3340,33 @@ fn buffer_uav(
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "unordered buffer view the host would refuse left null"
-        );
+    // A view of no elements is the console's for the rest of its buffer (see
+    // `elements_left`); a host copy of no bytes has no rest, and the view
+    // stays null for that reason of its own.
+    let count = match view_count(
+        desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
+        desc.Format,
+        first,
+        count,
+        stride,
+        raw,
+        offset,
+        len,
+        width,
+    ) {
+        Ok(count) => count,
+        Err(why) => {
+            // The console's "no elements is the rest of its buffer" has no
+            // rest to give here: the copy declares no bytes, or the view
+            // begins past its end.
+            buffer.NumElements = 0;
+            refused(why, true, desc.Format, first, 0, stride, raw, width, (address, len));
+            return None;
+        }
+    };
+    buffer.NumElements = count;
+    if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        refused(why, true, desc.Format, first, count, stride, raw, width, (address, len));
         return None;
     }
     let host = host()?;
@@ -3203,15 +4011,28 @@ mod tests {
         // bytes before the view's memory: bytes 192..2192.
         let (first, count) = raw_window(32, 8, 100, 20).unwrap();
         assert_eq!((first, count), (48, 500));
-        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096));
+        assert_eq!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096), Ok(()));
         // the format a raw view must name; the structured one's is refused
-        assert!(!buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096),
+            Err(Refused::RawShape)
+        );
         // past the buffer, not on 16 bytes, no elements
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000),
+            Err(Refused::PastTheEnd)
+        );
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first + 1, count, 0, true, 4096),
+            Err(Refused::RawStart)
+        );
         assert!(raw_window(4, 0, 100, 20).is_none());
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096),
+            Err(Refused::NoElements)
+        );
         // a structured view the host takes as it is
-        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+        assert_eq!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096), Ok(()));
     }
 
     /// The queue of textures picked by index serves the slots looked at
@@ -3502,6 +4323,75 @@ mod tests {
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
     }
 
+    /// A placed buffer view of `elements` elements of 4 bytes at title
+    /// address `at`, its first element `first` elements in.
+    fn placed_buffer(at: u64, first: u64, elements: u32) -> View {
+        // The ten words of the descriptor, as `srv_desc` reads them (the
+        // union of `D3D12_SHADER_RESOURCE_VIEW_DESC` begins at its fourth):
+        // format, dimension, then first element, elements, stride, flags.
+        let desc = [
+            0,
+            1, // D3D12_SRV_DIMENSION_BUFFER
+            0,
+            0,
+            first as u32,
+            (first >> 32) as u32,
+            elements,
+            0,
+            1, // D3D12_BUFFER_SRV_FLAG_RAW: 4 bytes an element
+            0,
+            at as u32,
+            (at >> 32) as u32,
+            0,
+            0,
+            0,
+            0,
+        ];
+        View::Placed(false, [1, 0, 0, 0, 0x4000, 0, 0, 0, 0, 0, 0, 0, 0, 0], desc)
+    }
+
+    /// The address a heap slot's descriptor holds is the title address the
+    /// buffer view there reads its first element at, and zero where the slot
+    /// holds a texture view or nothing: a shader that picks a descriptor
+    /// from the heap by an index it computes reads it, and a zero says the
+    /// host has no address to give rather than one it made up.
+    #[test]
+    fn a_slots_view_address_is_where_its_buffer_view_begins() {
+        let at = 0x7fee_0000_1234u64;
+        assert_eq!(slot_address(Some(&placed_buffer(at, 0, 16))), at);
+        // The first element moves the address, as the console's does.
+        assert_eq!(slot_address(Some(&placed_buffer(at, 3, 16))), at + 12);
+        // A placed texture view (the buffer discriminant is 0), and a slot
+        // with no view.
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
+        assert_eq!(slot_address(Some(&texture)), 0);
+        assert_eq!(slot_address(None), 0);
+    }
+
+    /// The host writes that address into the heap's table of them, two
+    /// dwords a slot, where the title writes the descriptor.
+    #[test]
+    fn a_slots_view_address_reaches_the_table_of_them() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = &heap.addresses else {
+            return; // no host GPU (the table is made with the heap)
+        };
+        let at = 0x7fee_0000_4321u64;
+        heap.note_buffer(5, Some(&placed_buffer(at, 2, 4)), false);
+        // SAFETY: inside the mapping, eight bytes a slot, as the shader
+        // reads them.
+        let written = unsafe { *(*data as *const u64).add(5) };
+        assert_eq!(written, at + 8);
+        // A texture view in the slot: no address.
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
+        heap.note_buffer(5, Some(&texture), false);
+        // SAFETY: as above.
+        let written = unsafe { *(*data as *const u64).add(5) };
+        assert_eq!(written, 0);
+    }
+
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
     #[test]
@@ -3572,19 +4462,448 @@ mod tests {
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 
+    /// A run of allocations makes no search: each of 10,000 tables in a ring
+    /// that holds them costs the cursor one step and reads no slot of it.
+    /// Everything given back merges into one run, and the tables after that
+    /// cost one run read apiece.
     #[test]
-    fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
+    fn ten_thousand_allocations_do_not_walk_the_ring() {
+        const TABLES: u32 = 10_000;
+        let mut ring = Ring::new(TABLES);
+        assert_eq!(ring.free, TABLES);
+        for table in 0..TABLES {
+            let before = ring.steps;
+            assert_eq!(ring.take(1), Some((table, 1)), "table {table}");
+            assert_eq!(ring.steps - before, 1, "table {table} read the ring");
+        }
+        // Full: the ring has nothing left and the cursor is at its end.
+        assert_eq!((ring.free, ring.at), (0, TABLES));
+        assert_eq!(ring.take(1), None);
+        // Given back one run at a time in the order they were taken, the runs
+        // merge: the whole ring is one run again.
+        for table in 0..TABLES {
+            ring.give_back(table, 1);
+        }
+        assert_eq!(ring.runs, [(0, TABLES)]);
+        assert_eq!(ring.free, TABLES);
+        let before = ring.steps;
+        for table in 0..TABLES {
+            assert_eq!(ring.take(1), Some((table, 1)), "again {table}");
+        }
+        // One step per table plus one run read for the first: the run is
+        // looked at per take, and no more than that.
+        assert_eq!(ring.steps - before, 2 * u64::from(TABLES));
+    }
+
+    /// A list's tables come out of the run it holds: 10,000 of them cost it
+    /// the run's cursor, and the ring is not read. Another heap's run is
+    /// never stepped through.
+    #[test]
+    fn a_lists_tables_come_from_its_own_run() {
+        let mut list = DynamicList {
+            regions: vec![Region {
+                heap: 7,
+                first: 100,
+                next: 100,
+                end: 10_100,
+            }],
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
-        // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        for table in 0..10_000u32 {
+            assert_eq!(list.step(7, 1), Some(100 + table));
+        }
+        // Spent: the list asks the ring for another run.
+        assert_eq!(list.step(7, 1), None);
+        assert_eq!(list.step(8, 1), None);
+    }
+
+    /// A heap made where a released one stood is another heap: identities
+    /// come from a counter, so a run a list took under one is never stepped
+    /// through by the other, and the drain names the identity it took the
+    /// run under, not an address.
+    #[test]
+    fn a_heap_made_where_another_stood_gets_another_identity() {
+        let first = next_ident();
+        let second = next_ident();
+        assert!(second > first, "identities are handed out in order");
+        let mut list = DynamicList {
+            regions: vec![Region { heap: first, first: 100, next: 100, end: 200 }],
+        };
+        // The run is the first heap's: the second's tables never come out of
+        // it, though a heap made at the same address would have before.
+        assert_eq!(list.step(second, 1), None);
+        assert_eq!(list.step(first, 1), Some(100));
+        assert_eq!(list.drain(), [(first, 100, 100)]);
+    }
+
+    /// A run is given back to the ring of its own heap only: another heap's
+    /// identity is not answered, and a heap released meanwhile takes nothing
+    /// (its ring is gone, so the run is forgotten rather than landing in a
+    /// heap made at the same address).
+    #[test]
+    fn a_run_is_given_back_to_its_own_heap_only() {
+        let first = next_ident();
+        let ring = std::sync::Arc::new(Mutex::new(Ring::new(64)));
+        register(first, 1_000, &ring);
+        let free = || ring.lock().unwrap().free;
+        assert_eq!(ring.lock().unwrap().take(8), Some((0, 8)));
+        // Host index 1000 is the ring's first dynamic slot.
+        release_dynamic(first, 1_000, 8);
+        assert_eq!(free(), 64, "the run came back");
+        // Another heap's identity, naming slots inside this ring: nothing.
+        let second = next_ident();
+        assert_eq!(ring.lock().unwrap().take(4), Some((8, 4)));
+        release_dynamic(second, 1_008, 4);
+        assert_eq!(free(), 60, "another heap's run landed in this ring");
+        // The heap gone: the run is forgotten (and no address is read as a
+        // heap, as the release path used to).
+        release_dynamic(first, 1_008, 4);
+        assert_eq!(free(), 64);
+        drop(ring);
+        release_dynamic(first, 1_000, 8);
+    }
+
+    /// A refusal asks for room at most once a quarter second, however many
+    /// draws it stands for, and says itself at most once every 0.4 s; the
+    /// first of each goes at once.
+    #[test]
+    fn a_refusal_waits_before_it_asks_and_before_it_speaks() {
+        assert!(due(u64::MAX, 1_000, ROOM_EVERY_US));
+        assert!(!due(1_000, 1_000, ROOM_EVERY_US));
+        assert!(!due(1_000, 1_000 + ROOM_EVERY_US - 1, ROOM_EVERY_US));
+        assert!(due(1_000, 1_000 + ROOM_EVERY_US, ROOM_EVERY_US));
+        // A clock that went backwards (two threads, one settled earlier):
+        // no second ask until it has caught up.
+        assert!(!due(9_000, 1_000, ROOM_EVERY_US));
+        // Saying it is rarer than asking: a storm of refusals is not a storm
+        // of lines.
+        const { assert!(SAY_EVERY_US > ROOM_EVERY_US) };    }
+
+    /// Runs never overlap, whatever the order tables are asked for and given
+    /// back in (a slot handed out twice is a table the other list reads).
+    #[test]
+    fn runs_never_overlap() {
+        let mut ring = Ring::new(256);
+        // A fixed sequence: no card, no clock.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |of: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(of)) as u32
+        };
+        let mut held: Vec<(u32, u32)> = Vec::new();
+        let mut refused = 0;
+        for _ in 0..20_000 {
+            let n = 1 + next(40);
+            match ring.take(n) {
+                Some((first, len)) => {
+                    for &(f, l) in &held {
+                        assert!(first + len <= f || f + l <= first, "{first}+{len} over {f}+{l}");
+                    }
+                    held.push((first, len));
+                }
+                None => refused += 1,
+            }
+            if !held.is_empty() && next(3) == 0 {
+                let k = next(held.len() as u32) as usize;
+                let (f, l) = held.swap_remove(k);
+                ring.give_back(f, l);
+            }
+        }
+        // Slots were refused for want of one run, so the ring was worked.
+        assert!(refused > 0, "nothing was refused");
+    }
+
+    /// A table of a length that found no run is refused without a search
+    /// until slots are given back, as it was (enough slots were free, but in
+    /// pieces, and every such table walked the whole ring).
+    #[test]
+    fn a_refused_table_is_refused_again_without_a_search() {
+        let mut ring = Ring::new(64);
+        for at in 0..8u32 {
+            assert_eq!(ring.take(8), Some((at * 8, 8)));
+        }
+        // Two runs of eight at either end of the ring.
+        ring.give_back(0, 8);
+        ring.give_back(16, 8);
+        assert_eq!((ring.free, ring.at), (16, 64));
+        // Sixteen slots free, and sixteen nowhere: refused, and noted.
+        assert_eq!(ring.take(16), None);
+        assert_eq!((ring.free, ring.refused), (16, 16));
+        // A shorter table still fits, and reads one run for it.
+        let before = ring.steps;
+        assert_eq!(ring.take(8), Some((0, 8)));
+        assert_eq!(ring.steps - before, 2);
+        // Slots given back join the run next to them: the length refused is
+        // forgotten, and the table that was refused fits.
+        ring.give_back(8, 8);
+        assert_eq!((ring.runs.as_slice(), ring.refused), (&[(8, 16)][..], u32::MAX));
+        assert_eq!(ring.take(16), Some((8, 16)));
+    }
+
+    /// A run given back twice is credited once: the ring never holds more
+    /// free slots than it has, so it never hands one run to two lists. (The
+    /// gauge the 5 s line printed was credited with each merged run whole,
+    /// and stood at 1.31 billion free of 262,144 in run 2026-11-25 05:53.)
+    #[test]
+    fn a_run_given_back_twice_is_not_credited_twice() {
+        let mut ring = Ring::new(64);
+        assert_eq!(ring.take(8), Some((0, 8)));
+        ring.give_back(0, 8);
+        assert_eq!((ring.free, ring.runs.as_slice()), (64, &[(0, 8)][..]));
+        // The same run again, as a list drained twice would give it: nothing
+        // comes back, and the run it is counted in does not grow.
+        ring.give_back(0, 8);
+        assert_eq!(ring.free, 64, "the same run was credited twice");
+        assert!(ring.free <= ring.capacity, "{} free of {}", ring.free, ring.capacity);
+        assert_eq!(ring.runs.as_slice(), &[(0, 8)][..], "the run grew past what was taken");
+        // All of it is free, and no slot of it more than once.
+        assert_eq!((ring.free, ring.runs.as_slice()), (64, &[(0, 8)][..]));
+        // Sixty-four slots to give, not seventy-two: sixteen from the tail the
+        // cursor has not handed out, eight from the run, and the rest.
+        assert_eq!(ring.take(16), Some((8, 16)));
+        assert_eq!(ring.take(8), Some((24, 8)));
+        assert_eq!(ring.take(8), Some((32, 8)));
+        // Thirty-two free, in two places: the run of eight and the tail of
+        // twenty-four, and no table of thirty-two that fits either.
+        assert_eq!(ring.take(33), None);
+        assert_eq!(ring.take(32), None);
+        assert_eq!(ring.take(24), Some((40, 24)));
+        assert_eq!(ring.take(8), Some((0, 8)));
+        assert_eq!(ring.free, 0, "the ring gave out slots it does not have");
+    }
+
+    /// The gauge the 5 s line and a refusal name is the rings' own count, one
+    /// slot once: a run that merges with the run next to it is credited for
+    /// its own slots only (the counter it replaced was credited the whole
+    /// merged run, 366,972 free of 262,144 in the first 5 s line of run
+    /// 2026-11-25 05:53, 1.31 billion by 06:02), and a heap let go takes its
+    /// ring out of the total.
+    #[test]
+    fn the_gauge_counts_a_free_slot_once() {
+        let rings: Vec<std::sync::Arc<Mutex<Ring>>> =
+            (0..2).map(|_| std::sync::Arc::new(Mutex::new(Ring::new(64)))).collect();
+        assert_eq!(gauge_of(rings.clone().into_iter()), (128, 128, 2));
+        for ring in &rings {
+            let mut ring = ring.lock().unwrap();
+            for at in 0..4u32 {
+                assert_eq!(ring.take(8), Some((at * 8, 8)));
+            }
+            // Two runs, one after the other: the second release merges with
+            // the first, and is credited for itself alone.
+            assert_eq!(ring.give_back(0, 8), 8);
+            assert_eq!(ring.give_back(8, 8), 8);
+            assert_eq!((ring.free, ring.capacity, ring.runs.as_slice()), (48, 64, &[(0, 16)][..]));
+            // Half of each ring is still handed out.
+        }
+        let (free, slots, count) = gauge_of(rings.clone().into_iter());
+        assert_eq!((free, slots, count), (96, 128, 2), "a merged run was credited twice");
+        assert!(free <= slots, "{free} free of {slots}");
+        drop(rings);
+
+        // A heap let go is no heap: its ring leaves the gauge with it.
+        let ring = std::sync::Arc::new(Mutex::new(Ring::new(16)));
+        let weak = std::sync::Arc::downgrade(&ring);
+        register(next_ident(), 0, &ring);
+        assert!(live_rings().iter().any(|live| std::sync::Arc::ptr_eq(live, &ring)), "a live heap's ring");
+        drop(ring);
+        assert!(weak.upgrade().is_none(), "the registry outlived the heap");
+        assert!(
+            !live_rings()
+                .iter()
+                .any(|live| std::sync::Weak::ptr_eq(&std::sync::Arc::downgrade(live), &weak)),
+            "a heap let go was still counted"
+        );
+    }
+
+    /// A list whose run cannot be had takes the table alone
+    /// (`DynamicList::alloc`): a refused table is a draw without its
+    /// descriptors.
+    #[test]
+    fn a_shortened_run_fits_where_the_wanted_one_does_not() {
+        let mut ring = Ring::new(64);
+        for at in 0..7u32 {
+            assert_eq!(ring.take(8), Some((at * 8, 8)));
+        }
+        // Eight slots free at the end of the ring, and no run of the sixteen
+        // a growing list would ask for.
+        assert_eq!((ring.free, ring.at), (8, 56));
+        assert_eq!(ring.take(16), None);
+        assert_eq!(ring.take(8), Some((56, 8)));
+    }
+
+    /// The two shapes the log of run 2026-11-25 (02:56) holds are told apart:
+    /// a raw view that begins 8 bytes into its buffer, which the host cannot
+    /// move, and a raw view of no elements, which the console reads as the
+    /// rest of its buffer and of which the host takes none.
+    #[test]
+    fn the_refused_shapes_of_the_log_are_told_apart() {
+        let raw = |first: u64, count: u32, width: u64| {
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, width)
+        };
+        // `first=2 count=32 stride=0 raw=true width=4194304` (line 11087).
+        assert_eq!(raw(2, 32, 4_194_304), Err(Refused::RawStart));
+        // The same view on 16 bytes: the host takes it.
+        assert_eq!(raw(4, 32, 4_194_304), Ok(()));
+        // `first=10880256 count=0 stride=0 raw=true width=182452224` (line
+        // 7328): a count of none. The caller works the rest out first
+        // (`view_count`), so only a view with no rest left reaches this.
+        assert_eq!(raw(10_880_256, 0, 182_452_224), Err(Refused::NoElements));
+        // Read as the rest of the 174 MB buffer, the same view is taken:
+        // 43,521,024 bytes in, 34,732,800 dwords to the buffer's end.
+        assert_eq!(elements_left(10_880_256, 4, 0, 182_452_224, 182_452_224), Some(34_732_800));
+        assert_eq!(raw(10_880_256, 34_732_800, 182_452_224), Ok(()));
+    }
+
+    /// A view of no elements is given the rest of its own buffer, not the rest
+    /// of the copy the buffer lies in; a view of some keeps its count, and a
+    /// descriptor of another dimension is left alone. A buffer that declares
+    /// no bytes has no rest, and one whose view begins past its end has none
+    /// either: each is refused for its own reason.
+    #[test]
+    fn only_a_view_of_no_elements_gets_the_rest_of_its_buffer() {
+        let count = |buffer, first, count, offset, len, width| {
+            view_count(buffer, DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, offset, len, width)
+        };
+        // The log's shape: the rest of the 174 MB buffer (43,521,024 bytes in,
+        // 138,931,200 bytes to its end).
+        assert_eq!(count(true, 10_880_256, 0, 0, 182_452_224, 182_452_224), Ok(34_732_800));
+        // A view of some keeps what it asked for.
+        assert_eq!(count(true, 2, 32, 0, 4_194_304, 4_194_304), Ok(32));
+        // A descriptor of another dimension has no elements to read past.
+        assert_eq!(count(false, 10_880_256, 0, 0, 182_452_224, 182_452_224), Ok(0));
+        // A shape the host takes no view of is left at none (and refused).
+        assert_eq!(
+            view_count(true, DXGI_FORMAT_UNKNOWN, 10_880_256, 0, 0, true, 0, 182_452_224, 182_452_224),
+            Ok(0)
+        );
+        // A 4 MiB buffer 8 MiB into a 174 MiB copy: the 4 MiB after it.
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 182_452_224), Ok(1_048_576));
+        // From its last dword: one dword left; from its end, and past it: none
+        // to read, and no rest either: the view is refused, not served none.
+        assert_eq!(count(true, 3_145_727, 0, 8_388_608, 4_194_304, 182_452_224), Ok(1));
+        assert_eq!(count(true, 3_145_728, 0, 8_388_608, 4_194_304, 182_452_224), Err(Refused::PastTheEnd));
+        assert_eq!(count(true, 4_000_000, 0, 8_388_608, 4_194_304, 182_452_224), Err(Refused::PastTheEnd));
+        // The copy ends before the buffer does: what is there is all there is.
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 10_485_760), Ok(524_288));
+        // A buffer that declares no bytes (a placed buffer the title describes
+        // none wide, run 2026-11-25 05:53): no rest to give, named apart.
+        assert_eq!(count(true, 0, 0, 0, 0, 0), Err(Refused::NoLength));
+        // A structured view counts elements of its stride.
+        assert_eq!(elements_left(0, 32, 0, 1_048_576, 1_048_576), Some(32_768));
+    }
+
+    /// A view of no elements of a buffer the title declares no bytes wide,
+    /// of which the host holds a copy that is whole (a placed heap: `of the
+    /// buffer 0x3f07b080+0` with a copy 182,452,224 bytes wide, run
+    /// 2026-11-25 15:30), reads the rest of that copy; only a copy of no
+    /// bytes at all has no rest.
+    #[test]
+    fn a_view_of_none_of_a_buffer_declared_none_wide_reads_the_rest_of_its_copy() {
+        let count = |first, offset, len, width| {
+            view_count(true, DXGI_FORMAT_R32_TYPELESS, first, 0, 0, true, offset, len, width)
+        };
+        // The log's line: `format=39 first=10688960 count=0 stride=0 raw=true
+        // width=182452224, of the buffer 0x3f07b080+0`.
+        assert_eq!(count(10_688_960, 0, 0, 182_452_224), Ok(34_924_096));
+        // 42,755,840 bytes in, 139,696,384 to the copy's end: the host takes it.
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 10_688_960, 34_924_096, 0, true, 182_452_224),
+            Ok(())
+        );
+        // `first` counts from the copy's start (`buffer_srv` adds the copy's
+        // offset to it in dwords, `raw_window` likewise): a view 4,000,000
+        // bytes into the copy has 44,613,056 dwords to its end.
+        assert_eq!(count(1_000_000, 4_096, 0, 182_452_224), Ok(44_613_056));
+        // From the copy's last dword: one left; from its end: no rest to read.
+        assert_eq!(count(45_613_055, 0, 0, 182_452_224), Ok(1));
+        assert_eq!(count(45_613_056, 0, 0, 182_452_224), Err(Refused::PastTheEnd));
+        // A copy that declares no bytes has no rest, and is named apart.
+        assert_eq!(count(0, 0, 0, 0), Err(Refused::NoLength));
+        // A view of some elements is not touched by this: it keeps its count.
+        assert_eq!(
+            view_count(true, DXGI_FORMAT_R32_TYPELESS, 10_688_960, 32, 0, true, 0, 0, 182_452_224),
+            Ok(32)
+        );
+    }
+
+    /// The sizes the host probes hold the title's views, the ring and the
+    /// null slot; a heap capped at [`PORTABLE_VIEWS`] holds neither, and the
+    /// slots it leaves out are the ring's own band.
+    #[test]
+    fn the_probed_view_counts_hold_the_title_the_ring_and_the_null_slot() {
+        // The probe's ladder, in the order `probe_view_limit` tries it: the
+        // aim holds what the title asks for, which holds the ring and the
+        // null slot.
+        const { assert!(WANTED_VIEWS <= UNCAPPED_VIEWS, "the aim holds every wanted slot") };
+        assert_eq!(WANTED_VIEWS, TITLE_VIEWS + DYNAMIC + 1);
+        // Every slot the title asks for is below the ring, and the ring below
+        // the null slot: `HostHeap::new` serves the title's whole count.
+        const { assert!(TITLE_VIEWS + DYNAMIC < WANTED_VIEWS) };
+        // The capped heap: 1,000,000 slots, the null slot at 999,999, and the
+        // ring takes the 262,144 title slots between it and the title's own
+        // 737,855: the band a title index in it reads is a live table's.
+        let fitted = PORTABLE_VIEWS - 1 - DYNAMIC;
+        assert_eq!(fitted, 737_855);
+        assert_eq!(PORTABLE_VIEWS - fitted, DYNAMIC + 1);
+        // 507,329 of the title's 1,245,184 slots are served by neither.
+        assert_eq!(TITLE_VIEWS - fitted, 507_329);
+    }
+
+    /// Every reason is counted and logged apart from the others, and the
+    /// refusal line names the reason and the buffer the view is of.
+    #[test]
+    fn a_refusal_names_its_reason_and_its_buffer_and_is_counted_apart() {
+        for (i, why) in Refused::ALL.iter().enumerate() {
+            assert_eq!(*why as usize, i, "{why:?}");
+            assert!(!why.name().is_empty());
+        }
+        assert_eq!(Refused::ALL.len(), Refused::COUNT);
+        assert_eq!(by_reason([0; Refused::COUNT]), None);
+        let mut counts = [0; Refused::COUNT];
+        counts[Refused::NoLength as usize] = 6494;
+        counts[Refused::RawStart as usize] = 12;
+        let counted = by_reason(counts).unwrap();
+        // The two no-element reasons are told apart: the log of run
+        // 2026-11-25 05:53 counted views of a buffer that declares no bytes,
+        // not views of another dimension.
+        assert!(
+            counted.contains("a view of no elements of a buffer that declares no bytes 6494"),
+            "{counted}"
+        );
+        assert!(!counted.contains(Refused::NoElements.name()), "{counted}");
+        assert!(counted.contains("a raw view that does not begin on 16 bytes 12"), "{counted}");
+        assert!(!counted.contains("typed"), "{counted}");
+        // The line of the log's shape: the reason, the fields that decided it,
+        // and the buffer (its address and bytes).
+        let line = refusal(
+            Refused::NoLength,
+            true,
+            DXGI_FORMAT_R32_TYPELESS,
+            10_681_472,
+            0,
+            0,
+            true,
+            182_452_224,
+            (0x1c24_f200, 0),
+        );
+        assert!(line.contains("a view of no elements of a buffer that declares no bytes"), "{line}");
+        assert!(line.contains("unordered"), "{line}");
+        assert!(line.contains("format=39 first=10681472 count=0 stride=0 raw=true"), "{line}");
+        assert!(line.contains("0x1c24f200+0"), "{line}");
+        let line = refusal(
+            Refused::RawStart,
+            false,
+            DXGI_FORMAT_R32_TYPELESS,
+            2,
+            32,
+            0,
+            true,
+            4_194_304,
+            (0x1000_0000, 4_194_304),
+        );
+        assert!(line.contains("does not begin on 16 bytes"), "{line}");
+        assert!(line.contains("first=2 count=32"), "{line}");
     }
 }
 

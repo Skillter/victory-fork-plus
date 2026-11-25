@@ -56,6 +56,9 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
+    // Copies of builds this run will not map are dead weight; the copy about
+    // to be written is skipped by name whatever its timestamp says.
+    crate::images::prune(dir, &path);
     write_if_changed(&path, &prepared.bytes)?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

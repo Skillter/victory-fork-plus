@@ -70,9 +70,13 @@
 *.7z
 *.rar
 
+# Agent worktrees: one lane per sub-agent, merged by the conductor only
+/.worktrees/
+
 # Editor / OS noise
 .vs/
 .idea/
 *.swp
 Thumbs.db
 .DS_Store
+/.trash

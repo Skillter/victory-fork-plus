@@ -743,6 +743,14 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+thread_local! {
+    /// The host barriers of one `ResourceBarrier` call, reused across calls:
+    /// the title passes one or two barriers a call, a couple of thousand
+    /// calls a frame, and a `Vec` made for each was an allocation a call.
+    static HOST_BARRIERS: std::cell::RefCell<Vec<Barrier>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -751,30 +759,47 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
-        }
-        if !host.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        crate::list::census::title(count as u64);
+        // Buffers have host copies, not resources the barrier can name: a
+        // barrier on one waits for every shader write before it. Found in
+        // the same pass that maps the others (a second pass over them
+        // asked the same questions twice).
+        let mut buffers = false;
+        let mut dropped = 0u64;
+        let (host, mapped) = HOST_BARRIERS.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            for b in barriers {
+                match host_barrier(list, b) {
+                    Some(host) => scratch.push(host),
+                    None => dropped += 1,
+                }
+                if b.kind != 1
+                    && !b.first.is_null()
+                    && crate::resource::buffer_bytes(b.first).is_some()
+                {
+                    buffers = true;
+                }
+            }
+            if buffers {
+                scratch.push(UAV_BARRIER);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            (scratch.as_ptr(), scratch.len())
+        });
+        #[cfg(feature = "diagnostics")]
+        crate::list::census::title_mapped(mapped as u64 - u64::from(buffers), dropped, buffers);
+        if mapped > 0 {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
+            // SAFETY: the same layout; the slice is the scratch's, filled by
+            // this call, and nothing else touches the scratch before the
+            // barrier is recorded (the same thread is here); borrowed
+            // resource pointers, never released through this slice.
+            let host =
+                unsafe { std::slice::from_raw_parts(host.cast::<D3D12_RESOURCE_BARRIER>(), mapped) };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -786,11 +811,157 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    // The state the title's own call named, before the flags cut it down.
+    #[cfg(feature = "diagnostics")]
+    let asked = state;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        crate::draw::emitted(crate::draw::Command::Barrier, 1);
+        #[cfg(feature = "diagnostics")]
+        census::asked(resource, asked, true);
+    } else {
+        // The list has the texture in that state: a draw asks for its
+        // targets and depth buffer every time and records no barrier.
+        crate::draw::spared_command(crate::draw::Command::Barrier);
+        #[cfg(feature = "diagnostics")]
+        census::asked(resource, asked, false);
+    }
+}
+
+/// Where the barrier decisions of a run come from, for the census line
+/// ([`census::line`]): whether they are the title's own `ResourceBarrier`
+/// calls or the draw path's [`ensure_state`], which state each asks for, and
+/// which textures they name. `VICTORY_BARRIER_CENSUS=1` in a diagnostics
+/// build; off, nothing here is touched but one `OnceLock` read.
+///
+/// It is for measuring, not for a run to leave on: the census counts one
+/// hash per ask, which the recording phase then pays for.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod census {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::object::This;
+
+    /// What a call asks for, by the state bits it names.
+    #[derive(Clone, Copy)]
+    enum Ask {
+        Target,
+        Depth,
+        Read,
+        Other,
+    }
+    const ASKS: usize = 4;
+    const LABELS: [&str; ASKS] = ["targets", "depth", "shader reads", "copies and other"];
+
+    fn ask(state: u32) -> usize {
+        // Render target, depth write | depth read, the two shader read bits.
+        match state {
+            s if s & 0x4 != 0 => Ask::Target as usize,
+            s if s & (0x10 | 0x20) != 0 => Ask::Depth as usize,
+            s if s & (0x40 | 0x80) != 0 => Ask::Read as usize,
+            _ => Ask::Other as usize,
+        }
+    }
+
+    /// `[asked, changed, spared]` per [`Ask`].
+    static ENSURE: [[AtomicU64; 3]; ASKS] = [const {
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]
+    }; ASKS];
+    /// The title's own calls: calls, barriers passed, mapped onto host
+    /// resources, dropped (a resource the host does not have), the buffers
+    /// that added an unordered access barrier.
+    static TITLE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    /// Each texture asked for, by its title pointer, and how often.
+    static TOP: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_CENSUS").is_some_and(|v| v != "0"))
+    }
+
+    /// One [`ensure_state`] call for `state` on `resource`, which changed the
+    /// texture's state or did not.
+    pub(super) fn asked(resource: This, state: u32, changed: bool) {
+        if !on() {
+            return;
+        }
+        let kind = ask(state);
+        ENSURE[kind][0].fetch_add(1, Relaxed);
+        ENSURE[kind][if changed { 1 } else { 2 }].fetch_add(1, Relaxed);
+        let mut top = TOP.lock().unwrap_or_else(|e| e.into_inner());
+        *top.get_or_insert_with(HashMap::new).entry(resource as u64).or_insert(0) += 1;
+    }
+
+    /// One of the title's `ResourceBarrier` calls, with the barriers it
+    /// passed.
+    pub(super) fn title(barriers: u64) {
+        if !on() {
+            return;
+        }
+        TITLE[0].fetch_add(1, Relaxed);
+        TITLE[1].fetch_add(barriers, Relaxed);
+    }
+
+    /// What that call mapped: barriers on host resources (before a buffer's
+    /// unordered access barrier), those dropped, and whether a buffer was
+    /// named.
+    pub(super) fn title_mapped(mapped: u64, dropped: u64, buffer: bool) {
+        if !on() {
+            return;
+        }
+        TITLE[2].fetch_add(mapped, Relaxed);
+        TITLE[3].fetch_add(dropped, Relaxed);
+        TITLE[4].fetch_add(u64::from(buffer), Relaxed);
+    }
+
+    /// The line for `draws` draws over the window that just ended, taken
+    /// once, or nothing at all when the census is off.
+    pub(crate) fn line(draws: u64) -> Option<String> {
+        if !on() {
+            return None;
+        }
+        let per = |n: u64| n as f64 / draws.max(1) as f64;
+        let asks: Vec<(usize, [u64; 3])> = (0..ASKS)
+            .map(|k| (k, ENSURE[k].each_ref().map(|c| c.swap(0, Relaxed))))
+            .collect();
+        let title = TITLE.each_ref().map(|c| c.swap(0, Relaxed));
+        let top = TOP.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut top: Vec<(u64, u64)> = top.into_iter().collect();
+        top.sort_by_key(|&(_, asked)| std::cmp::Reverse(asked));
+        top.truncate(6);
+        let asked: u64 = asks.iter().map(|(_, [asked, _, _])| asked).sum();
+        let changed: u64 = asks.iter().map(|(_, [_, changed, _])| changed).sum();
+        Some(format!(
+            "barrier decisions per draw: {:.2} from draws ({:.2} moved a texture, {:.2} did not: \
+             {}), {:.2} from the title's ResourceBarrier ({} calls of {:.2} barriers: {:.2} \
+             mapped, {:.2} dropped, {:.2} buffers added an unordered access barrier); the \
+             textures asked for most: {}",
+            per(asked),
+            per(changed),
+            per(asked - changed),
+            asks.iter()
+                .map(|(k, [a, c, s])| format!(
+                    "{} {:.2}/{:.2}/{:.2} asked/moved/kept",
+                    LABELS[*k], per(*a), per(*c), per(*s)
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            per(title[0]),
+            title[0],
+            per(title[1]),
+            per(title[2]),
+            per(title[3]),
+            per(title[4]),
+            top.iter()
+                .map(|(r, n)| format!("{r:#x} {:.2}", per(*n)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))
     }
 }
 
@@ -1211,6 +1382,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        crate::present::note_target(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1283,6 +1455,9 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        // A clear says the texture exists, not that it holds a frame
+        // (`crate::present`).
+        crate::present::note_cleared(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1337,6 +1512,9 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        // A clear of the depth buffer says it exists, not that it holds a
+        // frame (`crate::present`).
+        crate::present::note_cleared(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

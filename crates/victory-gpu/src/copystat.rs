@@ -18,8 +18,6 @@ pub(crate) enum C {
     SkippedBytes,
     Runs,
     RunUs,
-    Queries,
-    QueryUs,
     MoveUs,
     Unmapped,
     /// Write-watch askings and their time.
@@ -30,6 +28,11 @@ pub(crate) enum C {
     Unchanged,
     /// Copies that met an unmapped page.
     Fallbacks,
+    /// Bytes read in place under the mapping's guard (`Shadow::copy`'s fast
+    /// path), and the microseconds they took (check and copy): what is not
+    /// counted here went through the kernel (`MoveUs`).
+    InPlace,
+    InPlaceUs,
     /// Writes taken by the guard on view memory.
     GuardFaults,
     /// Texture bytes detiled after a watched write; hashed; detiled after a
@@ -134,7 +137,14 @@ pub(crate) enum C {
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
 }
-const COUNTERS: usize = 80;
+/// One counter per [`C`]. Edited with the enum: a variant added without it
+/// panics on the first `add`, a stale value leaves the last ones unreachable.
+///
+/// `queries` is gone from [`C`] rather than counted: nothing here ever resolves
+/// a console query (`crate::query` remembers a heap's description and no more,
+/// so no query produces a result), and a column that reads zero on every line
+/// says the mechanism is idle when it has not been built.
+const COUNTERS: usize = 84;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -473,6 +483,41 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
+/// The process's own disk traffic in bytes since it started: read, written.
+///
+/// The pagefile's traffic is the system's, not ours, so it is not here: a run
+/// whose disk is busy while these figures are small is one the system is
+/// paging, not one we are writing.
+fn process_io() -> (u64, u64) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, IO_COUNTERS,
+    };
+    // SAFETY: plain data the call fills in.
+    let mut c: IO_COUNTERS = unsafe { std::mem::zeroed() };
+    // SAFETY: our own process and a structure the call fills in.
+    unsafe { GetProcessIoCounters(GetCurrentProcess(), &mut c) };
+    (c.ReadTransferCount, c.WriteTransferCount)
+}
+
+/// The process's disk traffic per second since the last call, in MB/s: read,
+/// written. The first call has no window behind it and reports nothing.
+fn io_rate() -> Option<(f64, f64)> {
+    static LAST: std::sync::Mutex<Option<(u64, u64, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let (read, wrote) = process_io();
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_read, was_wrote, was_at) = last.replace((read, wrote, now))?;
+    let secs = now.duration_since(was_at).as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    Some((
+        read.saturating_sub(was_read) as f64 / secs / 1e6,
+        wrote.saturating_sub(was_wrote) as f64 / secs / 1e6,
+    ))
+}
+
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
 fn system_memory() -> (u64, u64) {
@@ -805,8 +850,14 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    if let Some((read, wrote)) = io_rate() {
+        tracing::info!(
+            "this process on the disk: {read:.1} MB/s read, {wrote:.1} MB/s written (its own \
+             traffic only; pages the system moved to the pagefile are not ours)"
+        );
+    }
     tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
+        "memory, placed textures: {} of them were asked for again with other filler words in their description (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
     // What the line above leaves open: what is alive of the buffers "made
@@ -1097,10 +1148,10 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; moves {:.2} ms, \
+         {:.1} MB in place {:.2} ms; {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, \
+         {:.1} MB checked, {:.1} MB unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB \
+         watched and changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1110,9 +1161,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::SkippedBytes as usize]),
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
-        c[C::Queries as usize],
-        ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
+        mb(c[C::InPlace as usize]),
+        ms(c[C::InPlaceUs as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],

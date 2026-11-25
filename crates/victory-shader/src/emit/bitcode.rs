@@ -30,6 +30,8 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// Only a `v_cvt_f32_f64` needs one: the console's double lives in a
+    /// register pair and only ever leaves it rounded to single.
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -108,6 +110,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// A double rounded to single (LLVM's `fptrunc`).
+    FpTrunc = 7,
     Bitcast = 11,
 }
 
@@ -389,6 +393,19 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    /// How value `v` is computed, where a binary operation computes it: the
+    /// tests read the index a table read goes by out of this.
+    #[cfg(test)]
+    pub fn bin_of(&self, v: V) -> Option<(Bin, V, V)> {
+        match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Bin(b, a, c) => Some((*b, *a, *c)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {

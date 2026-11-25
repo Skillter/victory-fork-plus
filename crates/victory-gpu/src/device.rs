@@ -346,20 +346,553 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// The largest word of a description that could be a size rather than a
+/// pointer: shader code and counts are small, and the title's own memory
+/// lies far above this.
+const SMALL: u64 = 0x1_0000;
+
+/// The size of the PC graphics pipeline description (shaders inline) and of
+/// the console compute one: a word of a description equal to either is where
+/// that description keeps its own size, so finding neither is what the dump
+/// below has to show.
+const GRAPHICS_DESCRIPTION: u64 = 0x2b0;
+const COMPUTE_DESCRIPTION: u64 = 0x60;
+
+/// `ID3D12PipelineState`, the interface the title asks these two methods for
+/// (PC's own GUID): the dump prints the `iid` argument as text, so an
+/// argument order we have wrong shows at once.
+const PIPELINE_STATE_IID: Iid = guid(
+    0x765a30f3,
+    0xf624,
+    0x4c6f,
+    [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+);
+
+/// Bytes the dump shows behind each argument.
+const DUMP_BYTES: usize = 256;
+
+/// Words of the description the probe reads: 256 bytes, twice the 128 the
+/// first dumps covered, because the 16,384th `0x1c8` call keeps words 13 to
+/// 15 nonzero where the others have zeros, and no record yet says where the
+/// description ends.
+const PROBE_WORDS: usize = 32;
+
+/// Bytes shown of each block a description's pointer word names: a
+/// container's magic and its first header.
+const PROBE_BYTES: usize = 64;
+
+/// Pointer words followed per call, so a description of 32 pointers costs
+/// six blocks instead of thirty-two.
+const PROBE_TARGETS: usize = 6;
+
+/// Above this a word is not an address of this process: the title's own
+/// memory (`0x19d…`), its heap (`0xd04…`) and the image (`0x7ff6…`) lie
+/// below it, and the tagged words a description also holds (`0x8004…`,
+/// `0x9001…`) above it.
+const POINTER_TOP: u64 = 0x0000_8000_0000_0000;
+
+/// Where [`dump_call`]'s text goes: `VICTORY_PIPELINE_DUMP=<file>` in any
+/// build (appended, so both slots and later runs stay in one file), the log
+/// in a `diagnostics` build, nowhere in a release one.
+enum Dump {
+    Off,
+    Log,
+    File(std::path::PathBuf),
+}
+
+fn dump_destination() -> &'static Dump {
+    static DEST: std::sync::OnceLock<Dump> = std::sync::OnceLock::new();
+    DEST.get_or_init(|| {
+        if let Some(path) = std::env::var_os("VICTORY_PIPELINE_DUMP").map(std::path::PathBuf::from)
+        {
+            if outside_repo(&path) {
+                return Dump::File(path);
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "VICTORY_PIPELINE_DUMP is inside the repository; the dump stays in the log"
+            );
+        }
+        if cfg!(feature = "diagnostics") {
+            Dump::Log
+        } else {
+            Dump::Off
+        }
+    })
+}
+
+/// Whether `path`'s folder is outside the workspace: a dump written into the
+/// tree fails the asset policy. This crate has no `victory_core` to ask
+/// (`ensure_outside_repo`), and a folder that does not exist is unresolvable,
+/// hence refused too.
+fn outside_repo(path: &std::path::Path) -> bool {
+    let Ok(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+    else {
+        return false;
+    };
+    path.parent()
+        .unwrap_or(path)
+        .canonicalize()
+        .is_ok_and(|folder| !folder.starts_with(root))
+}
+
+/// One argument's bytes: a header naming it and its value, then sixteen lines
+/// of sixteen bytes, hex and as text where printable. A line the kernel
+/// cannot read is `??` and counted at the end instead of aborting, so a
+/// pointer to a short block, or to nothing, still dumps what is there.
+fn dump_argument(
+    index: usize,
+    name: &str,
+    at: usize,
+    read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+) -> String {
+    let mut text = format!("[{index} {name}] {at:#018x}\n");
+    let mut faulted = 0;
+    for offset in (0..DUMP_BYTES).step_by(16) {
+        let mut bytes = [0u8; 16];
+        let (hex, shown) = if read(at + offset, &mut bytes) {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let shown: String = bytes
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        char::from(b)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            (hex.join(" "), shown)
+        } else {
+            faulted += 1;
+            ("?? ".repeat(15) + "??", "unreadable".to_string())
+        };
+        text += &format!("+{offset:#05x} | {hex} | {shown}\n");
+    }
+    if faulted > 0 {
+        text += &format!(
+            "[{index} {name}] {faulted} of {} lines unreadable\n",
+            DUMP_BYTES / 16
+        );
+    }
+    text
+}
+
+/// The 64-bit little-endian words of `bytes`, a remainder dropped.
+fn words_of(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect()
+}
+
+/// Whether `word` can be an address of this process: above every size a
+/// description holds ([`SMALL`]) and below [`POINTER_TOP`].
+fn address(word: u64) -> bool {
+    word > SMALL && word < POINTER_TOP
+}
+
+/// The indexes of the words of `bytes` equal to `size`: a description that
+/// keeps its own size keeps it in one of them.
+fn size_words(bytes: &[u8], size: u64) -> Vec<usize> {
+    words_of(bytes)
+        .iter()
+        .enumerate()
+        .filter(|&(_, word)| *word == size)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// `bytes` as text: printable bytes as they are, every other byte a `.`,
+/// stopped after `max` characters and marked `~` where it stopped.
+fn ascii(bytes: &[u8], max: usize) -> String {
+    let mut text: String = bytes
+        .iter()
+        .take(max)
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                char::from(b)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    if bytes.len() > max {
+        text.push('~');
+    }
+    text
+}
+
+/// What the first bytes of a block are, where a magic says it and text
+/// otherwise. The log line [`probe`] writes for each followed pointer says
+/// whether the pair it sits in is a shader container, a root signature, a
+/// console description, or none of these.
+fn classify(bytes: &[u8]) -> &'static str {
+    const MAGIC: [(&[u8], &str); 4] = [
+        (b"DXBC", "a DXBC container"),
+        (b"DXIL", "DXIL"),
+        (b"RTS0", "a serialised root signature"),
+        (b"\x1b[", "this process's own log text"),
+    ];
+    if let Some((_, what)) = MAGIC.iter().find(|(magic, _)| bytes.starts_with(magic)) {
+        return what;
+    }
+    let head = &bytes[..bytes.len().min(32)];
+    if head.is_empty() {
+        return "nothing";
+    }
+    let printable = head.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+    if printable * 4 >= head.len() * 3 {
+        "text"
+    } else {
+        "words"
+    }
+}
+
+/// Everything one description says, for the log: its 256 bytes as hex and
+/// text, the words that read as a size, where the two known description
+/// sizes appear, and each block its pointer words name with what that
+/// block's first bytes are.
+///
+/// The last is what the earlier dump got backwards: it followed the words
+/// that read as a size (`0x1c`, `0x14`) as if they were addresses, which no
+/// size ever is, so `pointed` was always empty and the bytes behind the
+/// description's real pointers were never seen.
+fn probe(at: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> String {
+    let mut text = format!(
+        "      description: {} words ({} bytes) at {at:#018x}\n",
+        PROBE_WORDS,
+        PROBE_WORDS * 8
+    );
+    let mut bytes = [0u8; PROBE_WORDS * 8];
+    let mut unreadable = 0;
+    for (line, chunk) in bytes.chunks_mut(16).enumerate() {
+        if read(at + line * 16, chunk) {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(
+                "      +{:#05x} | {} | {}\n",
+                line * 16,
+                hex.join(" "),
+                ascii(chunk, 16)
+            );
+        } else {
+            unreadable += 1;
+            text += &format!("      +{:#05x} | ?? | unreadable\n", line * 16);
+        }
+    }
+    let words = words_of(&bytes);
+    let sizes: Vec<(usize, u64)> = words
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, word)| word != 0 && word <= SMALL)
+        .collect();
+    text += &format!(
+        "      sizes: 0x2b0 graphics at {:x?}, 0x60 compute at {:x?}\n",
+        size_words(&bytes, GRAPHICS_DESCRIPTION),
+        size_words(&bytes, COMPUTE_DESCRIPTION)
+    );
+    text += &format!("      words that read as a size: {sizes:x?}\n");
+    let mut followed: Vec<u64> = Vec::new();
+    for (index, &word) in words.iter().enumerate() {
+        if !address(word) || followed.contains(&word) {
+            continue;
+        }
+        if followed.len() == PROBE_TARGETS {
+            break;
+        }
+        followed.push(word);
+        let mut block = [0u8; PROBE_BYTES];
+        let mut shown = 0;
+        for (line, chunk) in block.chunks_mut(16).enumerate() {
+            if !read(word as usize + line * 16, chunk) {
+                break;
+            }
+            shown += 16;
+        }
+        text += &format!(
+            "      [w{index}] {word:#018x}: first {PROBE_BYTES} bytes are {}\n",
+            classify(&block[..shown])
+        );
+        for (line, chunk) in block[..shown].chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(
+                "      +{:#05x} | {} | {}\n",
+                line * 16,
+                hex.join(" "),
+                ascii(chunk, 16)
+            );
+        }
+        if shown == 0 {
+            text += "      (not readable)\n";
+        }
+    }
+    if unreadable > 0 {
+        text += &format!(
+            "      {unreadable} of {} lines of the description unreadable\n",
+            PROBE_WORDS * 8 / 16
+        );
+    }
+    text
+}
+
+/// Every argument of one call, [`DUMP_BYTES`] behind each, then [`probe`] of
+/// the description. The first call of each slot dumps once, so 18,432 calls
+/// cost two dumps.
+///
+/// The mismatch the dump settles: the description's first word points at a
+/// block that decodes as this process's own log text, so the record is not a
+/// description we know — the `iid` text, the size words and what each
+/// followed block's first bytes are say what it is instead.
+fn dump_call(slot: usize, this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> String {
+    let mut text = format!("slot {slot:#x}: 4 arguments (this, desc, iid, out)\n");
+    #[cfg(windows)]
+    let mut read =
+        |at: usize, bytes: &mut [u8]| at != 0 && crate::host::read_into(at as *const u8, bytes);
+    #[cfg(not(windows))]
+    let mut read = |_: usize, _: &mut [u8]| false;
+    let args = [
+        ("this", this as usize),
+        ("desc", desc as usize),
+        ("iid", iid as usize),
+        ("out", out as usize),
+    ];
+    for (index, &(name, at)) in args.iter().enumerate() {
+        text += &dump_argument(index, name, at, &mut read);
+    }
+    let mut iid_bytes = [0u8; 16];
+    if read(iid as usize, &mut iid_bytes) {
+        text += &format!(
+            "      iid reads {} (ID3D12PipelineState is {})\n",
+            guid_text(&iid_bytes),
+            guid_text(&PIPELINE_STATE_IID)
+        );
+    }
+    text += &format!("      desc is {:#018x}:\n", desc as usize);
+    if !desc.is_null() {
+        text += &probe(desc as usize, &mut read);
+    }
+    text
+}
+
+/// Bytes [`bytes_at`] shows either side of the title's return address: the
+/// argument setup of the call is behind it, the next branch ahead of it.
+const CALLSITE_BYTES: usize = 160;
+
+/// Bytes shown either side of the `description` argument: whether the words
+/// before it are a header of the same record and whether the words after it
+/// are its fields or its container's neighbours is what tells a description
+/// from a container's slot.
+const CALLSITE_CONTEXT: usize = 128;
+
+/// Whether `VICTORY_CALLSITE_PROBE=1` asks for [`callsite_probe`]'s dump. Off
+/// unless set, in every build: the dump walks the stack and reads about 1 KiB
+/// of the title's code and memory, once per slot per run, into the log.
+fn callsite_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CALLSITE_PROBE").is_some_and(|v| v == "1"))
+}
+
+/// `len` bytes at `at`, sixteen a line, hex and as text; a line the kernel
+/// cannot read is `??` and counted at the end, so a pointer at the start of a
+/// page, or to nothing, still dumps what is there.
+fn bytes_at(at: usize, len: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> String {
+    let mut text = String::new();
+    let mut unreadable = 0;
+    for offset in (0..len).step_by(16) {
+        let mut bytes = [0u8; 16];
+        if read(at + offset, &mut bytes) {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(
+                "      +{offset:#05x} | {} | {}\n",
+                hex.join(" "),
+                ascii(&bytes, 16)
+            );
+        } else {
+            unreadable += 1;
+            text += &format!("      +{offset:#05x} | ?? | unreadable\n");
+        }
+    }
+    if unreadable > 0 {
+        text += &format!("      {unreadable} of {} lines unreadable\n", len.div_ceil(16));
+    }
+    text
+}
+
+/// The module `at` lies in: a return address minus this is its offset into the
+/// title, the form the call sites are named in.
+#[cfg(windows)]
+fn module_base(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: looks up the module holding the address, taking no reference.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        )
+    };
+    (found != 0).then_some(module as usize)
+}
+
+/// The addresses the stack says this call came through, nearest first. The
+/// nearest one in another module than ours is the title's return address.
+#[cfg(windows)]
+fn return_sites() -> Vec<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    let mut frames = [std::ptr::null_mut(); 6];
+    // SAFETY: room for six frames, which the kernel fills; it writes nothing
+    // else.
+    let count = unsafe {
+        RtlCaptureStackBackTrace(
+            1,
+            frames.len() as u32,
+            frames.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    frames[..count as usize]
+        .iter()
+        .map(|&frame| frame as usize)
+        .collect()
+}
+
+/// A temporary investigation probe, asked for by `VICTORY_CALLSITE_PROBE=1`:
+/// this call's arguments and the title's code at the call site, to settle what
+/// methods 0x1c8 and 0x218 are from the title's own code rather than from the
+/// dump's guesses. It is not part of the method and answers nothing.
+///
+/// It prints the title's return address and the 160 bytes either side of it
+/// (the `mov`/`lea` immediates that set `rcx`, `rdx`, `r8` and `r9` are in
+/// there), then 128 bytes before the `description` argument, its own 256, and
+/// 128 after: a record whose header precedes the argument and whose fields
+/// follow it reads differently from a container's value slot, whose
+/// neighbours are 16 bytes away.
+fn callsite_probe(slot: usize, desc: usize) -> String {
+    #[cfg(windows)]
+    {
+        let mut read =
+            |at: usize, bytes: &mut [u8]| at != 0 && crate::host::read_into(at as *const u8, bytes);
+        let ours = module_base(callsite_probe as *const () as usize);
+        let sites = return_sites();
+        let mut text = format!("slot {slot:#x}: frames");
+        for &site in &sites {
+            match (module_base(site), ours) {
+                (Some(module), Some(ours)) if module == ours => {
+                    text += &format!(" +{:#x},", site - module)
+                }
+                (Some(module), _) => text += &format!(" title+{:#x},", site - module),
+                (None, _) => text += &format!(" {site:#018x},"),
+            }
+        }
+        text += "\n";
+        let title = sites
+            .iter()
+            .copied()
+            .find(|&site| module_base(site) != ours);
+        let Some(site) = title else {
+            return text + "      no frame outside this module: nothing to dump\n";
+        };
+        text += &format!(
+            "      the title's code at the return address {site:#018x}, {CALLSITE_BYTES} bytes \
+             either side:\n{}",
+            bytes_at(
+                site.saturating_sub(CALLSITE_BYTES),
+                CALLSITE_BYTES * 2,
+                &mut read
+            )
+        );
+        text += &format!(
+            "      {CALLSITE_CONTEXT} bytes before the description {desc:#018x}:\n{}",
+            bytes_at(desc.saturating_sub(CALLSITE_CONTEXT), CALLSITE_CONTEXT, &mut read)
+        );
+        text += &format!(
+            "      the description's own {} bytes:\n{}",
+            PROBE_WORDS * 8,
+            bytes_at(desc, PROBE_WORDS * 8, &mut read)
+        );
+        text += &format!(
+            "      {CALLSITE_CONTEXT} bytes after it:\n{}",
+            bytes_at(desc.saturating_add(PROBE_WORDS * 8), CALLSITE_CONTEXT, &mut read)
+        );
+        text
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (slot, desc);
+        String::from("the call-site probe reads title memory: Windows only\n")
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// pipeline, silently. 16,384 and 2,048 calls: the load burst.
+///
+/// **What the call sites settle** (decoded from the prepared image's code —
+/// the bytes `VICTORY_CALLSITE_PROBE=1` dumps at run time; the offsets are
+/// title-relative):
+///
+/// - Both calls are the same three lines: `mov rcx,[rip+g]` (the device, held
+///   in one global), `mov rax,[rcx]`, `call qword ptr [rax+slot]`. `r8` comes
+///   from `lea r8,[rip+…]` on the GUID `765a30f3-f624-4c6f-a828-ace948622445`,
+///   which is PC's `ID3D12PipelineState` here too, and `r9` is a stack local:
+///   the third and fourth arguments are read correctly.
+/// - `0x1c8`, the call at `title+0x2477578`, is inside a queued task: its
+///   entry (code at `title+0x24774c0`) walks a singly linked list (next at
+///   node+0x00, the key at node+0x10) covering one key's range of pending
+///   pipelines, and passes `node+0x40`. The word at `node+0x40` is written in
+///   the instruction before the call from a pointer the task captured, so it
+///   is the same word for every call that task makes: word 0 of what the
+///   method receives is not a field of the record the title keeps there.
+/// - `0x218`, the call at `title+0x24800d5`, is inside a hash-map lookup
+///   (`title+0x2480050`: mask at map+0x150, 16-byte buckets at map+0x138,
+///   each holding a node chained at node+0x08 with its key at node+0x10 and
+///   its value at node+0x18) keyed by the pipeline's id; it passes
+///   `node+0x18`, the map's value slot, after storing the looked-up value in
+///   it, and keeps the object that comes back at its own +0x120.
+///
+/// So the method is handed **one pointer**, and the words each dump read past
+/// word 0 need not be a description at all: on the 0x218 path they are the map
+/// value slot's neighbours (`…0d04d4a550, 0x1c, 0d04d4a56c, 0x14…` is what
+/// bucket pairs look like, and 0x1c and 0x14 are sizes of nothing this call
+/// was given), and on the 0x1c8 path they may be that node's own fields, which
+/// is why [`callsite_probe`] reads 128 bytes before the argument as well. No
+/// word of either record equals 0x2b0 (PC graphics, shaders inline) or 0x60
+/// (console compute): neither description we already translate passes here,
+/// and the first dump's reading of "six (address, size) pairs" was a reading
+/// of the record's memory, not of subobjects of a description we know.
+///
+/// What is still open is what that pointer names and how much of it the
+/// method reads: a compiled blob (a `DXBC` container, or the record's own
+/// header carrying a size), or a console description whose first word points
+/// at one. [`callsite_probe`] (`VICTORY_CALLSITE_PROBE=1`, off by default)
+/// dumps exactly that decision: the title's 160 bytes either side of the
+/// return address, 128 bytes before the argument, its 256, and 128 after. The
+/// next experiment must show the block the pointer names beginning with a
+/// magic (`DXBC`, `RTS0`, or a first word that reads as its own size) and,
+/// in the 128 bytes before the argument, the word the record keeps as the
+/// type of what it points at.
+///
+/// So both still fail, with `out` null, and a run logs [`probe`]: the
+/// description's hex and text, each block its pointer words name with what
+/// that block's first bytes are (a DXBC container, a root signature, a
+/// console description, or words), and the words that read as a size.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
-    _: This,
+    this: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -369,30 +902,67 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    if desc.is_null() {
+        // As every creation method here answers a description it cannot read.
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    let read =
+        |at: usize, bytes: &mut [u8]| at != 0 && crate::host::read_into(at as *const u8, bytes);
+    #[cfg(not(windows))]
+    let read = |_: usize, _: &mut [u8]| false;
+    if calls == 1 {
+        let dump = dump_call(SLOT, this, desc, iid, out);
+        match dump_destination() {
+            Dump::File(path) => {
+                use std::io::Write;
+                let written = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(dump.as_bytes()));
+                if let Err(e) = written {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %e,
+                        "VICTORY_PIPELINE_DUMP is not writable"
+                    );
+                }
+            }
+            Dump::Log => tracing::warn!(
+                slot = format_args!("{:#x}", SLOT),
+                "a pipeline creation call's raw arguments:\n{dump}"
+            ),
+            Dump::Off => {}
+        }
+    }
+    if calls == 1 && callsite_probe_enabled() {
+        let text = callsite_probe(SLOT, desc as usize);
+        tracing::warn!(
+            slot = format_args!("{:#x}", SLOT),
+            "VICTORY_CALLSITE_PROBE, a temporary investigation probe:\n{text}"
+        );
+    }
     if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
-            })
-        };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
+        let mut bytes = [0u8; PROBE_WORDS * 8];
+        let mut whole = true;
+        for (line, chunk) in bytes.chunks_mut(64).enumerate() {
+            whole &= read(desc as usize + line * 64, chunk);
+        }
+        let words = words_of(&bytes);
+        let sizes: Vec<(usize, u64)> = words
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, word)| word != 0 && word <= SMALL)
+            .collect();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
+            whole,
+            words = format_args!("{words:x?}"),
+            sizes = format_args!("{sizes:x?}"),
+            text = %ascii(&bytes, 64),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
@@ -583,5 +1153,310 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The dump prints hex, text where printable, and `??` for a line the
+    /// kernel could not read, counted rather than aborting the pointer.
+    #[test]
+    fn the_argument_dump_shows_hex_text_and_marks_unreadable_lines() {
+        let block: Vec<u8> = (0..DUMP_BYTES).map(|b| b as u8).collect();
+        let mut read = |at: usize, bytes: &mut [u8]| {
+            let offset = at - 0x1000;
+            if offset == 0x20 {
+                return false;
+            }
+            let len = bytes.len();
+            bytes.copy_from_slice(&block[offset..offset + len]);
+            true
+        };
+        let text = dump_argument(2, "iid", 0x1000, &mut read);
+        let lines: Vec<&str> = text.lines().collect();
+        // A header, sixteen lines of sixteen bytes, and the count of the one
+        // that faulted.
+        assert_eq!(lines.len(), 18);
+        assert_eq!(lines[0], "[2 iid] 0x0000000000001000");
+        assert_eq!(
+            lines[1],
+            "+0x000 | 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f | ................"
+        );
+        assert_eq!(
+            lines[3],
+            "+0x020 | ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? | unreadable"
+        );
+        // 0x30 to 0x3f are the digits, 0x40 to 0x4f the capitals.
+        assert!(lines[4].ends_with("| 0123456789:;<=>?"));
+        assert!(lines[5].ends_with("| @ABCDEFGHIJKLMNO"));
+        assert_eq!(lines[17], "[2 iid] 1 of 16 lines unreadable");
+        // A null argument dumps every line unreadable and reads nothing.
+        let mut none = |_: usize, _: &mut [u8]| false;
+        let text = dump_argument(3, "out", 0, &mut none);
+        assert_eq!(text.lines().count(), 18);
+        assert_eq!(
+            text.lines().last(),
+            Some("[3 out] 16 of 16 lines unreadable")
+        );
+    }
+
+    /// The call-site probe's block: hex and text, and a line the kernel could
+    /// not read counted instead of ending the dump, so a return address at the
+    /// edge of unmapped memory still shows what is readable.
+    #[test]
+    fn the_callsite_block_marks_unreadable_lines() {
+        let block: Vec<u8> = (0..16).map(|b| b as u8).collect();
+        let mut read = |at: usize, bytes: &mut [u8]| {
+            assert_eq!(at, 0x2000, "one line at a time, at the line's own start");
+            bytes.copy_from_slice(&block);
+            true
+        };
+        assert_eq!(
+            bytes_at(0x2000, 16, &mut read),
+            "      +0x000 | 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f | ................\n"
+        );
+        let mut none = |_: usize, _: &mut [u8]| false;
+        let text = bytes_at(0x2000, 32, &mut none);
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.lines().next().is_some_and(|l| l.ends_with("| unreadable")));
+        assert_eq!(text.lines().last(), Some("      2 of 2 lines unreadable"));
+    }
+
+    /// The records the two slots were logged with, word for word: the shape
+    /// the dump showed, and what the doc comment above reads out of it.
+    const RECORD_0X1C8: [u64; 16] = [
+        0x0000_0197_dbea_f430,
+        0x0000_000d_04f6_9758,
+        0x184,
+        0x0000_000d_04f6_98dc,
+        0xbc,
+        0x0000_000d_494b_3400,
+        0x1c0,
+        0x0000_000d_04f6_9998,
+        0xd0,
+        0x0000_000d_494b_3600,
+        0x180,
+        0x0000_000d_04f6_9a68,
+        0x2f0,
+        0,
+        0,
+        0,
+    ];
+    const RECORD_0X218: [u64; 16] = [
+        0x0000_0197_dbea_f8e0,
+        0x0000_000d_04d4_a550,
+        0x1c,
+        0x0000_000d_04d4_a56c,
+        0x14,
+        0x0000_000d_4942_0700,
+        0x2c0,
+        0x0000_000d_04d4_a580,
+        0x1d8,
+        0x0000_000d_03fb_5540,
+        0x0000_000d_03fb_47c0,
+        0x6c39_48d3_f99e_6117,
+        0,
+        0x0000_000d_04d4_a0f0,
+        0x1c,
+        0x0000_000d_04d4_a758,
+    ];
+
+    fn bytes_of(words: &[u64]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The call-site probe answers text and reads nothing when no frame lies
+    /// outside this module: the only shape a test can reach, and the one that
+    /// matters if the stack is unwound past the title.
+    #[cfg(windows)]
+    #[test]
+    fn the_callsite_probe_names_no_site_when_every_frame_is_ours() {
+        let text = callsite_probe(0x1c8, 0x1000);
+        assert!(text.starts_with("slot 0x1c8: frames"), "{text}");
+        assert!(
+            text.ends_with("no frame outside this module: nothing to dump\n"),
+            "{text}"
+        );
+    }
+
+    /// The 0x1c8 record reads as an address then six (address, size) pairs;
+    /// the 0x218 one repeats (address, 0x1c) and (address, 0x14) around two
+    /// growing sizes and a value that changes every call. What those words
+    /// are is the doc comment's finding: the record's own fields at 0x1c8,
+    /// the map's neighbours at 0x218.
+    #[test]
+    fn the_logged_records_read_as_address_and_size_pairs() {
+        let bytes = bytes_of(&RECORD_0X1C8);
+        let words = words_of(&bytes);
+        let sizes: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|&(_, word)| *word != 0 && *word <= SMALL)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(sizes, vec![2, 4, 6, 8, 10, 12]);
+        assert_eq!(words[2], 0x184);
+        assert_eq!(words[12], 0x2f0);
+        // Every word before the sizes is an address, so that no pair is
+        // (size, size).
+        assert!((1..12).step_by(2).all(|index| address(words[index])));
+        let bytes = bytes_of(&RECORD_0X218);
+        let words = words_of(&bytes);
+        let sizes: Vec<(usize, u64)> = words
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, word)| word != 0 && word <= SMALL)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![(2, 0x1c), (4, 0x14), (6, 0x2c0), (8, 0x1d8), (14, 0x1c)]
+        );
+        // [9] and [10] are two addresses, [11] a value that is neither size
+        // nor address: the tagged word the record also holds.
+        assert!(address(words[9]) && address(words[10]));
+        assert!(!address(words[11]) && words[11] > SMALL);
+    }
+
+    /// Neither record names a description we translate, which is why the two
+    /// slots still refuse instead of building a pipeline from a guess.
+    #[test]
+    fn neither_record_names_a_description_we_handle() {
+        for record in [RECORD_0X1C8, RECORD_0X218] {
+            let bytes = bytes_of(&record);
+            assert!(size_words(&bytes, GRAPHICS_DESCRIPTION).is_empty());
+            assert!(size_words(&bytes, COMPUTE_DESCRIPTION).is_empty());
+        }
+    }
+
+    /// The timestamp that made the first dump useless, as the record logged
+    /// it: `ESC[2m2026-11-25T01:17:05.605447Z`, which no console description
+    /// holds, so that read landed in this process's own heap.
+    #[test]
+    fn a_block_holding_a_log_timestamp_is_this_processes_own_text() {
+        let words: Vec<u64> = vec![
+            0x3632_3032_6d32_5b1b,
+            0x3054_3532_2d31_312d,
+            0x2e35_303a_3731_3a31,
+            0x005a_3734_3435_3036,
+        ];
+        let bytes = bytes_of(&words);
+        let text = ascii(&bytes, 64);
+        assert!(text.contains("2026-11-25T01:17:05"), "{text}");
+        assert_eq!(classify(&bytes), "this process's own log text");
+    }
+
+    /// What a block's first bytes are, as the probe names it for the log.
+    #[test]
+    fn a_blocks_first_bytes_name_what_it_is() {
+        assert_eq!(classify(b"DXBC\x00\x01\x02\x03"), "a DXBC container");
+        assert_eq!(classify(b"RTS0rest"), "a serialised root signature");
+        assert_eq!(classify(b"DXIL"), "DXIL");
+        assert_eq!(classify(b"nontemporal\0alias.scope"), "text");
+        assert_eq!(classify(b"\x00\x01\x02\x03\x04\x05\x06\x07"), "words");
+        assert_eq!(classify(b""), "nothing");
+    }
+
+    /// A pointer word is followed and its block classified; a word that
+    /// reads as a size is not followed, because no size is an address. The
+    /// earlier dump followed the sizes and so never saw a block at all.
+    #[test]
+    fn addresses_are_followed_and_sizes_are_not() {
+        const BASE: usize = 0x2_0000_0000;
+        let mut memory = vec![0u8; 0x3000];
+        memory[0x1000..0x1008].copy_from_slice(&(BASE as u64 + 0x2000).to_le_bytes());
+        memory[0x1010..0x1018].copy_from_slice(&0x1cu64.to_le_bytes());
+        memory[0x2000..0x2004].copy_from_slice(b"DXBC");
+        let mut read_at: Vec<usize> = Vec::new();
+        let mut read = |at: usize, bytes: &mut [u8]| {
+            read_at.push(at);
+            let len = bytes.len();
+            memory
+                .get(at - BASE..at - BASE + len)
+                .map(|slice| bytes.copy_from_slice(slice))
+                .is_some()
+        };
+        let text = probe(BASE + 0x1000, &mut read);
+        assert!(
+            text.contains("[w0] 0x0000000200002000: first 64 bytes are a DXBC container"),
+            "{text}"
+        );
+        assert!(!text.contains("[w2]"), "{text}");
+        assert!(!read_at.contains(&0x1c), "{read_at:x?}");
+        assert!(
+            text.contains("sizes: 0x2b0 graphics at [], 0x60 compute at []"),
+            "{text}"
+        );
+        assert!(
+            text.contains("words that read as a size: [(2, 1c)]"),
+            "{text}"
+        );
+    }
+
+    /// A description that cannot be read says so and follows nothing.
+    #[test]
+    fn an_unreadable_description_says_so() {
+        let mut none = |_: usize, _: &mut [u8]| false;
+        let text = probe(0x2000, &mut none);
+        assert!(
+            text.contains("16 of 16 lines of the description unreadable"),
+            "{text}"
+        );
+        assert!(text.contains("sizes: 0x2b0 graphics at []"), "{text}");
+        assert!(!text.contains("[w"), "{text}");
+    }
+
+    /// A null description is refused the way every other creation method
+    /// here refuses one, and `out` is nulled first.
+    #[test]
+    fn a_null_description_is_invalid_argument() {
+        let mut out: This = 0x1 as This;
+        let hr = unknown_pipeline::<0x1c8>(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &raw mut out,
+        );
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(out.is_null());
+    }
+
+    /// A dump inside the tree would fail the asset policy; a folder outside
+    /// it is accepted, and one that does not exist is refused.
+    #[test]
+    fn the_dump_refuses_a_path_inside_the_repository() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pipeline.txt");
+        assert!(!outside_repo(&inside));
+        let temp = tempfile::tempdir().unwrap();
+        assert!(outside_repo(&temp.path().join("pipeline.txt")));
+        assert!(!outside_repo(
+            &temp.path().join("missing").join("pipeline.txt")
+        ));
+    }
+
+    /// The call dump reads the arguments it is handed: a description whose
+    /// word 3 holds the PC size, and the pipeline state's own interface id.
+    #[cfg(windows)]
+    #[test]
+    fn the_call_dump_reads_a_description_and_the_iid() {
+        let mut description = [0u64; 16];
+        description[3] = GRAPHICS_DESCRIPTION;
+        let mut out: This = std::ptr::null_mut();
+        let text = dump_call(
+            0x1c8,
+            std::ptr::null_mut(),
+            (&raw const description).cast(),
+            std::ptr::from_ref(&PIPELINE_STATE_IID),
+            &raw mut out,
+        );
+        assert!(
+            text.starts_with("slot 0x1c8: 4 arguments (this, desc, iid, out)"),
+            "{text}"
+        );
+        assert!(text.contains("sizes: 0x2b0 graphics at [3]"), "{text}");
+        assert!(text.contains("ID3D12PipelineState is"), "{text}");
+        // The first word is null, so nothing is followed (the bytes behind the
+        // description are stack, so only a line of its own counts).
+        assert!(
+            !text.lines().any(|line| line.starts_with("      desc[0] =")),
+            "{text}"
+        );
     }
 }
