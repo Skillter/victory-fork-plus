@@ -64,7 +64,7 @@ Speed and memory:
 
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_LAZY_MERGE`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...),
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_COPY_QUEUE`, `VICTORY_BVH_BUILDER`, ...),
 and some translate a shader another way (`VICTORY_FIRSTLANE_OWN=1` takes a
 half-wave's own first lane where the translator would otherwise refuse the
 shader; own shader cache entries). Each is described in a comment where it is

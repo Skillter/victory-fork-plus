@@ -18,6 +18,17 @@
 - Upload: only ranges a submission is known to read are refreshed, from
   64 KiB pages tracked by `GetWriteWatch` (`watch`); guard pages cover views
   that cannot be write-watched.
+- Those refreshed ranges reach their card copies on the direct queue, in a list
+  ahead of the submission that reads them. A COPY queue of its own
+  (`VICTORY_COPY_QUEUE=1`, off by default) buys overlap only where its wait
+  does not hold it: the batch waits for the last value signalled on the direct
+  fence (the flights already sent read those copies with the bytes from
+  before), the direct queue waits for the batch's value before its next list
+  (`host::CopyOrder`, `host::card_copies`), and the batch leaves each copy in
+  `COMMON`, a copy queue touching nothing else and decay doing the rest, which
+  `host::copied_state` hands the reader as `BeforeState`. Off because the value
+  waited for is the previous submission: what overlaps is one DMA with the
+  submitting thread, not with the card.
 - Readback: declare shader writes (`Shadow::gpu_writes`), snapshot before
   submission (`Shadow::writing`), then compare per 64 KiB piece and merge only
   differing bytes (`Shadow::copy_back_with`). Title threads write the same
