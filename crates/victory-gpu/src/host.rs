@@ -9550,8 +9550,16 @@ impl Host {
                 _ => list.CopyResource(&back, picture),
             }
             // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
+            // title's own frame, which the lines below read back). The box is
+            // copied in, so the back buffer must be a copy destination while it
+            // is drawn — a drawn frame leaves it a render target.
+            if target != D3D12_RESOURCE_STATE_COPY_DEST {
+                list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
             crate::fpsbox::draw(self, list, &back, (chain.0, chain.1, format));
+            if target != D3D12_RESOURCE_STATE_COPY_DEST {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target)]);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
