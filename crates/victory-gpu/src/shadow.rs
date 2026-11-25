@@ -180,19 +180,21 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
-pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// bytes; the waits for the card the fetches added and their microseconds;
+/// the copies on the card those fetches were (`fetch_runs` joins the
+/// pieces of one copy that touch).
+pub(crate) static CARD_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub(crate) fn card_stats() -> [u64; 11] {
+    let mut out = [0u64; 11];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
-    out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+    out[8] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[9] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+    out[10] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
 
@@ -370,6 +372,51 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     out
 }
 
+/// The copies to issue to fetch `pieces` — `(who, from, to)`, naming a copy
+/// of title memory and the bytes of it a fetch brings down — with those of
+/// one copy that touch or overlap as one run (`Host::card_back`,
+/// `Host::relay_card_back`). Returns the runs (`who`, `from`, `to`, and
+/// where the run's first byte goes in the fetch buffer), where each piece's
+/// own first byte goes in it, and the bytes the runs move.
+///
+/// A run may reach bytes no piece named, a gap between two pieces of one
+/// copy: they are read and never merged, so a piece the title wrote and the
+/// card did not keeps the title's value, and nothing is stored into the
+/// card's memory. One `CopyBufferRegion` a run, where there was one a 64 KiB
+/// piece.
+pub(crate) fn fetch_runs(pieces: &[(usize, usize, usize)]) -> (Vec<(usize, usize, usize, u64)>, Vec<u64>, u64) {
+    // In the order the copies are made: one copy's pieces by offset, so that
+    // those that touch are neighbours here.
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_unstable_by_key(|&k| (pieces[k].0, pieces[k].1));
+    let mut runs: Vec<(usize, usize, usize, u64)> = Vec::with_capacity(pieces.len());
+    let mut at_of = vec![0u64; pieces.len()];
+    let mut total = 0u64;
+    for k in order {
+        let (who, from, to) = pieces[k];
+        // The pieces of one copy come in order of offset, so a run needs no
+        // sort of its own: the last one ends where the next begins, or past
+        // it when two pieces overlap.
+        let mut carried_on = false;
+        if let Some(last) = runs.last_mut()
+            && last.0 == who
+            && from <= last.2
+        {
+            let end = last.2.max(to);
+            total += (end - last.2) as u64;
+            last.2 = end;
+            at_of[k] = last.3 + (from - last.1) as u64;
+            carried_on = true;
+        }
+        if !carried_on {
+            runs.push((who, from, to, total));
+            at_of[k] = total;
+            total += (to - from) as u64;
+        }
+    }
+    (runs, at_of, total)
+}
+
 /// A declared range of a copy in the card's memory, as the compare on the
 /// card takes it: its offsets in the copy, its first 64 KiB piece (pieces
 /// are cut at multiples of 64 KiB of title memory; piece 0 holds offset
@@ -406,7 +453,36 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, fetch_runs, joined, joined_piece_runs};
+
+    /// Pieces of one copy that touch or overlap are one copy on the card, and
+    /// every piece still lands where its own bytes are: a fetch of a run of
+    /// pieces issues one copy, and the merge walks the pieces as before
+    /// (`Host::card_back`).
+    #[test]
+    fn pieces_that_touch_are_one_copy_on_the_card() {
+        // Three pieces of one copy that carry on, two of a second that
+        // overlap, and one of a third, given out of order.
+        let pieces = [(9, 4096, 4196), (7, 100, 200), (11, 64, 128), (7, 0, 100), (9, 4100, 4200), (7, 200, 260)];
+        let (runs, at_of, total) = fetch_runs(&pieces);
+        assert_eq!(runs, [(7, 0, 260, 0), (9, 4096, 4200, 260), (11, 64, 128, 364)]);
+        assert_eq!(total, 260 + 104 + 64);
+        // Each piece's first byte is where its run's is, plus its offset.
+        assert_eq!(at_of, [260, 100, 364, 0, 264, 200]);
+        // And every piece lies inside the one run its copy got, at that spot.
+        for (&(who, from, to), &at) in pieces.iter().zip(&at_of) {
+            let run = runs
+                .iter()
+                .find(|r| r.0 == who && r.1 <= from && to <= r.2)
+                .expect("a run holds the piece");
+            assert_eq!(run.3 + (from - run.1) as u64, at);
+        }
+        // Pieces apart, of one copy or of several, are copies of their own.
+        let apart = fetch_runs(&[(7, 0, 64), (7, 128, 192), (8, 64, 128)]);
+        assert_eq!(apart.0.len(), 3);
+        assert_eq!(apart.2, 192);
+        assert_eq!(fetch_runs(&[]), (Vec::new(), Vec::new(), 0));
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]

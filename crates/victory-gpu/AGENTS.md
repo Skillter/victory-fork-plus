@@ -22,6 +22,15 @@
   submission (`Shadow::writing`), then compare per 64 KiB piece and merge only
   differing bytes (`Shadow::copy_back_with`). Title threads write the same
   buffers concurrently, so a blind write-back corrupts title records.
+- The bytes of a copy that the write watch named go up as the fewest copies
+  that hold them (`shadow::joined`), and no byte it did not name goes up: a
+  shader write there would be recorded as sent, and the merge would skip it
+  instead of taking it (`Shadow::card_merge_relay`'s skip list).
+- A fetch is issued in runs too: `shadow::fetch_runs` holds the differing
+  pieces of one copy in the fewest `CopyBufferRegion`s that cover them, and
+  every piece still merges where it lies, so a run reaching past its pieces
+  costs bytes and not correctness (`Host::card_back`,
+  `Host::relay_card_back`).
 - `VICTORY_CARD_BUFFERS*` adds a card-side copy and finds writes with a
   compute hash per piece; `VICTORY_INPLACE*` places a buffer in an
   `OpenExistingHeapFromFileMapping` heap. Both are off by default.
