@@ -40,6 +40,26 @@
 //! of the library's size was made, filled and written out at each save).
 //! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 //!
+//! The load of a 752 MB library took 26 s of the opening load, with nothing
+//! logged in between (run 05:19:01: first translated shader 05:19:11.328,
+//! `host pipeline library loaded` 05:19:37.473), while the same file loaded
+//! from the system's cache took 11 to 15 ms in other runs: the time is the
+//! mapping's pages coming off the disk, not the host's parse, which takes
+//! 49 ms with the bytes in memory (`VICTORY_LIBRARY_BENCH`, the test below).
+//! So the pages are read ahead in one pass before the parse
+//! ([`Mapped::prefetch`]: 256 MiB cost 578 ms at 465 MB/s against 3,575 ms
+//! faulted at 75 MB/s), the load says where its time went, and past
+//! `VICTORY_LIBRARY_MB` the library takes no more pipelines ([`room`]): a
+//! smaller file is the only other lever on what a start must read.
+//!
+//! What the library holds is the host's own form of each pipeline, not
+//! copies of the shader containers we hand it: of the 26,616 containers in
+//! `cache/shaders` none is in the 753 MB file (no `DXBC` in it at all, and 0
+//! bytes matched, `VICTORY_LIBRARY_BENCH_SHADERS`), and 753,134,320 B over
+//! the census's 2,454 pipelines is 307,000 B a pipeline of its compiled code
+//! and our descriptions together. A start reads all of it; nothing in the
+//! file can be left out.
+//!
 //! The mapped file's handle stays open for as long as the mapping lives
 //! ([`holds`]). A save renames the new library over the file this run has
 //! mapped, and with the handle closed Windows then gives up the old file's
@@ -58,7 +78,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -83,6 +103,9 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// rewrite, and the base the growth gate in `save` measures against.
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
+/// Whether the cap (`VICTORY_LIBRARY_MB`) has stopped a store this run: said
+/// once, not once a pipeline.
+static AT_CAP: AtomicBool = AtomicBool::new(false);
 
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
@@ -98,6 +121,29 @@ fn mapped() -> bool {
 fn holds() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_HANDLE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the mapped library's pages are read into memory in one pass
+/// before the host parses them ([`Mapped::prefetch`]). On by default;
+/// `VICTORY_LIBRARY_PREFETCH=0` lets the parse fault them in, as before.
+fn prefetches() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| prefetches_of(std::env::var("VICTORY_LIBRARY_PREFETCH").ok().as_deref()))
+}
+
+/// `VICTORY_LIBRARY_PREFETCH` read as the switch it is: on unless switched
+/// off, so a run with no environment is the read-ahead the notes measure.
+fn prefetches_of(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Bytes of a mapping read ahead in one call: the whole file is read ahead,
+/// a quarter of a gigabyte at a time.
+const PREFETCH_CHUNK: usize = 256 << 20;
+
+/// Milliseconds since `since`, for the load's phases.
+fn ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1e3
 }
 
 /// A whole file mapped into memory: read-only (the library's file) or
@@ -189,6 +235,49 @@ impl Mapped {
         // SAFETY: a writable view of `len` bytes, ours alone.
         unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
     }
+
+    /// Reads the view's pages into memory now, before the host parses them:
+    /// one sequential read of the file instead of a fault per page the
+    /// parse reaches, which is what 26 s of a 752 MB load was made of.
+    /// Milliseconds spent, `None` when the switch is off ([`prefetches`]).
+    fn prefetch(&self) -> Option<f64> {
+        if !prefetches() {
+            return None;
+        }
+        let began = Instant::now();
+        for (at, bytes) in prefetch_ranges(self.len) {
+            // SAFETY: as `prefetch` asks: a range of our own view, readable
+            // for `len` bytes.
+            unsafe { prefetch(self.at.Value.cast::<u8>().wrapping_add(at), bytes) };
+        }
+        Some(ms(began))
+    }
+}
+
+/// The ranges of a mapping of `len` bytes read ahead in one pass: whole
+/// chunks of [`PREFETCH_CHUNK`], the last one what is left (nothing for an
+/// empty file).
+fn prefetch_ranges(len: usize) -> Vec<(usize, usize)> {
+    (0..len)
+        .step_by(PREFETCH_CHUNK)
+        .map(|at| (at, PREFETCH_CHUNK.min(len - at)))
+        .collect()
+}
+
+/// `PrefetchVirtualMemory` of `bytes` at `at`: the system reads those pages
+/// in now. False if it declined (the pages then come back a page fault at a
+/// time, as they did before).
+///
+/// # Safety
+/// `at` must be the address of `bytes` readable bytes of an accessible view.
+unsafe fn prefetch(at: *const u8, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let entry =
+        WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: at.cast_mut().cast(), NumberOfBytes: bytes };
+    // SAFETY: a range of an accessible view, read by the call and nothing
+    // else touched.
+    unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0) != 0 }
 }
 
 impl Drop for Mapped {
@@ -557,9 +646,37 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            let began = Instant::now();
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            // Mapping the file is the open, the size and one call into the
+            // system; reading it into a buffer (`VICTORY_LIBRARY_MAP=0`) is
+            // the whole file, which is why the two are told apart here.
+            let (mapped, bytes, file_ms) = match &blob {
+                Blob::None => (false, 0, ms(began)),
+                Blob::Held(bytes) => (false, bytes.len(), ms(began)),
+                Blob::Mapped(file) => (true, file.len, ms(began)),
+            };
+            // The host reads the whole file while it parses it (752 MB took
+            // 26 s of a run): read ahead first, so that the parse waits for
+            // the disk once and not once a page.
+            let prefetched = match &blob {
+                Blob::Mapped(file) => file.prefetch().map(|ms| (file.len, ms)),
+                _ => None,
+            };
+            let parse = Instant::now();
             let library = open(&device, blob);
+            let parse_ms = ms(parse);
+            tracing::info!(
+                bytes,
+                mapped,
+                file_ms = file_ms as u64,
+                prefetched_bytes = prefetched.map_or(0, |(bytes, _)| bytes as u64),
+                prefetch_ms = prefetched.map_or(0, |(_, ms)| ms as u64),
+                parse_ms = parse_ms as u64,
+                total_ms = ms(began) as u64,
+                "pipeline library load: the file, the read-ahead and the host's parse"
+            );
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -588,6 +705,18 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 // file to gain a few hundred kilobytes.
                 SAVED.store(bytes as u64, Ordering::Relaxed);
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+                // A library over the cap loads (it is every pipeline of every
+                // earlier run, which a recompile would not give back in one
+                // run) but takes no more, so it never grows past it again: the
+                // only lever on the parse is a smaller file, and only the
+                // reader can say when to spend the compiles of rebuilding.
+                if let Some(cap) = cap().filter(|cap| bytes >= *cap) {
+                    tracing::warn!(
+                        bytes,
+                        cap,
+                        "the pipeline library is at or over its cap and will take no more pipelines; move the file aside to rebuild a smaller one"
+                    );
+                }
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
@@ -615,6 +744,28 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
+}
+
+/// The most the library's file may grow to, in bytes, from
+/// `VICTORY_LIBRARY_MB`; `None` for no cap.
+fn cap() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| cap_of(std::env::var("VICTORY_LIBRARY_MB").ok().as_deref()))
+}
+
+/// The cap `VICTORY_LIBRARY_MB` names, in bytes. `None` for nothing that
+/// limits the library: unset, empty, `0` (off, as before) or not a number.
+fn cap_of(mb: Option<&str>) -> Option<usize> {
+    let mb: u64 = mb?.trim().parse().ok()?;
+    (mb > 0).then(|| (mb as usize).saturating_mul(1 << 20))
+}
+
+/// Whether a library of `size` bytes takes one more pipeline: under its cap,
+/// or with no cap at all. A library holds one entry per pipeline and the
+/// host is given no way to drop one, so the only bound on a file it must
+/// parse whole at every start is this one.
+fn room(size: usize, cap: Option<usize>) -> bool {
+    cap.is_none_or(|cap| size < cap)
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -807,6 +958,25 @@ pub(crate) fn pipeline(
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
+    // `shortcut:` a library past its cap takes no more pipelines, so a run
+    // that draws a pipeline the file does not hold compiles it again next
+    // time. The alternative is a file the host parses whole at every start
+    // (752 MB, 26 s of the opening load), and no host call drops an entry.
+    if let Some(cap) = cap() {
+        // SAFETY: a plain query on a live library, under the guard that keeps
+        // a save from serialising it meanwhile.
+        let size = unsafe { library.library.GetSerializedSize() };
+        if !room(size, Some(cap)) {
+            if !AT_CAP.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    size,
+                    cap,
+                    "the pipeline library is at its cap: pipelines this run makes are not kept (VICTORY_LIBRARY_MB)"
+                );
+            }
+            return Ok(pso);
+        }
+    }
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -1019,7 +1189,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_change_with_what_goes_into_the_pipeline() {        let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
+    fn names_change_with_what_goes_into_the_pipeline() {
+        let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps2"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps"], "state2"));
@@ -1311,5 +1482,339 @@ mod tests {
         // nothing to do.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(prune(&empty.path().join("pipelines"), now), Pruned::default());
+    }
+
+    /// The cap `VICTORY_LIBRARY_MB` names, and that a library at it takes no
+    /// more pipelines: the whole point of it is a file the host parses in
+    /// a start, and one entry more is a file that grows for ever.
+    #[test]
+    fn the_cap_bounds_what_the_library_may_grow_to() {
+        assert_eq!(cap_of(None), None, "unset: no cap, as before");
+        assert_eq!(cap_of(Some("")), None);
+        assert_eq!(cap_of(Some("0")), None, "0 is off, as before");
+        assert_eq!(cap_of(Some("junk")), None);
+        assert_eq!(cap_of(Some("-1")), None);
+        assert_eq!(cap_of(Some(" 256 ")), Some(256 << 20));
+        assert_eq!(cap_of(Some("4096")), Some(4096 << 20));
+        // One byte short of the cap takes a pipeline; the cap itself takes
+        // none, and neither does anything past it (a library that shrank is
+        // still one the host must parse whole).
+        assert!(room((752 << 20) - 1, Some(752 << 20)));
+        assert!(!room(752 << 20, Some(752 << 20)));
+        assert!(!room((752 << 20) + 1, Some(752 << 20)));
+        assert!(room(usize::MAX / 2, None), "no cap, no bound");
+        // The read-ahead is on unless a run switches it off, so the shipped
+        // behaviour is the one the notes measure.
+        assert!(prefetches_of(None));
+        assert!(prefetches_of(Some("1")));
+        assert!(!prefetches_of(Some("0")));
+    }
+
+    /// The read ahead is the whole file, once, and the system takes it: the
+    /// pages are the file's, read before the host parses them.
+    #[test]
+    fn the_read_ahead_covers_the_whole_file_once() {
+        assert!(prefetch_ranges(0).is_empty());
+        assert_eq!(prefetch_ranges(10), vec![(0, 10)]);
+        assert_eq!(prefetch_ranges(PREFETCH_CHUNK * 2 + 7), vec![
+            (0, PREFETCH_CHUNK),
+            (PREFETCH_CHUNK, PREFETCH_CHUNK),
+            (PREFETCH_CHUNK * 2, 7)
+        ]);
+        // No page skipped, none counted twice, whatever the size.
+        for len in [1usize, 4_095, 4_096, PREFETCH_CHUNK - 1, PREFETCH_CHUNK + 1] {
+            let mut at = 0;
+            for (start, bytes) in prefetch_ranges(len) {
+                assert_eq!(start, at, "the ranges run on from each other");
+                assert!(bytes > 0);
+                at += bytes;
+            }
+            assert_eq!(at, len, "they cover the file");
+        }
+        // And the system's call takes one: a mapping of a real file, read
+        // ahead the way a load reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
+        let mapped = Mapped::open(&path).expect("the file, mapped");
+        for (at, bytes) in prefetch_ranges(mapped.len) {
+            // SAFETY: as `prefetch` asks: the whole of our own view.
+            let read = unsafe { prefetch(mapped.at.Value.cast::<u8>().wrapping_add(at), bytes) };
+            assert!(read, "the system read it ahead");
+        }
+        assert_eq!(&mapped.bytes()[..4], [7; 4]);
+    }
+
+    /// Reads `path` (a file of `len` bytes) past the system's cache, into a
+    /// buffer of its own: the bytes the disk holds, with no page of them
+    /// left in the cache for a mapping to be handed for free.
+    fn read_uncached(path: &Path, len: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_NO_BUFFERING
+        const UNCACHED: u32 = 0x2000_0000;
+        const CHUNK: usize = 1 << 20;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(UNCACHED)
+            .open(path)
+            .ok()?;
+        let mut store = vec![0u8; CHUNK + 4096];
+        let start = store.as_ptr().align_offset(4096);
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            let chunk = &mut store[start..start + CHUNK];
+            let read = file.read(chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        Some(bytes)
+    }
+
+    /// Where a real load's time goes, in the order the load spends it:
+    /// `VICTORY_LIBRARY_BENCH=<path to a host-pipelines.bin>` and
+    /// `cargo test -p victory-gpu --lib the_load_of_a_real_library_is_timed
+    /// -- --nocapture`. Skips (passes) without the variable or without a
+    /// host GPU, like the GPU tests above.
+    ///
+    /// The figures it prints, for a 752 MB library:
+    /// - the disk, the file read past the cache: the floor under everything;
+    /// - a mapping's pages faulted in by the parse itself: what a start does
+    ///   with `VICTORY_LIBRARY_PREFETCH=0`;
+    /// - the same parse again, the pages in memory: the host's own work;
+    /// - the parse of bytes read into a buffer: the same work, no mapping;
+    /// - a fresh mapping read ahead first, then parsed: the load as shipped.
+    #[test]
+    fn the_load_of_a_real_library_is_timed() {
+        let Some(path) = std::env::var_os("VICTORY_LIBRARY_BENCH").map(PathBuf::from) else {
+            println!("skipped: VICTORY_LIBRARY_BENCH is not set");
+            return;
+        };
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            println!("skipped: no host GPU here");
+            return;
+        };
+        let file = std::fs::File::open(&path).expect("the library file, opened");
+        let len = usize::try_from(file.metadata().unwrap().len()).unwrap();
+        assert!(len > 0, "an empty library");
+        println!("{}: {len} bytes", path.display());
+        let make = |bytes: &[u8]| -> f64 {
+            let began = Instant::now();
+            // SAFETY: the bytes outlive the library (`made` is dropped before
+            // them, in this call).
+            let made = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes) };
+            let spent = ms(began);
+            match &made {
+                // SAFETY: a plain query on a live library.
+                Ok(library) => println!(
+                    "  parse of {} bytes: {spent:.0} ms (serialised {} bytes)",
+                    bytes.len(),
+                    unsafe { library.GetSerializedSize() }
+                ),
+                Err(e) => println!("  parse of {} bytes: {spent:.0} ms, refused: {e}", bytes.len()),
+            }
+            spent
+        };
+        // 1. What the disk holds: the file read past the system's cache, so
+        //    that no page of it is left for the mappings below.
+        let began = Instant::now();
+        let uncached = read_uncached(&path, len).expect("an uncached read of the file");
+        let disk_ms = ms(began);
+        println!(
+            "the disk: {disk_ms:.0} ms for {len} bytes ({:.0} MB/s)",
+            len as f64 / 1e6 / (disk_ms / 1e3)
+        );
+        assert_eq!(uncached.len(), len, "the whole file");
+        // 2. A mapping as a start makes it, its pages faulted in by the
+        //    parse: the load without the read ahead.
+        let mapped = Mapped::map(&file, len, false).expect("a mapping of the file");
+        let without = {
+            let began = Instant::now();
+            let spent = make(mapped.bytes());
+            println!("  (of which the mapping: {:.0} ms)", ms(began) - spent);
+            spent
+        };
+        // 3. The same parse of the same mapping with its pages in memory.
+        let warm = make(mapped.bytes());
+        // 4. The bytes as a buffer, as `VICTORY_LIBRARY_MAP=0` holds them.
+        let held = make(&uncached);
+        drop(mapped);
+        // 5. A fresh mapping, read ahead in one pass, then parsed: the load as
+        //    shipped. The pages are already the system's here, so the figure
+        //    is the parse and the read ahead's own cost, not the disk's.
+        let fresh = Mapped::open(&path).expect("the file, mapped");
+        let began = Instant::now();
+        for (at, bytes) in prefetch_ranges(fresh.len) {
+            // SAFETY: as `prefetch` asks: the whole of our own view.
+            unsafe { prefetch(fresh.at.Value.cast::<u8>().wrapping_add(at), bytes) };
+        }
+        let read_ahead = ms(began);
+        let read_ahead_parse = make(fresh.bytes());
+        println!(
+            "summary: disk {disk_ms:.0} ms; faults {without:.0} ms; warm {warm:.0} ms; \
+             buffer {held:.0} ms; read ahead {read_ahead:.0} ms + parse {read_ahead_parse:.0} ms"
+        );
+    }
+
+    /// What a library is made of, and what of it the shader cache already
+    /// holds: `VICTORY_LIBRARY_BENCH=<a host-pipelines.bin>` and
+    /// `VICTORY_LIBRARY_BENCH_SHADERS=<cache/shaders>` say what to read.
+    /// Prints how many bytes of the library are copies of the translated
+    /// shader containers in that folder (a lower bound: the host's own
+    /// compiled code is not one of them) and the rest.
+    #[test]
+    fn the_library_holds_copies_of_shader_code_the_cache_already_has() {
+        use std::collections::HashSet;
+        use std::io::Read;
+        let (Some(library), Some(shaders)) = (
+            std::env::var_os("VICTORY_LIBRARY_BENCH").map(PathBuf::from),
+            std::env::var_os("VICTORY_LIBRARY_BENCH_SHADERS").map(PathBuf::from),
+        ) else {
+            println!("skipped: VICTORY_LIBRARY_BENCH_SHADERS is not set");
+            return;
+        };
+        // A shader cache file is `VSH1`, a version, a length, then the
+        // container the translator made; its first 32 bytes name it.
+        const HEAD: usize = 44;
+        let mut containers: HashSet<[u8; 32]> = HashSet::new();
+        let mut files = 0u64;
+        let mut biggest: Vec<(u64, PathBuf)> = Vec::new();
+        for at in 0..256u32 {
+            let Ok(listing) = std::fs::read_dir(shaders.join(format!("{at:02x}"))) else { continue };
+            for entry in listing.flatten() {
+                let Ok(mut file) = std::fs::File::open(entry.path()) else { continue };
+                let mut head = [0u8; HEAD];
+                if file.read_exact(&mut head).is_err() || &head[..4] != b"VSH1" {
+                    continue;
+                }
+                files += 1;
+                containers.insert(head[12..].try_into().unwrap());
+                if let Ok(metadata) = entry.metadata() {
+                    biggest.push((metadata.len(), entry.path()));
+                }
+            }
+        }
+        let file = std::fs::File::open(&library).expect("the library file, opened");
+        let len = usize::try_from(file.metadata().unwrap().len()).unwrap();
+        let blob = Mapped::map(&file, len, false).expect("a mapping of the library");
+        let bytes = blob.bytes();
+        // Every `DXBC` the library holds, counted with the size the container
+        // states at its offset 24.
+        let (mut copies, mut made_of, mut shaders_seen) = (0u64, 0u64, 0u64);
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut at = 0usize;
+        while let Some(found) = find(bytes, b"DXBC", at) {
+            at = found + 4;
+            let Some(head) = bytes.get(found..found + 32) else { break };
+            let head: [u8; 32] = head.try_into().unwrap();
+            if !containers.contains(&head) {
+                continue;
+            }
+            let size = u32::from_le_bytes(bytes[found + 24..found + 28].try_into().unwrap()) as usize;
+            assert!((32..=1 << 26).contains(&size), "a container's size: {size}");
+            copies += 1;
+            made_of += size as u64;
+            if seen.insert(head) {
+                shaders_seen += 1;
+            }
+        }
+        println!("the library: {len} bytes; the shader cache: {files} containers");
+        println!(
+            "the library holds {copies} copies of {shaders_seen} of them: {made_of} bytes of shader \
+             code ({:.0} %), the other {} bytes are descriptions and the host's own compiled code",
+            made_of as f64 * 100.0 / len as f64,
+            len as u64 - made_of
+        );
+        // ... and whether any container survives at all: three of the largest,
+        // matched 4 KiB in, where a rewritten header cannot reach.
+        biggest.sort_unstable_by_key(|it| std::cmp::Reverse(it.0));
+        for (size, path) in biggest.into_iter().take(3) {
+            let Ok(mut file) = std::fs::File::open(&path) else { continue };
+            let mut inside = [0u8; 32];
+            use std::io::Seek;
+            if file.seek(std::io::SeekFrom::Start(12 + 4096)).is_err()
+                || file.read_exact(&mut inside).is_err()
+            {
+                continue;
+            }
+            println!(
+                "a {size} byte container of the shader cache: its bytes 4 KiB in are {} in the library",
+                match find(bytes, &inside, 0) {
+                    Some(at) => format!("at {at}"),
+                    None => "nowhere".to_owned(),
+                }
+            );
+        }
+    }
+
+    /// Where `needle` is in `bytes`, from `at` on.
+    fn find(bytes: &[u8], needle: &[u8], at: usize) -> Option<usize> {
+        let mut from = at;
+        while let Some(offset) = bytes.get(from..)?.iter().position(|&b| b == needle[0]) {
+            let found = from + offset;
+            if bytes.get(found..found + needle.len()) == Some(needle) {
+                return Some(found);
+            }
+            from = found + 1;
+        }
+        None
+    }
+
+    /// What the two ways of getting a file's pages in cost against the disk:
+    /// one page fault at a time as a parse reaches them, or one read ahead of
+    /// the whole file. `VICTORY_LIBRARY_BENCH_DISK=<MiB>` (256 is a second or
+    /// two of a fast disk); skipped without it, because the measurement
+    /// writes two files of that size past the system's cache.
+    #[test]
+    fn a_file_read_ahead_is_read_faster_than_a_file_faulted_in() {
+        let Some(mib) = std::env::var("VICTORY_LIBRARY_BENCH_DISK").ok().and_then(|v| v.parse::<usize>().ok()) else {
+            println!("skipped: VICTORY_LIBRARY_BENCH_DISK is not set");
+            return;
+        };
+        let len = mib << 20;
+        let dir = tempfile::tempdir().unwrap();
+        // One byte of every page, as a parse reaching the next page reads
+        // one: the pages come in however they come in.
+        let touch = |file: &Mapped| -> f64 {
+            let began = Instant::now();
+            let mut sum = 0u64;
+            for at in (0..file.len).step_by(4096) {
+                sum = sum.wrapping_add(u64::from(file.bytes()[at]));
+            }
+            std::hint::black_box(sum);
+            ms(began)
+        };
+        let rate = |ms: f64| len as f64 / 1e6 / (ms / 1e3);
+        // 1. The pages faulted in as they are read, as the host's parse of a
+        //    mapping does it.
+        let faulted = dir.path().join("faulted.bin");
+        if !write_uncached(&faulted, len) {
+            println!("skipped: this folder takes no writes past the cache");
+            return;
+        }
+        let file = Mapped::open(&faulted).expect("the file, mapped");
+        let faults = touch(&file);
+        // 2. The pages read ahead in one pass, then read.
+        let ahead = dir.path().join("ahead.bin");
+        if !write_uncached(&ahead, len) {
+            println!("skipped: this folder takes no writes past the cache");
+            return;
+        }
+        let file = Mapped::open(&ahead).expect("the file, mapped");
+        let began = Instant::now();
+        for (at, bytes) in prefetch_ranges(file.len) {
+            // SAFETY: as `prefetch` asks: the whole of our own view.
+            unsafe { prefetch(file.at.Value.cast::<u8>().wrapping_add(at), bytes) };
+        }
+        let ahead_ms = ms(began);
+        let after = touch(&file);
+        println!(
+            "{mib} MiB: faults {faults:.0} ms ({:.0} MB/s); read ahead {ahead_ms:.0} ms ({:.0} MB/s), \
+             then a read of every page {after:.0} ms",
+            rate(faults),
+            rate(ahead_ms)
+        );
     }
 }

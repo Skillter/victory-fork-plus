@@ -195,6 +195,10 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
   this session made or loaded (`pipeline::library::report_census`), an average
   that falls as a session loads more, not a pipeline's size: 1,443,536 at 88
   made + 336 loaded, 275,537 at 295 + 2,435.
+  The load of it is the file's pages, not the parse: the 753,134,320 B library
+  took 9,407 ms with its pages on the disk (80 MB/s) and 49 ms with them in
+  memory, and a sequential read of the same file took 2,711 ms (278 MB/s)
+  (`VICTORY_LIBRARY_BENCH`), so the mapping is read ahead before the parse.
   `dropped N (0 being made)` means the backlog is drained; `M being made` means
   compilation is the limit that frame.
 - Drops with the library warm *(re-measured 04:23)*: 153.5/frame `BuilderOff`
