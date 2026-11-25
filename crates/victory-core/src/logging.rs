@@ -197,6 +197,14 @@ fn install(default_level: &str, target: Option<PathBuf>) {
 /// file, so the truncation here only guards two runs that start in the same
 /// second; there is no separate retention policy.
 fn open(path: &Path) -> Option<Shared> {
+    // The default target is built from the data directory, which
+    // `crates/victory-core/src/config.rs` already checks; an override names
+    // its own path, and a log inside the repository would fail
+    // `cargo xtask policy` on the next commit.
+    if let Err(e) = crate::policy::ensure_outside_repo(path) {
+        eprintln!("warning: no log file at {}: {e}", path.display());
+        return None;
+    }
     let result = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -330,6 +338,16 @@ mod tests {
             std::fs::read_to_string(&path).expect("read"),
             "second run\n"
         );
+    }
+
+    #[test]
+    fn a_log_file_inside_the_repository_is_refused() {
+        // `VICTORY_LOG_FILE` names its own path; the default comes from a
+        // data directory the config already checks. A log inside the tree
+        // fails `cargo xtask policy` on the next commit.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target-refused.log");
+        assert!(open(&path).is_none(), "a log inside the repo must not open");
+        assert!(!path.exists(), "and must not be created either");
     }
 
     #[test]
