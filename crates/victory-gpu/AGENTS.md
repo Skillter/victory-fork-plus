@@ -182,9 +182,10 @@
   `feature = "diagnostics"`. `VICTORY_GPU_TIMING` forces `late_stage` to 0;
   `VICTORY_D3D12_DRED` names the faulting command.
 - `draw` counts what a draw emits on the host list and what those caches
-  spare, per 5 s in every build (`draw::commands_line`): a per-draw cost that
-  line does not show is `host`'s barriers and copies, not a command of the
-  draw's.
+  spare, per 5 s in every build (`draw::commands_line`), including the
+  barriers and state an indirect clamp emits; `draw::windowed_line` splits
+  those clamps by why their window closed. A per-draw cost neither line shows
+  is `host`'s copies, not a command of the draw's.
 - `list::census` (`VICTORY_BARRIER_CENSUS=1`, diagnostics only) splits a
   frame's barrier decisions by source: the draw path's `ensure_state` asks by
   the state asked for (a target, the depth buffer, a shader read, other), and
