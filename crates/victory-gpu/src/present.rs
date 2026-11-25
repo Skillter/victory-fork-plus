@@ -32,7 +32,9 @@
 //!   frame of a title that pads 1080 lines to 1088 is either texture, and
 //!   guessing between them draws the wrong one.
 //!
-//! `VICTORY_PRESENT_FALLBACK=0` turns the fallback off; it is on by default.
+//! `VICTORY_PRESENT_FALLBACK=1` turns the fallback on; it is off by default,
+//! because a substituted frame can lack the layers the title composites into
+//! the frame it presents (the world's own draw is one of them).
 #![cfg_attr(not(windows), allow(dead_code))] // the decision is tested everywhere
 
 use std::sync::Mutex;
@@ -143,10 +145,10 @@ fn note(list: &mut Vec<usize>, at: usize) {
     }
 }
 
-/// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=0` turns it off).
+/// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=1` turns it on).
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_some_and(|v| v == "1"))
 }
 
 /// A draw, dispatch, copy or resolve rendered into `this`: it holds a frame.

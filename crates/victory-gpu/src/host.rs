@@ -8425,7 +8425,7 @@ impl Host {
                             victory_core::logging::warn_once("present.fallback", || {
                                 format!(
                                     "presented frame was not written; showing the {}x{} frame it \
-                                     did write (VICTORY_PRESENT_FALLBACK=0 turns this off)",
+                                     did write (VICTORY_PRESENT_FALLBACK=1 turns this on)",
                                     desc.Width, desc.Height
                                 )
                             });
