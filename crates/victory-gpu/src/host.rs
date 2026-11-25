@@ -6495,6 +6495,13 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // Why the host left buffer views null, once there are any: the
+            // total is in the line above, the reasons apart.
+            if let Some(reasons) = crate::descriptor::host::refused_census() {
+                tracing::info!(
+                    "buffer views left null as the host would refuse them, by reason: {reasons}"
+                );
+            }
             // The reasons, in the builds that do not print the frame listing:
             // the same drops, split by why each was not run. Diagnostics
             // builds split them by the detail worth formatting there (shader
