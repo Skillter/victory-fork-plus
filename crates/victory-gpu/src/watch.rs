@@ -49,6 +49,18 @@ thread_local! {
     static ASKINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Askings made and kernel pages walked, since the last take: a call costs
+/// with the pages it covers, so a frame line that names one without the
+/// other cannot tell a big asking from many small ones.
+static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The askings made and the kernel pages they walked since the last call.
+pub(crate) fn take_askings() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (MADE.swap(0, Relaxed), WALKED.swap(0, Relaxed))
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -270,6 +282,11 @@ fn ask_kernel(j: &mut Journal, start: usize, end: usize, now: u64) -> bool {
     #[cfg(test)]
     ASKINGS.with(|n| n.set(n.get() + 1));
     let mut count = (end - start) / KERNEL_PAGE;
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        MADE.fetch_add(1, Relaxed);
+        WALKED.fetch_add(count as u64, Relaxed);
+    }
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]

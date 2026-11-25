@@ -451,6 +451,29 @@ fn card_clock_line(frames: f64, ms: f64) {
     );
 }
 
+/// Where a submission's preparing goes, in microseconds since the last
+/// frame-rate line, always counted: the frame line splits preparing into
+/// copies and textures only, and what is left of a 4 s frame is otherwise
+/// unattributed. `PHASE_OTHER` is not counted here (it is what the frame
+/// line's preparing has over these sums).
+static PHASES: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// [`PHASES`] in the order the print names them.
+const PHASE_NAMES: [&str; 7] = ["asking", "recording", "flush", "snapshots", "card", "send", "settle"];
+
+const PHASE_ASKING: usize = 0;
+const PHASE_RECORDING: usize = 1;
+const PHASE_FLUSH: usize = 2;
+const PHASE_SNAPSHOTS: usize = 3;
+const PHASE_CARD: usize = 4;
+const PHASE_SEND: usize = 5;
+const PHASE_SETTLE: usize = 6;
+
+/// Adds what passed since `since` to a [`PHASES`] entry.
+fn phase(i: usize, since: std::time::Instant) {
+    PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -4379,7 +4402,9 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let asking = std::time::Instant::now();
             crate::watch::ask_once(&ranges);
+            phase(PHASE_ASKING, asking);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -4388,13 +4413,16 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                phase(PHASE_SETTLE, settling);
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+            phase(PHASE_SETTLE, settling);
         }
+        let recording = std::time::Instant::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4403,15 +4431,20 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        phase(PHASE_RECORDING, recording);
+        let flushing = std::time::Instant::now();
         batch.flush();
         crate::watch::ask_once_end();
+        phase(PHASE_FLUSH, flushing);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
+            let snapping = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            phase(PHASE_SNAPSHOTS, snapping);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
@@ -4423,20 +4456,25 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            phase(PHASE_SETTLE, settling);
         }
+        let carding = std::time::Instant::now();
         let card = self.card_before(runs, flown);
+        phase(PHASE_CARD, carding);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            let sending = std::time::Instant::now();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            phase(PHASE_SEND, sending);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6655,6 +6693,22 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // Where the preparing went: the frame line splits it into
+            // copies and textures, and a frame that spends seconds outside
+            // both says nothing about where (run 93: 4.6 s with 6 draws).
+            {
+                let ms = |i: usize| PHASES[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+                let parts: Vec<String> = (0..PHASES.len())
+                    .map(|i| format!("{} {:.1} ms", PHASE_NAMES[i], ms(i)))
+                    .collect();
+                let (made, walked) = crate::watch::take_askings();
+                tracing::info!(
+                    "submission phases per frame: {}, asking the kernel {:.1} times for {:.0} pages",
+                    parts.join(", "),
+                    made as f64 / frames,
+                    walked as f64 / frames
+                );
+            }
             // Why the host left buffer views null, once there are any: the
             // total is in the line above, the reasons apart.
             if let Some(reasons) = crate::descriptor::host::refused_census() {
