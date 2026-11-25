@@ -2108,59 +2108,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
-/// The host format's support bits (`D3D12_FORMAT_SUPPORT1`), asked once per
-/// format: which uses of a format a resource may be created with.
-#[cfg(windows)]
-fn format_support(format: u32) -> u32 {
-    static CACHE: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
-    {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(_, bits)) = cache.iter().find(|&&(f, _)| f == format) {
-            return bits;
-        }
-    }
-    use windows::Win32::Graphics::Direct3D12::*;
-    let Some(host) = crate::host::host() else {
-        return u32::MAX;
-    };
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    // SAFETY: a plain query into our own structure.
-    let asked = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_FORMAT_SUPPORT,
-            (&raw mut support).cast(),
-            size_of_val(&support) as u32,
-        )
-    };
-    let bits = if asked.is_err() { u32::MAX } else { support.Support1.0 as u32 };
-    CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((format, bits));
-    bits
-}
-
-/// Says once what create flags a format lost: the console takes a render
-/// target or an unordered access view of formats the host has neither for,
-/// and a create that asks is refused whole (`0x80070057`) while its views
-/// are ones the device removes itself for.
-#[cfg(windows)]
-fn cut_flags(format: u32, asked: u32, kept: u32) {
-    static SAID: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-    if said.contains(&format) {
-        return;
-    }
-    said.push(format);
-    tracing::warn!(
-        format,
-        asked = format_args!("{asked:#x}"),
-        kept = format_args!("{kept:#x}"),
-        "the host has no such use of this format: the flags are dropped"
-    );
+/// Whether the host takes a clear value for a texture with these flags:
+/// `CreateCommittedResource` answers `E_INVALIDARG` for a clear value on a
+/// texture that is neither a render target nor a depth target (only those
+/// two flags have an optimised clear). The console ignores the pointer, so
+/// the title passes one for every texture it fills: the description says
+/// `flags: 0` and the create was refused whole.
+fn takes_clear_value(flags: u32) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    flags & (TARGET | DEPTH) != 0
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -2209,32 +2166,9 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // A flag the format has no use of is a create the host refuses whole
-    // (0x80070057), and a render target view of it is one the device removes
-    // itself for: keep what the format supports.
-    {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
-            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
-        };
-        let support = format_support(d.format);
-        let asked = d.flags;
-        for (flag, bit) in [
-            (TARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0),
-            (UNORDERED, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0),
-            (DEPTH, D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0),
-        ] {
-            if d.flags & flag != 0 && support & bit as u32 == 0 {
-                d.flags &= !flag;
-            }
-        }
-        if d.flags != asked {
-            cut_flags(d.format, asked, d.flags);
-        }
-    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && takes_clear_value(d.flags)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2944,6 +2878,21 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn a_clear_value_goes_only_to_a_target() {
+        // CreateCommittedResource refuses a clear value on a texture that is
+        // neither a render target nor a depth target: the title passes one
+        // for every texture it fills, and those creates came back
+        // E_INVALIDARG (the console ignores the pointer).
+        assert!(!takes_clear_value(0));
+        assert!(!takes_clear_value(4)); // unordered access only
+        assert!(!takes_clear_value(8 | 4)); // no shader access
+        assert!(takes_clear_value(1)); // render target
+        assert!(takes_clear_value(2)); // depth
+        assert!(takes_clear_value(1 | 4));
+        assert!(takes_clear_value(2 | 8));
     }
 
     #[test]

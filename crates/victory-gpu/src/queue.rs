@@ -800,6 +800,8 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    note_planes(frame, planes, plane_parameters);
     commands_line();
     // The run's frame count, for the `STOP` block: a count of a static, so a
     // path that ends the process elsewhere still has it.
@@ -864,6 +866,38 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Diagnostics: what the title's own present call names, every frame that
+/// is a power of two: each plane, its resources, and the size and format of
+/// the first. Our window shows the first plane's first resource, so a frame
+/// whose other planes hold the scene reads as black here.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_planes(frame: u64, planes: u32, parameters: *const Plane) {
+    if !frame.is_power_of_two() || parameters.is_null() || planes == 0 {
+        return;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let planes = unsafe { std::slice::from_raw_parts(parameters, planes as usize) };
+    let mut said = Vec::new();
+    for (i, plane) in planes.iter().enumerate() {
+        let mut first = String::from("none");
+        if plane.count > 0 && !plane.resources.is_null() {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if let Some(host) = crate::resource::host_resource(resource) {
+                // SAFETY: a live resource.
+                let d = unsafe { host.GetDesc() };
+                first = format!("{}x{} f{}", d.Width, d.Height, d.Format.0);
+            }
+        }
+        said.push(format!("{i}: {first} of {}", plane.count));
+    }
+    tracing::info!(
+        frame,
+        planes = %said.join(", "),
+        "what the present names"
+    );
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
