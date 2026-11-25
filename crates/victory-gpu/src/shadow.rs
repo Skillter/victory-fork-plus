@@ -55,6 +55,13 @@ pub(crate) struct Shadow {
     /// them. A hint (the compare decides), joined as ranges ([`Held`]) and
     /// cut back where that compare finds the title wrote the bytes itself.
     backed: Mutex<Held>,
+    /// Room to read title memory into to compare it with the copy
+    /// ([`Shadow::copy_unless_there`]), kept from refresh to refresh: a
+    /// fresh buffer each time was an allocation and a zeroing of it every
+    /// refresh, for ranges that do not change width much. Grown to the
+    /// widest range compared, up to [`SCRATCH_KEEP`]; a wider range reads
+    /// into a buffer of its own, which is not kept.
+    scratch: Mutex<Vec<u8>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -1137,6 +1144,173 @@ mod backed_tests {
         assert_eq!(shadow.copy_unless_there(from, to, &mut scratch), 0);
         assert!(shadow.backed(from, to), "still ours: compared, not copied");
     }
+
+    /// A copy of `pages` 64 KiB pages over `title`'s bytes, with the copy's
+    /// title address on a page boundary (a refresh's pages are the kernel's,
+    /// not the buffer's): `(shadow, k)`, where the bytes the copy's address
+    /// names start at `title[k]`. `title` needs room for `pages + 1` pages.
+    fn copy_pages(title: &mut Vec<u8>, data: &mut Vec<u8>, pages: usize) -> (Shadow, usize) {
+        use windows::core::Interface;
+        *title = vec![0x11u8; (pages + 1) * PAGE];
+        *data = vec![0x11u8; pages * PAGE];
+        let base = (title.as_ptr() as usize).div_ceil(PAGE) * PAGE;
+        let k = base - title.as_ptr() as usize;
+        // SAFETY: as `copy_over`: a buffer interface with nothing behind it,
+        // in a copy that is never dropped.
+        let buffer = unsafe { ID3D12Resource::from_raw(std::ptr::NonNull::dangling().as_ptr()) };
+        (Shadow::new(buffer, data.as_mut_ptr(), 0, base as u64, (pages * PAGE) as u64), k)
+    }
+
+    /// Pages held whole are one asking about the range (`copy_stale` asks the
+    /// set once where it holds the range whole) and are then taken page by
+    /// page: the page the title wrote is copied up and let go, its
+    /// neighbours stay held, and the range as a whole is no longer held
+    /// (the hole the let-go left).
+    #[test]
+    fn a_range_held_whole_is_let_go_one_page_at_a_time() {
+        let (mut title, mut data) = (Vec::new(), Vec::new());
+        // SAFETY: never dropped: no object stands behind its buffer.
+        let (shadow, k) = copy_pages(&mut title, &mut data, 3);
+        let shadow = std::mem::ManuallyDrop::new(shadow);
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let page = from / PAGE;
+        shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        // All three pages are the copy's bytes: compared, none copied.
+        assert_eq!(shadow.copy_stale(from, to, 1, &[]), 0);
+        assert!(shadow.backed(from, to), "the range is held whole");
+        // The title writes its own bytes into the middle page.
+        title[k + PAGE..k + 2 * PAGE].fill(0x33);
+        assert_eq!(
+            shadow.copy_stale(from, to, 3, &[(page + 1, 3)]),
+            PAGE,
+            "only the title's page is copied up"
+        );
+        let bad = data[PAGE..2 * PAGE]
+            .iter()
+            .zip(&title[k + PAGE..k + 2 * PAGE])
+            .position(|(a, b)| a != b);
+        assert_eq!(bad, None, "the copy diffs from the title at this offset of the page");
+        assert!(!shadow.backed((page + 1) * PAGE, (page + 2) * PAGE), "that page is the title's");
+        assert!(shadow.backed(page * PAGE, (page + 1) * PAGE), "the neighbours stay held");
+        assert!(shadow.backed((page + 2) * PAGE, (page + 3) * PAGE), "the neighbours stay held");
+        // A hole: the range is no longer held whole, and each page is asked
+        // about on its own from here (the first page is still the copy's).
+        assert!(!shadow.backed(from, to), "a page of it was let go");
+        assert_eq!(shadow.copy_stale(from, to, 5, &[(page, 5)]), 0);
+        assert!(shadow.backed(page * PAGE, (page + 1) * PAGE), "compared, not copied");
+    }
+
+    /// Room to read title memory into for the compare is kept from refresh to
+    /// refresh (it was an allocation and a zeroing of it every refresh), and
+    /// a range wider than `SCRATCH_KEEP` reads into a buffer of its own
+    /// rather than growing the kept one.
+    #[test]
+    fn the_room_the_compare_reads_into_is_kept_and_bounded() {
+        let (mut title, mut data) = (Vec::new(), Vec::new());
+        // SAFETY: never dropped: no object stands behind its buffer.
+        let (shadow, _) = copy_pages(&mut title, &mut data, 20);
+        let shadow = std::mem::ManuallyDrop::new(shadow);
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let page = from / PAGE;
+        shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        let room = || {
+            let room = shadow.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (room.len(), room.capacity())
+        };
+        // Three pages compared: the room grows to them and is kept.
+        assert_eq!(shadow.copy_stale(from, from + 3 * PAGE, 1, &[]), 0);
+        let (len, capacity) = room();
+        assert!(len >= 3 * PAGE && capacity >= 3 * PAGE, "kept for the next refresh");
+        // The rest of the buffer, wider than the kept room: a buffer of its
+        // own, the kept one untouched.
+        assert_eq!(shadow.copy_stale(from, to, 2, &[]), 0);
+        assert_eq!(room(), (len, capacity), "a wide range does not grow the kept room");
+        // Compared again: the same room, no allocation.
+        assert_eq!(shadow.copy_stale(from, from + 3 * PAGE, 3, &[(page, 3)]), 0);
+        assert_eq!(room().1, capacity, "no allocation for a range the room takes");
+    }
+
+    /// Not a test: what a refresh's read costs the ways it can be read, and
+    /// the kept room against a fresh buffer per refresh. `cargo test -p
+    /// victory-gpu --lib -- --ignored --nocapture timing` on this machine.
+    #[test]
+    #[ignore]
+    fn timing() {
+        const ROUNDS: usize = 200;
+        const WIDE: usize = 1 << 20;
+        let (mut title, mut data) = (Vec::new(), Vec::new());
+        // SAFETY: never dropped: no object stands behind its buffer.
+        let (shadow, _) = copy_pages(&mut title, &mut data, 20);
+        let shadow = std::mem::ManuallyDrop::new(shadow);
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let mut room = vec![0u8; WIDE];
+        // One MiB read tile, the three ways.
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            assert!(crate::host::read_into(from as *const u8, &mut room));
+        }
+        let kernel = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let Some(_mapped) = crate::watch::title_memory_reading_now() else { continue };
+            assert!(crate::texture::committed(from as *const u8, WIDE));
+            // SAFETY: mapped, under the guard.
+            unsafe { std::ptr::copy_nonoverlapping(from as *const u8, room.as_mut_ptr(), WIDE) };
+        }
+        let in_place = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let Some(_mapped) = crate::watch::title_memory_reading_now() else { continue };
+            assert!(crate::texture::committed(from as *const u8, WIDE));
+        }
+        let ask = started.elapsed();
+        println!(
+            "1 MiB x{ROUNDS}: kernel {:?}, guard+ask+in place {:?} (asks alone {:?})",
+            kernel, in_place, ask
+        );
+        // The same over one 64 KiB piece and over one 4 KiB page: the sizes a
+        // refresh's copies come in.
+        for (size, times) in [(PAGE, 2000), (4096, 4000)] {
+            let mut small = vec![0u8; size];
+            let started = std::time::Instant::now();
+            for _ in 0..times {
+                assert!(crate::host::read_into(from as *const u8, &mut small));
+            }
+            let kernel = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..times {
+                let Some(_mapped) = crate::watch::title_memory_reading_now() else { continue };
+                assert!(crate::texture::committed(from as *const u8, size));
+                // SAFETY: mapped, under the guard.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, small.as_mut_ptr(), size) };
+            }
+            let in_place = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..times {
+                assert!(crate::watch::title_memory_reading_now().is_some());
+            }
+            println!(
+                "{size} B x{times}: kernel {kernel:?}, guard+ask+in place {in_place:?} (guard alone {:?})",
+                started.elapsed()
+            );
+        }
+        // A refresh of a held range: room kept, against a buffer of its own
+        // per refresh (the shape before).
+        let page = from / PAGE;
+        shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        let started = std::time::Instant::now();
+        for i in 0..ROUNDS {
+            let now = 2 * i as u64 + 1;
+            shadow.copy_stale(from, to, now, &[(page, now)]);
+        }
+        let kept = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let mut own = vec![0u8; to - from];
+            shadow.copy_unless_there(from, to, &mut own);
+        }
+        println!("refresh of {} KiB x{ROUNDS}: room kept {:?}, a buffer of its own {:?}", (to - from) / 1024, kept, started.elapsed());
+    }
 }
 
 #[cfg(test)]
@@ -1457,6 +1631,10 @@ mod difference_tests {
 
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
+
+/// The widest room a copy keeps to read title memory into before comparing
+/// it with its own bytes ([`Shadow::scratch`]).
+const SCRATCH_KEEP: usize = 1 << 20;
 
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
@@ -2372,6 +2550,7 @@ impl Shadow {
             flights: Mutex::default(),
             before: Mutex::default(),
             backed: Mutex::default(),
+            scratch: Mutex::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -3088,7 +3267,13 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
-        let mut scratch: Vec<u8> = Vec::new();
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        // One asking about the whole range, before the pages: where no
+        // shader wrote (the usual case: `update_free` is called for the
+        // ranges nothing declared) the set is empty and one walk of it says
+        // so for every page, and a set that holds the range whole holds
+        // each page of it, so those pages ask nothing more.
+        let all_ours = self.backed(from, to);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3109,7 +3294,8 @@ impl Shadow {
                 // Runs are cut where the bytes stop being ones we put into
                 // title memory ourselves: those are read and compared before
                 // they are copied (`copy_unless_there`).
-                let ours = self.backed((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                let ours = all_ours
+                    || self.backed((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
                 match run {
                     Some((_, was)) if was == ours => {}
                     Some((first, was)) => {
@@ -3165,16 +3351,29 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
-        scratch.clear();
-        scratch.resize(n, 0);
+        // The room kept ([`Shadow::scratch`]) is grown, never cleared: the
+        // read fills the `n` bytes used next, so a refresh that compares
+        // what the last one compared neither allocates nor zeroes. A range
+        // wider than the kept room reads into a buffer of its own, which
+        // is not kept: a 4 MiB run per frame is not worth 4 MiB of RAM for
+        // good.
+        let mut own = Vec::new();
+        let room = if n > SCRATCH_KEEP { &mut own } else { scratch };
+        if room.len() < n {
+            room.resize(n, 0);
+        }
+        let room = &mut room[..n];
         // Title memory not there: copied as it always was (the read fails
-        // and the copy's own read will say so too).
-        if !crate::host::read_into(from as *const u8, scratch) {
+        // and the copy's own read will say so too). Read in place where it
+        // can be (`read_in_place`), through the kernel otherwise.
+        if !self.read_in_place(from, room.as_mut_ptr(), n)
+            && !crate::host::read_into(from as *const u8, room)
+        {
             return self.copy(from, to);
         }
         // SAFETY: inside the copy's mapping.
         let here = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        if here == &scratch[..] {
+        if here == &room[..] {
             BACK_CLASS[11].fetch_add(1, Ordering::Relaxed);
             BACK_CLASS[12].fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3188,7 +3387,7 @@ impl Shadow {
         }
         // SAFETY: the buffer was just filled with `n` bytes of title
         // memory, and `n` bytes of the mapping follow `self.data + from`.
-        unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), self.data.add(from - start), n) };
+        unsafe { std::ptr::copy_nonoverlapping(room.as_ptr(), self.data.add(from - start), n) };
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         // Title memory holds other bytes than the ones put there: the title
@@ -3205,13 +3404,57 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if !self.read_in_place(from, at, to - from) {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// Reads title memory `[from, from + len)` into `at`, in place: a plain
+    /// copy under the guard that stops the runtime changing what title memory
+    /// shows ([`crate::watch::title_memory_reading`], the one a texture
+    /// refresh reads under), once every page of the range is found mapped
+    /// ([`crate::texture::committed`]: the state of each page, no walk of the
+    /// region around it). False where it cannot be read so — a page that is
+    /// not there, or the runtime changing mappings right now — and the caller
+    /// reads through the kernel instead ([`crate::host::copy_mapped`], which
+    /// stands a page that is not there in with zeros, as before).
+    fn read_in_place(&self, from: usize, at: *mut u8, len: usize) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            // `plain` (copy without the guard) and `none` (copy nothing) are
+            // timing switches, and both are `copy_mapped`'s to honour.
+            return false;
+        }
+        // Held until the read is done: the runtime changes what title memory
+        // shows only with this taken alone, so a page `committed` finds
+        // mapped stays mapped (see `crate::watch::title_memory_reading`).
+        let Some(_mapped) = crate::watch::title_memory_reading_now() else {
+            return false;
+        };
+        if !crate::texture::committed(from as *const u8, len) {
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: every page of the range was found mapped, and no mapping
+        // of title memory changes while the guard is held.
+        unsafe { std::ptr::copy_nonoverlapping(from as *const u8, at, len) };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::InPlace, len as u64);
+            add(C::InPlaceUs, started.elapsed().as_micros() as u64);
+        }
+        true
     }
 
     /// Whether shaders read and write this copy in the card's own memory
