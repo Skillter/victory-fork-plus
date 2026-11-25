@@ -395,6 +395,19 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// How value `v` is computed, where a binary operation computes it: the
+    /// tests read the index a table read goes by out of this.
+    #[cfg(test)]
+    pub fn bin_of(&self, v: V) -> Option<(Bin, V, V)> {
+        match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Bin(b, a, c) => Some((*b, *a, *c)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
