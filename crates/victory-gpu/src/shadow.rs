@@ -2021,6 +2021,7 @@ pub(crate) fn let_go_idle() {
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
+        changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -3170,6 +3171,31 @@ impl Shadow {
     }
 }
 
+/// Which answer the registry of copies ([`find`], [`find_any`]) gives, as a
+/// number: bumped whenever an entry is added or removed, and when the
+/// runtime changes what title memory shows
+/// ([`crate::watch::title_memory_remapped`]).
+///
+/// A cache of the registry's answers tags each answer with this number and
+/// uses it only while the number still holds: title memory remapped under
+/// the same addresses, or an entry added or let go, can make the same title
+/// address name another copy. [`crate::draw`]'s per-list copies are such a
+/// cache.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// The registry's revision ([`REVISION`]). One relaxed load: cheap enough
+/// to read per ask, and cheap enough that a hit needs no lock.
+pub(crate) fn revision() -> u64 {
+    REVISION.load(Ordering::Relaxed)
+}
+
+/// The registry changed what it would answer: an entry was added or
+/// removed, or what title memory shows is new ([`REVISION`]). A cache of
+/// the registry's answers must ask again.
+pub(crate) fn changed() {
+    REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -3191,11 +3217,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // An address may belong to another buffer from now on.
+    changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if buffers().remove(&(start, resource)).is_some() {
+        changed();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3236,6 +3266,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3310,6 +3343,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            changed();
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -3357,6 +3391,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
+        changed();
     }
     entry.shadow.clone()
 }
@@ -3531,6 +3566,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -3567,6 +3603,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    changed();
     Some(shadow)
 }
 

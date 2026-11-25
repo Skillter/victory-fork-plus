@@ -773,6 +773,9 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Answers of the registry of host copies are answers by address, and
+    // what an address holds is new (`crate::shadow::revision`).
+    crate::shadow::changed();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
