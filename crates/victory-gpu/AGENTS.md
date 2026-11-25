@@ -91,14 +91,22 @@
   `draw::rectangles` marks the vertex buffers unknown (it sets its own). A
   draw therefore emits its pipeline switches, its live root arguments and one
   draw; what else it emits is a redundancy `draw` counts (see Diagnostics).
+- The view heap's size is probed, not assumed: `descriptor::host::probe_view_limit`
+  asks for `UNCAPPED_VIEWS` (2^21), then `WANTED_VIEWS` (the title's 1,245,184
+  + the ring + the null slot), then the 1,000,000 tiers 1 and 2 cap; the null
+  slot is the last one, inside the heap the card made.
 - The capped heap points past-the-end reads at a null slot for a reason: a
-  real read past the heap end hung an NVIDIA GPU.
+  real read past the heap end hung an NVIDIA GPU. Below the cap, the ring sits
+  at the title's last slots (`HostHeap::reserve`), so a title index in that band
+  reads a live table's descriptor, not the null slot.
 - A buffer view of no elements is the console's for the rest of its buffer:
   `descriptor::host::view_count` works the length out and
-  `descriptor::host::buffer_copy` refreshes and writes back that rest. A view
-  left null reads as zeros. A view of no elements of a buffer that declares no
-  bytes has no rest: it stays null as `Refused::NoLength`, apart from a view of
-  no elements of another dimension (`Refused::NoElements`).
+  `descriptor::host::buffer_copy` refreshes and writes back that rest. The rest
+  ends where the title's declared bytes do, or at the end of the host copy when
+  the title declared none (a placed buffer described none wide). A view left
+  null reads as zeros. Only a host copy of no bytes has no rest: it stays null
+  as `Refused::NoLength`, apart from a view of no elements of another dimension
+  (`Refused::NoElements`).
 - A view the host still refuses is counted per reason and logged once with its
   reason and its buffer (`descriptor::host::refused_census`).
 - A shader that picks a buffer from a view heap by an index it computes reads

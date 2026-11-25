@@ -559,6 +559,19 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// The most views the retail title has been seen to ask for: its heap of
+/// 1,245,184 (run 2026-11-25 15:30), past a host capped at
+/// [`PORTABLE_VIEWS`], which left 507,329 of its slots unserved.
+const TITLE_VIEWS: u32 = 1_245_184;
+
+/// The views a host heap must hold to serve every slot [`TITLE_VIEWS`]
+/// names: the title's own, the ring's past them, and the null slot at the
+/// end. 1,507,329 slots of 32 bytes are 48.2 MB of descriptor memory, 16.2
+/// more than a heap capped at [`PORTABLE_VIEWS`]; a host that took 1,507,328
+/// descriptors before the null slot was added (this card, run 11) takes it,
+/// and one that does not falls back to the cap.
+const WANTED_VIEWS: u32 = TITLE_VIEWS + DYNAMIC + 1;
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -587,15 +600,34 @@ pub(crate) fn probe_view_limit() {
                         NodeMask: 0,
                     })
             };
+            if let Err(e) = &made {
+                // Which size the card refuses, and in its own words: the
+                // probe's fallback is the next size down.
+                tracing::info!(count, error = %e, "a view heap of {count} views is not made");
+            }
             made.is_ok()
         };
         let views = if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
+        } else if fits(WANTED_VIEWS) {
+            // The card takes what the title asks for, and no more: one power
+            // of two below the aim is not the answer, since 1,245,184 title
+            // slots fit under it while a heap of 2^21 does not.
+            WANTED_VIEWS
         } else {
             PORTABLE_VIEWS
         };
+        let step = u64::from(
+            // SAFETY: a live device.
+            unsafe {
+                host.device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            },
+        );
         tracing::info!(
             views,
+            bytes = u64::from(views) * step,
+            step,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
@@ -666,9 +698,17 @@ impl HostHeap {
             let fitted = if count + extra <= null {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                // shortcut: descriptors past the host's limit are left out; a
+                // title that reaches them needs remapping. The slots the ring
+                // covers read a live table of some draw's, which is not the
+                // null slot the others read: `mirror` names the highest index
+                // the title asked for.
+                let band = size - (null - extra);
+                let nulled = count.saturating_sub(null);
+                tracing::warn!(
+                    count,
+                    "host view heap capped at {size}; {band} title slots the ring covers read a live table, and {nulled} past {null} read a null slot"
+                );
                 null - extra
             };
             match make(size) {
@@ -2175,8 +2215,8 @@ enum Refused {
     /// No elements, and a descriptor of a dimension that is not a buffer's:
     /// the host has no buffer to work an element of.
     NoElements,
-    /// No elements, and the buffer it is of declares no bytes: there is no
-    /// rest of it to read.
+    /// No elements, and the host copy the view is of declares no bytes: there
+    /// is no rest of it to read.
     NoLength,
     /// A raw view that is not R32 typeless without a stride.
     RawShape,
@@ -2287,9 +2327,13 @@ fn buffer_element(format: DXGI_FORMAT, stride: u32, raw: bool) -> Result<u64, Re
 /// removes the device for one), and one left null reads as zeros where the
 /// title's buffer is (`null_for`), so the length is worked out instead:
 /// from `first` to the end of the buffer, which lies `offset` bytes into a
-/// host copy of `width` and is `len` bytes long. `None` if nothing is left.
+/// host copy `width` bytes wide. `len` is the bytes the title declares its
+/// buffer; a placed buffer the title describes none wide (run 2026-11-25
+/// 15:30: `of the buffer 0x3f07b080+0`, its copy 182,452,224 bytes) declares
+/// none, and the copy is then the only end there is. `None` if nothing is
+/// left.
 fn elements_left(first: u64, element: u64, offset: u64, len: u64, width: u64) -> Option<u32> {
-    let end = offset.saturating_add(len).min(width);
+    let end = if len == 0 { width } else { offset.saturating_add(len).min(width) };
     let bytes = end.checked_sub(first.checked_mul(element)?)?;
     // A view of more than a u32 of elements covers all the host can name.
     (bytes >= element).then(|| u32::try_from(bytes / element).unwrap_or(u32::MAX))
@@ -2303,9 +2347,8 @@ fn elements_left(first: u64, element: u64, offset: u64, len: u64, width: u64) ->
 /// in, `len` bytes of a buffer, `width` bytes wide.
 ///
 /// `Err` where there is nothing to work the rest out from and the view stays
-/// null for a reason of its own: a buffer that declares no bytes (a placed
-/// buffer the title described none wide, run 2026-11-25 05:53) has no rest,
-/// and a view that begins past its buffer's end has none either.
+/// null for a reason of its own: a host copy of no bytes at all has no rest,
+/// and a view that begins past its copy's end has none either.
 #[allow(clippy::too_many_arguments)]
 fn view_count(
     buffer: bool,
@@ -2327,7 +2370,7 @@ fn view_count(
     };
     match elements_left(first, element, offset, len, width) {
         Some(left) => Ok(left),
-        None if len == 0 => Err(Refused::NoLength),
+        None if width == 0 => Err(Refused::NoLength),
         None => Err(Refused::PastTheEnd),
     }
 }
@@ -2443,8 +2486,8 @@ fn buffer_srv(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     // A view of no elements is the console's for the rest of its buffer (see
-    // `elements_left`); one of a buffer that declares no bytes has no rest,
-    // and stays null for that reason of its own.
+    // `elements_left`); a host copy of no bytes has no rest, and the view
+    // stays null for that reason of its own.
     let count = match view_count(
         desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER,
         desc.Format,
@@ -2459,7 +2502,7 @@ fn buffer_srv(
         Ok(count) => count,
         Err(why) => {
             // The console's "no elements is the rest of its buffer" has no
-            // rest to give here: the buffer declares no bytes, or the view
+            // rest to give here: the copy declares no bytes, or the view
             // begins past its end.
             buffer.NumElements = 0;
             refused(why, false, desc.Format, first, 0, stride, raw, width, (address, len));
@@ -2539,8 +2582,8 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     // A view of no elements is the console's for the rest of its buffer (see
-    // `elements_left`); one of a buffer that declares no bytes has no rest,
-    // and stays null for that reason of its own.
+    // `elements_left`); a host copy of no bytes has no rest, and the view
+    // stays null for that reason of its own.
     let count = match view_count(
         desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
         desc.Format,
@@ -2555,7 +2598,7 @@ fn buffer_uav(
         Ok(count) => count,
         Err(why) => {
             // The console's "no elements is the rest of its buffer" has no
-            // rest to give here: the buffer declares no bytes, or the view
+            // rest to give here: the copy declares no bytes, or the view
             // begins past its end.
             buffer.NumElements = 0;
             refused(why, true, desc.Format, first, 0, stride, raw, width, (address, len));
@@ -3741,6 +3784,63 @@ mod tests {
         assert_eq!(count(true, 0, 0, 0, 0, 0), Err(Refused::NoLength));
         // A structured view counts elements of its stride.
         assert_eq!(elements_left(0, 32, 0, 1_048_576, 1_048_576), Some(32_768));
+    }
+
+    /// A view of no elements of a buffer the title declares no bytes wide,
+    /// of which the host holds a copy that is whole (a placed heap: `of the
+    /// buffer 0x3f07b080+0` with a copy 182,452,224 bytes wide, run
+    /// 2026-11-25 15:30), reads the rest of that copy; only a copy of no
+    /// bytes at all has no rest.
+    #[test]
+    fn a_view_of_none_of_a_buffer_declared_none_wide_reads_the_rest_of_its_copy() {
+        let count = |first, offset, len, width| {
+            view_count(true, DXGI_FORMAT_R32_TYPELESS, first, 0, 0, true, offset, len, width)
+        };
+        // The log's line: `format=39 first=10688960 count=0 stride=0 raw=true
+        // width=182452224, of the buffer 0x3f07b080+0`.
+        assert_eq!(count(10_688_960, 0, 0, 182_452_224), Ok(34_924_096));
+        // 42,755,840 bytes in, 139,696,384 to the copy's end: the host takes it.
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 10_688_960, 34_924_096, 0, true, 182_452_224),
+            Ok(())
+        );
+        // `first` counts from the copy's start (`buffer_srv` adds the copy's
+        // offset to it in dwords, `raw_window` likewise): a view 4,000,000
+        // bytes into the copy has 44,613,056 dwords to its end.
+        assert_eq!(count(1_000_000, 4_096, 0, 182_452_224), Ok(44_613_056));
+        // From the copy's last dword: one left; from its end: no rest to read.
+        assert_eq!(count(45_613_055, 0, 0, 182_452_224), Ok(1));
+        assert_eq!(count(45_613_056, 0, 0, 182_452_224), Err(Refused::PastTheEnd));
+        // A copy that declares no bytes has no rest, and is named apart.
+        assert_eq!(count(0, 0, 0, 0), Err(Refused::NoLength));
+        // A view of some elements is not touched by this: it keeps its count.
+        assert_eq!(
+            view_count(true, DXGI_FORMAT_R32_TYPELESS, 10_688_960, 32, 0, true, 0, 0, 182_452_224),
+            Ok(32)
+        );
+    }
+
+    /// The sizes the host probes hold the title's views, the ring and the
+    /// null slot; a heap capped at [`PORTABLE_VIEWS`] holds neither, and the
+    /// slots it leaves out are the ring's own band.
+    #[test]
+    fn the_probed_view_counts_hold_the_title_the_ring_and_the_null_slot() {
+        // The probe's ladder, in the order `probe_view_limit` tries it: the
+        // aim holds what the title asks for, which holds the ring and the
+        // null slot.
+        const { assert!(WANTED_VIEWS <= UNCAPPED_VIEWS, "the aim holds every wanted slot") };
+        assert_eq!(WANTED_VIEWS, TITLE_VIEWS + DYNAMIC + 1);
+        // Every slot the title asks for is below the ring, and the ring below
+        // the null slot: `HostHeap::new` serves the title's whole count.
+        const { assert!(TITLE_VIEWS + DYNAMIC < WANTED_VIEWS) };
+        // The capped heap: 1,000,000 slots, the null slot at 999,999, and the
+        // ring takes the 262,144 title slots between it and the title's own
+        // 737,855: the band a title index in it reads is a live table's.
+        let fitted = PORTABLE_VIEWS - 1 - DYNAMIC;
+        assert_eq!(fitted, 737_855);
+        assert_eq!(PORTABLE_VIEWS - fitted, DYNAMIC + 1);
+        // 507,329 of the title's 1,245,184 slots are served by neither.
+        assert_eq!(TITLE_VIEWS - fitted, 507_329);
     }
 
     /// Every reason is counted and logged apart from the others, and the
