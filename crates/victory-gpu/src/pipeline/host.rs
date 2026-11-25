@@ -479,13 +479,49 @@ const PSV_MESH: u8 = 13;
 struct Psv0 {
     stage: u8,
     threads: [u32; 3],
+    /// Mesh: the counts the program declares (`max_vertices`,
+    /// `max_primitives`), which `emit::lower`'s `mesh_prologue` sets every
+    /// group's counts to.
+    declared: (u32, u32),
     bindings: Vec<(u32, u32, u32)>,
+}
+
+/// What the mesh pipelines made so far declare, so a frame can price the
+/// outputs our translation promises for every group it dispatches: the
+/// groups a frame dispatched (counted on the card, `MESH_GROUPS`) times the
+/// vertices and primitives each group declares. Every mesh program the
+/// title ships declares the same pair, so the pair is kept as the smallest
+/// one seen and the third word says 1 when any pipeline declared another
+/// (the frame line then says "at most").
+static MESH_DECLARED: [AtomicU64; 3] = [const { AtomicU64::new(u64::MAX) }; 3];
+
+/// Notes one mesh pipeline's declared counts ([`MESH_DECLARED`]).
+fn note_mesh_declared(max_vertices: u32, max_primitives: u32) {
+    let [v, p] = [max_vertices, max_primitives].map(u64::from);
+    let seen = MESH_DECLARED[0].fetch_min(v, Ordering::Relaxed);
+    MESH_DECLARED[1].fetch_min(p, Ordering::Relaxed);
+    if seen != u64::MAX && (seen != v || MESH_DECLARED[1].load(Ordering::Relaxed) != p) {
+        MESH_DECLARED[2].store(1, Ordering::Relaxed);
+    }
+}
+
+/// The declared mesh counts a frame's groups each promise, and whether the
+/// pipelines made so far disagreed about them (`None` before any is made).
+pub(crate) fn mesh_declared() -> Option<((u64, u64), bool)> {
+    let (v, p) = (MESH_DECLARED[0].load(Ordering::Relaxed), MESH_DECLARED[1].load(Ordering::Relaxed));
+    (v != u64::MAX).then(|| ((v, p), MESH_DECLARED[2].load(Ordering::Relaxed) != 0))
 }
 
 /// A little-endian word of `data`, when it holds one.
 fn word(data: &[u8], at: usize) -> Option<u32> {
     data.get(at..at + 4)
         .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")))
+}
+
+/// A little-endian halfword of `data`, when it holds one.
+fn half(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..at + 2)
+        .map(|b| u32::from(u16::from_le_bytes(b.try_into().expect("two bytes"))))
 }
 
 /// Reads `PSV0`: a size for its runtime info, that info, then the bindings
@@ -505,6 +541,15 @@ fn psv0(data: &[u8]) -> Result<Psv0, String> {
     for (k, at) in [36, 40, 44].into_iter().enumerate() {
         threads[k] = word(data, 4 + at).ok_or("its PSV0 runtime info is truncated")?;
     }
+    // Mesh runtime info: the declared counts, 16 bits each (`emit::container`).
+    let declared = if stage == PSV_MESH {
+        match (half(data, 4 + 12), half(data, 4 + 14)) {
+            (Some(v), Some(p)) => (v, p),
+            _ => return Err("its PSV0 runtime info is truncated".to_owned()),
+        }
+    } else {
+        (0, 0)
+    };
     let mut bindings = Vec::new();
     let at = 4 + info;
     if let Some(count) = word(data, at) {
@@ -533,6 +578,7 @@ fn psv0(data: &[u8]) -> Result<Psv0, String> {
     Ok(Psv0 {
         stage,
         threads,
+        declared,
         bindings,
     })
 }
@@ -735,6 +781,9 @@ fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
                         "its PSV0 declares stage {} where the pipeline is stage {stage}",
                         psv.stage
                     ));
+                }
+                if psv.stage == PSV_MESH {
+                    note_mesh_declared(psv.declared.0, psv.declared.1);
                 }
                 if threads && psv.threads.contains(&0) {
                     facts.causes.push(format!(
@@ -2111,6 +2160,29 @@ mod tests {
             root_uavs: uavs.to_vec(),
             root_indexed_views: Vec::new(),
         }
+    }
+
+    /// A mesh `PSV0` names its thread group and the counts it declares, which
+    /// are what `emit::lower`'s `mesh_prologue` sets every group's counts to
+    /// (`MESH_DECLARED` prices a frame's promised outputs with them).
+    #[test]
+    fn a_mesh_psv0_declares_its_counts_and_thread_group() {
+        let mut bytes = psv0_bytes(PSV_MESH, [128, 1, 1], &[]);
+        // The declared counts follow the group-shared bytes, 16 bits each.
+        bytes[4 + 12..4 + 14].copy_from_slice(&128u16.to_le_bytes());
+        bytes[4 + 14..4 + 16].copy_from_slice(&96u16.to_le_bytes());
+        let psv = psv0(&bytes).expect("a mesh PSV0");
+        assert_eq!(psv.stage, PSV_MESH);
+        assert_eq!(psv.threads, [128, 1, 1]);
+        assert_eq!(psv.declared, (128, 96), "its counts");
+        // A stage that is not mesh declares none, whatever its bytes hold.
+        let other = psv0(&{
+            let mut bytes = psv0_bytes(PSV_COMPUTE, [8, 8, 1], &[]);
+            bytes[4 + 12..4 + 14].copy_from_slice(&64u16.to_le_bytes());
+            bytes
+        })
+        .expect("a compute PSV0");
+        assert_eq!(other.declared, (0, 0), "a compute shader declares no counts");
     }
 
     /// A compute refusal names the fields it read and the values of the bytes
