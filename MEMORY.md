@@ -34,7 +34,7 @@ Two directories hold all derived state, both outside `<repo>`: `<cache-dir>`
     <cache-dir>/pipelines/   host-pipelines.bin, early-pipelines.txt
     <cache-dir>/images/      prepared copies of the title's images
     <data-dir>/<title-id>/  saves, settings, crashes.log, temp
-    <data-dir>/logs/         run.log from `victory run`, if no VICTORY_LOG_FILE
+    <data-dir>/logs/         run-<YYYYMMDD>-<HHMMSS>.log from `victory run`
     <data-dir>/capture/      captured frames
     <data-dir>/world*/       frame dumps from earlier sessions
     <data-dir>/agility/      unpacked Agility SDK, if you keep one there
@@ -141,8 +141,8 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 Log destination. `VICTORY_LOG_FILE=<path>` writes the log to that file in
 addition to stderr. `VICTORY_LOG_FILE=0` (or `off`) disables the file copy, so
 the log is stderr only. When the variable is unset, `victory run` logs to
-`<data-dir>/logs/run.log`, truncated at the start of each run, and every other
-command logs to stderr only. If the data directory cannot hold the file (asset
+`<data-dir>/logs/run-<YYYYMMDD>-<HHMMSS>.log` (UTC, one file per run, so no
+run overwrites another), and every other command logs to stderr only. If the data directory cannot hold the file (asset
 policy, permissions), the run falls back to stderr instead of refusing to
 start. A capture that must survive a closed window is therefore
 `VICTORY_LOG_FILE=<path> target\release\victory.exe run ...`; a relative value

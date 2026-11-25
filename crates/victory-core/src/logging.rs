@@ -41,8 +41,9 @@ pub fn init_stderr(default_level: &str) {
     install(default_level, None);
 }
 
-/// Logging for `run`, which knows its data directory by now: stderr, plus
-/// `<log_dir>/run.log` unless `VICTORY_LOG_FILE` says otherwise.
+/// Logging for `run`, which knows its data directory by now: stderr, plus a
+/// `<log_dir>/run-<UTC date>-<UTC time>.log` of its own unless `VICTORY_LOG_FILE`
+/// says otherwise.
 pub fn init_run(default_level: &str, log_dir: &Path) {
     install(
         default_level,
@@ -57,15 +58,57 @@ fn override_path() -> Option<std::ffi::OsString> {
 
 /// Where the file layer writes, or `None` for stderr alone.
 ///
-/// Kept free of the environment and the filesystem so the rules stay
-/// testable: the override wins, `0` and `off` mean "no file at all", and
-/// only a command that supplies `log_dir` gets a default.
+/// Kept free of the filesystem so the rules stay testable: the override wins,
+/// `0` and `off` mean "no file at all", and only a command that supplies
+/// `log_dir` gets a default. The default carries the start time, so a second
+/// run never overwrites the log of the one before it.
 fn log_target(spec: Option<&OsStr>, log_dir: Option<&Path>) -> Option<PathBuf> {
     match spec {
         Some(s) if s.eq_ignore_ascii_case("off") || s == "0" => None,
         Some(s) => Some(PathBuf::from(s)),
-        None => log_dir.map(|dir| dir.join("run.log")),
+        None => log_dir.map(|dir| {
+            dir.join(format!(
+                "run-{}.log",
+                utc_stamp(std::time::SystemTime::now())
+            ))
+        }),
     }
+}
+
+/// `YYYYMMDD-HHMMSS` in UTC, matching the timestamps inside the file.
+fn utc_stamp(now: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        rest / 3_600,
+        rest / 60 % 60,
+        rest % 60
+    )
+}
+
+/// Days since the Unix epoch to a proleptic Gregorian date (Hinnant's
+/// `civil_from_days`), so the filename needs no calendar crate.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Installs the process-wide subscriber: the stderr layer both callers
@@ -101,9 +144,9 @@ fn install(default_level: &str, target: Option<PathBuf>) {
     }
 }
 
-/// Opens `path` for this process only, truncating whatever a previous run
-/// left there: one bounded file per run is the whole retention policy, so
-/// the user never has to curate a log directory.
+/// Opens `path` for this process only. Each run writes its own timestamped
+/// file, so the truncation here only guards two runs that start in the same
+/// second; there is no separate retention policy.
 fn open(path: &Path) -> Option<Shared> {
     let result = path
         .parent()
@@ -188,18 +231,43 @@ mod tests {
     }
 
     #[test]
-    fn run_defaults_under_the_data_dir() {
+    fn run_defaults_to_a_stamped_file() {
         let dir = PathBuf::from("data").join("logs");
-        assert_eq!(
-            log_target(None, Some(&dir)),
-            Some(PathBuf::from("data").join("logs").join("run.log"))
+        let name = log_target(None, Some(&dir))
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .expect("run logs to a file");
+        let (date, time) = name
+            .strip_prefix("run-")
+            .and_then(|n| n.strip_suffix(".log"))
+            .and_then(|s| s.split_once('-'))
+            .unwrap_or_else(|| panic!("run-YYYYMMDD-HHMMSS.log, got {name}"));
+        assert_eq!(date.len(), 8, "{name}");
+        assert_eq!(time.len(), 6, "{name}");
+        assert!(
+            date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()),
+            "{name}"
         );
         // Everything else stays stderr only.
         assert_eq!(log_target(None, None), None);
     }
 
     #[test]
-    fn a_run_truncates_the_previous_log() {
+    fn the_stamp_is_a_utc_date_and_time() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(utc_stamp(UNIX_EPOCH), "19700101-000000");
+        // 2024-02-29T00:00:00Z, the leap day a naive year-of-365 gets wrong.
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
+            "20240229-000000"
+        );
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "20231114-221320"
+        );
+    }
+
+    #[test]
+    fn opening_the_same_path_twice_keeps_the_newest() {
         let dir = std::env::temp_dir().join(format!("victory-logging-{}", std::process::id()));
         let path = dir.join("logs").join("run.log");
         for line in ["first run\n", "second run\n"] {
