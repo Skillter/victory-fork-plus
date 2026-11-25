@@ -41,12 +41,16 @@
   only if the second try fails, never served from unbuilt slots. Every refusal
   is counted and its line names the free slots and the lists in the air; the
   ring's room is printed every 5 s in every build
-  (`descriptor::host::dynamic_line`), not only in a diagnostics one.
+  (`descriptor::host::dynamic_line`), not only in a diagnostics one. The free
+  slots are counted from the rings (`descriptor::host::gauge`), never credited
+  as runs come back: a heap let go leaves the total with its ring.
 - A command list bumps through a run it holds (`DynamicList`), given back whole
   at submission; the ring is never walked per table. A run names its heap by
   identity, a counter (`HostHeap::ident`) resolved in `descriptor::host::RINGS`,
   never the heap's address: a heap released and another made where it stood are
-  two heaps, and a run goes back to the ring it came from or to none.
+  two heaps, and a run goes back to the ring it came from or to none. A run
+  given back twice is credited once (`Ring::give_back`), so `free` never passes
+  the ring's capacity.
 - Root arguments are cached per list (`draw::RootArgs`) and re-issued only when
   the resolved value changes; a root-signature change or a new list drops them.
 - The capped heap points past-the-end reads at a null slot for a reason: a
@@ -54,7 +58,9 @@
 - A buffer view of no elements is the console's for the rest of its buffer:
   `descriptor::host::view_count` works the length out and
   `descriptor::host::buffer_copy` refreshes and writes back that rest. A view
-  left null reads as zeros.
+  left null reads as zeros. A view of no elements of a buffer that declares no
+  bytes has no rest: it stays null as `Refused::NoLength`, apart from a view of
+  no elements of another dimension (`Refused::NoElements`).
 - A view the host still refuses is counted per reason and logged once with its
   reason and its buffer (`descriptor::host::refused_census`).
 
