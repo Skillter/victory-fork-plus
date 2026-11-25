@@ -4850,7 +4850,8 @@ mod tests {
     /// root arguments the list was given: the next dispatch that asks for the
     /// same constants spares them. A clamp of another signature leaves none.
     #[test]
-    fn a_clamp_keeps_the_root_arguments_it_did_not_undefine() {        let mut state = State::default();
+    fn a_clamp_keeps_the_root_arguments_it_did_not_undefine() {
+        let mut state = State::default();
         state.host_roots = [0x51, 0x52];
         assert!(state.root_values.again(0x52, true, 0, &[1, 2, 3, 4]));
         // A clamp right after another of its own signature: spared.
@@ -4899,6 +4900,52 @@ mod tests {
         state.forget_roots();
         assert!(state.root_args.again(0x51, false, 0, RootKind::Cbv, 0x1000));
         assert!(state.root_values.again(0x51, false, 0, &[1, 2, 3, 4]));
+    }
+
+    /// The commands a draw after a dispatch records: `State::set_root_arg` and
+    /// `State::root_constants` record one each, and nothing else of the root
+    /// state moves, so a call that answers "already set" is a command the list
+    /// does not get. The draw that follows a compute dispatch records none of
+    /// its own — the whole-cache clear made it record both — and a draw that
+    /// re-binds the signature the list holds records none either, which is
+    /// what a pipeline that binds records today: its draw, and no root
+    /// argument.
+    #[test]
+    fn a_draw_after_a_dispatch_records_no_root_argument_again() {
+        /// The root commands one draw (or dispatch) records: one per call
+        /// that answers that the list does not hold the value.
+        fn record(state: &mut State, signature: usize, compute: bool) -> u64 {
+            let mut calls = 0;
+            if compute {
+                // A dispatch: a root UAV and the user data it reads.
+                if state.root_args.again(signature, true, 0, RootKind::Uav, 0x2000) {
+                    calls += 1;
+                }
+                if state.root_values.again(signature, true, 0, &[5, 6]) {
+                    calls += 1;
+                }
+            } else {
+                // A draw: a root CBV and the user data it reads.
+                if state.root_args.again(signature, false, 0, RootKind::Cbv, 0x1000) {
+                    calls += 1;
+                }
+                if state.root_values.again(signature, false, 0, &[1, 2, 3, 4]) {
+                    calls += 1;
+                }
+            }
+            calls
+        }
+        let mut state = State::default();
+        assert_eq!(record(&mut state, 0x51, false), 2, "a draw's two");
+        // The dispatch sets a compute signature of its own.
+        state.forget_space(true);
+        assert_eq!(record(&mut state, 0x62, true), 2, "the dispatch's two");
+        // The graphics root arguments stand: the draw records no root command
+        // at all, where a whole-cache clear made it record both again.
+        assert_eq!(record(&mut state, 0x51, false), 0, "the draw's own stand");
+        // Bound again with the signature the list holds, as a pipeline that
+        // binds does: still none.
+        assert_eq!(record(&mut state, 0x51, false), 0);
     }
 
     /// A signature that undefines a space's constants does not give their
