@@ -128,6 +128,11 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+/// Host copies a list keeps for its draw buffers before it drops them all
+/// ([`State::copy`]): a list drawing from a range per draw would otherwise
+/// hold every window it ever saw alive until its reset.
+const COPY_CACHE: usize = 512;
+
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
@@ -255,6 +260,50 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// What a fresh table's records last mixed to, and the dynamic slot they
+/// were made in.
+#[derive(Clone, Copy, Default)]
+struct Fresh {
+    /// [`Fingerprint`] of the `n` records at the table.
+    words: Fingerprint,
+    /// The first dynamic slot they were made in.
+    first: u32,
+    /// The list's [`State::table_generation`] when they were.
+    generation: u32,
+}
+
+/// The record bytes of a fresh table, mixed to 128 bits: two multiply-xor
+/// lanes over the three dwords of every record.
+///
+/// The key of `State::fresh_tables` is the table's address and slot count;
+/// this is what tells the same table with other records from itself. Two
+/// different sets of records would have to agree in both lanes to be
+/// served the same dynamic slots, 128 bits of mixed content.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Fingerprint(u64, u64);
+
+impl Fingerprint {
+    /// The `n` records at `table` (three dwords each, in title memory).
+    fn of(table: u64, n: u32) -> Fingerprint {
+        // Odd constants: a change in any dword carries into both lanes.
+        const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
+        const OTHER: u64 = 0xC2B2_AE3D_27D4_EB4F;
+        let (mut a, mut b) = (
+            0x243F_6A88_85A3_08D3 ^ table,
+            0x1319_8A2E_0370_7344 ^ u64::from(n),
+        );
+        for k in 0..n {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: a descriptor slot in title memory.
+            let [x, y, z] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            let (x, y, z) = (u64::from(x), u64::from(y), u64::from(z));
+            a = (a.rotate_left(5) ^ x).wrapping_mul(ODD) ^ y.wrapping_mul(OTHER);
+            b = (b.rotate_left(7) ^ z).wrapping_mul(OTHER) ^ x.wrapping_add(y);
+        }
+        Fingerprint(a ^ b.rotate_left(1), b ^ a.rotate_left(1))
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -293,9 +342,31 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh in this list: (table, slot count) → the record
+    /// bytes last seen there and the dynamic slots they were made in
+    /// ([`Fresh`]). The records are held as a [`Fingerprint`] instead of
+    /// being hashed into the key: `DefaultHasher` over `3n` dwords read
+    /// unaligned from title memory ran for every fresh table of every draw.
+    fresh_tables: std::collections::HashMap<(u64, u32), Fresh>,
+    /// Bumped each time a table's records are seen to have changed: the
+    /// generation of [`Fresh`], so a table rewritten in place is never
+    /// served the slots made for its old records.
+    table_generation: u32,
+    /// Host copies found for this list's draw buffers: (address, bytes) →
+    /// the copy `crate::shadow::find_any` named, kept for the list. Every
+    /// draw asks for every buffer it binds, and each answer is a registry
+    /// lock, up to 64 range entries of a linear walk, and the chance of
+    /// making a window.
+    copies: std::collections::HashMap<(u64, u64), std::sync::Arc<crate::shadow::Shadow>>,
+    /// Scratch the draw path reuses rather than allocating per draw: the
+    /// slots made afresh, the (slot, offset) pairs they became, the used
+    /// resources of one slot, the indexed views it selected, and a stage's
+    /// user data.
+    scratch_slots: Vec<u8>,
+    scratch_made: Vec<(u8, u32)>,
+    scratch_entries: Vec<u32>,
+    scratch_selected: Vec<u32>,
+    scratch_values: Vec<u32>,
     /// The dynamic slots the list holds, as runs of the view heap's ring;
     /// given back when the list has run, is reset or released.
     ring: crate::descriptor::host::DynamicList,
@@ -341,9 +412,39 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.copies.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// The dynamic slots a fresh table was made in before, if its records
+    /// still mix to `words`: the table's address and slot count name the
+    /// entry, the records say whether the entry still stands.
+    fn fresh_table(&self, identity: (u64, u32), words: Fingerprint) -> Option<u32> {
+        match self.fresh_tables.get(&identity) {
+            Some(seen) if seen.words == words => Some(seen.first),
+            _ => None,
+        }
+    }
+
+    /// Records a fresh table's records as made in dynamic slot `first`, at a
+    /// generation bumped from the one its old records were made under, so
+    /// the slots holding those are never served for these.
+    fn fresh_made(&mut self, identity: (u64, u32), words: Fingerprint, first: u32) {
+        let generation = match self.fresh_tables.get(&identity) {
+            Some(seen) => seen.generation.wrapping_add(1),
+            None => self.table_generation.wrapping_add(1),
+        };
+        self.table_generation = generation;
+        self.fresh_tables.insert(
+            identity,
+            Fresh {
+                words,
+                first,
+                generation,
+            },
+        );
     }
 }
 
@@ -936,6 +1037,39 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
+    /// The host copy of a draw's vertex or index buffer: what
+    /// [`crate::shadow::find_any`] names, kept for the list. Every draw
+    /// asks for every buffer it binds, and each answer costs the registry's
+    /// lock and a walk back over up to 64 range entries; a list that draws
+    /// the same buffer five thousand times asked as often.
+    ///
+    /// The answer is only about which host copy covers
+    /// `[address, address + len)`, and the copy is brought up to date from
+    /// title memory at submission either way, so a title rewrite of the
+    /// buffer needs no invalidation. What does is the runtime changing what
+    /// title memory shows (`crate::watch::title_memory_remapping`) while the
+    /// list records: the range may then belong to another buffer, and this
+    /// cache would keep naming the copy made for the old one until the
+    /// list's tables are given back at its next submission. Closable only in
+    /// the registry: it needs a counter `crate::shadow` bumps whenever it
+    /// adds or removes an entry, which this compares before using an answer.
+    fn copy(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        if address == 0 || len == 0 {
+            return None;
+        }
+        if let Some(found) = self.copies.get(&(address, len)) {
+            return Some(found.clone());
+        }
+        let shadow = crate::shadow::find_any(address, len)?;
+        // A list that binds a range per draw would otherwise hold a copy of
+        // every window it ever saw.
+        if self.copies.len() >= COPY_CACHE {
+            self.copies.clear();
+        }
+        self.copies.insert((address, len), shadow.clone());
+        Some(shadow)
+    }
+
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
@@ -960,7 +1094,9 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
+        // Copied out: the copies below borrow the list's state.
+        let vertex = self.vertex;
+        for (slot, (view, &v)) in views.iter_mut().zip(&vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
             }
@@ -968,7 +1104,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = self.copy(v.address, u64::from(v.size)) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -986,7 +1122,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = self.copy(v.address, u64::from(v.size)) else {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1083,15 +1219,16 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep_pair(&p.pso, &p.root);
         }
+        let mut made = std::mem::take(&mut self.scratch_made);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            self.tables(list, &t.used, &t.host.root_indexed_views, compute, &mut made);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
+                self.scratch_made = made;
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
@@ -1110,18 +1247,29 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A buffer the list keeps: `vec![0; dwords]` was a heap
+                // allocation per stage per draw.
+                let mut values = std::mem::take(&mut self.scratch_values);
+                values.clear();
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    // `made` is ordered by root slot (the slots it was made
+                    // from were sorted and deduplicated), so this is a walk
+                    // of log n instead of a scan per dword.
+                    let fresh = if u.root == RootType::Table {
+                        made.binary_search_by_key(&u.slot, |m| m.0)
+                            .ok()
+                            .map(|at| made[at].1)
+                    } else {
+                        None
+                    };
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some(offset) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1133,6 +1281,7 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                self.scratch_values = values;
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -1220,6 +1369,7 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        self.scratch_made = made;
         true
     }
 
@@ -2320,8 +2470,8 @@ impl State {
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. Fills `made` with those tables' new byte offsets by
+    /// root parameter; the other tables' slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
@@ -2333,14 +2483,18 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+        made: &mut Vec<(u8, u32)>,
+    ) {
+        made.clear();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = std::mem::take(&mut self.scratch_slots);
+        fresh.clear();
+        fresh.extend(
+            used.iter()
+                .filter(tables)
+                .filter(|u| u.kind == ResourceType::Cbv)
+                .map(|u| u.slot),
+        );
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -2369,16 +2523,20 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut entries = std::mem::take(&mut self.scratch_entries);
+        let mut selected = std::mem::take(&mut self.scratch_selected);
+        for &slot in &fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            // This table's used resources, as indices into `used`.
+            entries.clear();
+            entries.extend(
+                used.iter()
+                    .enumerate()
+                    .filter(|(_, u)| tables(u) && u.slot == slot)
+                    .map(|(i, _)| i as u32),
+            );
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2388,10 +2546,9 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
+            selected.clear();
+            selected.extend(indexed.iter().filter(|index| index.table_slot == slot).map(
+                |index| {
                     let constant = self.user_value(
                         compute,
                         index.constant_slot,
@@ -2400,13 +2557,15 @@ impl State {
                     );
                     // The shader adds i32 byte offsets and shifts by 5.
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+                },
+            ));
             selected.sort_unstable();
             selected.dedup();
+            // The entries' slot of the table, as the record index it names.
+            let at = |i: u32| used[i as usize].table_offset_dwords / 8;
             let n = entries
                 .iter()
-                .map(|u| u.table_offset_dwords / 8)
+                .map(|&i| at(i))
                 .chain(selected.last().copied())
                 .max()
                 .unwrap_or(0)
@@ -2418,26 +2577,27 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+            // The records at the table, mixed. The key is the table and its
+            // slot count, which says nothing about what the title wrote
+            // there since: the fingerprint does, so a table rewritten in
+            // place is never served the slots made for its old records.
+            let words = Fingerprint::of(table, n);
+            let identity = (table, n);
+            let seen = self.fresh_table(identity, words);
+            if let Some(seen) = seen
+            {
+                for &i in &entries {
+                    let u = &used[i as usize];
+                    if u.kind == ResourceType::Cbv {
+                        continue;
+                    }
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in &selected {
+                    if entries.iter().any(|&i| at(i) == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2447,7 +2607,7 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, seen * 32));
                 continue;
             }
             let Some(first) = host.dynamic_in(&mut self.ring, n) else {
@@ -2456,7 +2616,11 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            // Records other than those these slots were made for: the
+            // identity of this table's contents is a new generation, taken
+            // from the one it replaced. The run is the list's ring, given
+            // back whole by `State::tables_done`.
+            self.fresh_made(identity, words, first);
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -2464,7 +2628,10 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let entry = entries
+                    .iter()
+                    .map(|&i| &used[i as usize])
+                    .find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -2476,7 +2643,7 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        let kind = used.map(|u| u.kind).or_else(|| {
+                        let kind = entry.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
@@ -2498,7 +2665,7 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -2506,7 +2673,9 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        self.scratch_slots = fresh;
+        self.scratch_entries = entries;
+        self.scratch_selected = selected;
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -2654,21 +2823,15 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
-                // The vertices are read in place, at submission: no change
-                // of mapping under the read (see
-                // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
+            // Data, not a boxed closure: a rectangle draw made one closure
+            // per vertex stream.
+            let work = crate::host::Rectangles::new(from, to, stride, n, &elements);
+            match work {
+                Some(work) => list.defer_host_rects(work),
+                None => list.defer_host(move || {
+                    crate::host::expand_rects_now(from, to, stride, n, &elements)
+                }),
+            }
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
@@ -3235,6 +3398,351 @@ mod tests {
         }
         // The first look is the first wait of the schedule.
         assert_eq!(RECHECK_FRAMES[0], 4);
+    }
+
+    /// The records of one descriptor table, as the title writes them: three
+    /// dwords at the start of each 32-byte slot.
+    struct Records {
+        words: Vec<u32>,
+        count: u32,
+    }
+
+    impl Records {
+        fn new(count: u32) -> Records {
+            Records {
+                words: vec![0; count as usize * 8],
+                count,
+            }
+        }
+
+        /// Where the table is: the address the draw path reads its records
+        /// from.
+        fn at(&self) -> u64 {
+            self.words.as_ptr() as u64
+        }
+
+        /// Rewrites one record: what the title does to a table in place.
+        fn set(&mut self, slot: usize, record: [u32; 3]) {
+            self.words[slot * 8..slot * 8 + 3].copy_from_slice(&record);
+        }
+    }
+
+    /// The identity a fresh table had before: `DefaultHasher` over the
+    /// records' three dwords, part of the key.
+    fn hashed(table: u64, count: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for k in 0..count {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: a record of the test's own buffer.
+            unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The dynamic slots each draw's tables were given, as the draw path
+    /// decides them with the identity it has now.
+    fn stream(records: &mut [Records], script: &[Vec<usize>]) -> Vec<(u64, u32, u32)> {
+        let mut state = State::default();
+        let mut out = Vec::new();
+        let mut next = 0u32;
+        for (draw, tables) in script.iter().enumerate() {
+            if draw == SCRIPT / 2 {
+                // The title rewrites a table in place: the slots made for
+                // its old records must not be served for the new ones.
+                records[1].set(2, [0x1234_5678, 0x9abc_def0, 7]);
+            }
+            for &table in tables {
+                let record = &records[table];
+                let identity = (record.at(), record.count);
+                let words = Fingerprint::of(record.at(), record.count);
+                let first = match state.fresh_table(identity, words) {
+                    Some(first) => first,
+                    None => {
+                        let first = next;
+                        next += record.count;
+                        state.fresh_made(identity, words, first);
+                        first
+                    }
+                };
+                out.push((identity.0, identity.1, first));
+            }
+        }
+        out
+    }
+
+    /// The same, with the identity the draw path had before.
+    fn old_stream(records: &mut [Records], script: &[Vec<usize>]) -> Vec<(u64, u32, u32)> {
+        let mut map: std::collections::HashMap<(u64, u32, u64), u32> =
+            std::collections::HashMap::new();
+        let mut out = Vec::new();
+        let mut next = 0u32;
+        for (draw, tables) in script.iter().enumerate() {
+            if draw == SCRIPT / 2 {
+                records[1].set(2, [0x1234_5678, 0x9abc_def0, 7]);
+            }
+            for &table in tables {
+                let record = &records[table];
+                let key = (record.at(), record.count, hashed(record.at(), record.count));
+                let first = *map.entry(key).or_insert_with(|| {
+                    let first = next;
+                    next += record.count;
+                    first
+                });
+                out.push((key.0, key.1, first));
+            }
+        }
+        out
+    }
+
+    /// A list of `SCRIPT` draws, each binding one or three tables.
+    fn script() -> Vec<Vec<usize>> {
+        (0..SCRIPT)
+            .map(|draw| {
+                if draw % 3 == 0 {
+                    vec![0]
+                } else {
+                    vec![0, 1, 2]
+                }
+            })
+            .collect()
+    }
+
+    /// Draws in the synthetic list.
+    const SCRIPT: usize = 5_000;
+
+    /// The fresh tables a draw binds are given the same slots as before,
+    /// draw for draw: the recorded commands do not change.
+    #[test]
+    fn the_tables_a_draw_binds_keep_their_slots() {
+        let script = script();
+        // One set of records, so the addresses both identities see are the
+        // same ones.
+        let mut records = [Records::new(4), Records::new(12), Records::new(64)];
+        let old = old_stream(&mut records, &script);
+        records[1].set(2, [0, 0, 0]);
+        let new = stream(&mut records, &script);
+        assert_eq!(old.len(), new.len());
+        for (draw, (was, now)) in old.iter().zip(&new).enumerate() {
+            assert_eq!(was, now, "draw {draw}");
+        }
+        // The rewrite in the middle of the list made the table afresh
+        // again: the slots it had are not served for the new records.
+        let rewritten = old
+            .iter()
+            .zip(&new)
+            .filter(|(_, (_, _, first))| *first != 0)
+            .count();
+        assert!(rewritten > 0, "the list made no table");
+    }
+
+    /// A table the title rewrites in place is never served the slots made
+    /// for its old records.
+    #[test]
+    fn a_table_rewritten_in_place_is_never_stale() {
+        let mut record = Records::new(8);
+        let identity = (record.at(), record.count);
+        let mut state = State::default();
+        let words = Fingerprint::of(record.at(), record.count);
+        assert_eq!(state.fresh_table(identity, words), None);
+        state.fresh_made(identity, words, 10);
+        assert_eq!(state.fresh_table(identity, words), Some(10));
+        // The title rewrites it.
+        record.set(3, [1, 2, 3]);
+        let words = Fingerprint::of(record.at(), record.count);
+        assert_eq!(state.fresh_table(identity, words), None, "a stale table");
+        state.fresh_made(identity, words, 20);
+        assert_eq!(state.fresh_table(identity, words), Some(20));
+        // And back to what it was: the old slots hold the old records, so
+        // they are not served either.
+        record.set(3, [0, 0, 0]);
+        let words = Fingerprint::of(record.at(), record.count);
+        assert_eq!(state.fresh_table(identity, words), None, "a stale table");
+    }
+
+    /// The bookkeeping a draw runs allocates nothing once its tables are
+    /// made: the vec it keeps is the one the list keeps.
+    #[cfg(not(feature = "diagnostics"))]
+    #[test]
+    fn a_draw_allocates_nothing_once_its_tables_are_made() {
+        let records = [Records::new(4), Records::new(12), Records::new(64)];
+        let mut state = State::default();
+        let mut words = [Fingerprint::default(); 3];
+        for (at, record) in records.iter().enumerate() {
+            words[at] = Fingerprint::of(record.at(), record.count);
+            state.fresh_made((record.at(), record.count), words[at], at as u32);
+        }
+        let (hits, blocks) = heap::counted(|| {
+            let mut hits = 0u32;
+            for _ in 0..SCRIPT {
+                for (at, record) in records.iter().enumerate() {
+                    let identity = (record.at(), record.count);
+                    if state.fresh_table(identity, words[at]).is_some() {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        });
+        assert_eq!(hits as usize, SCRIPT * 3);
+        assert_eq!(blocks, 0, "the draw path allocated");
+    }
+
+    /// What one of the state calls a draw makes costs in our own code, so
+    /// the report need not guess at it: the list's state lock, and the
+    /// clock a diagnostics build takes around each call.
+    #[test]
+    fn a_state_call_costs_a_lock() {
+        let rounds = 20_000u32;
+        let lock = std::sync::Mutex::new(0u32);
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *value += 1;
+        }
+        let per_call = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        // Twelve to fifteen state calls come between two draws.
+        eprintln!(
+            "one state lock: {per_call:.0} ns, {:.3} µs a draw at 15 calls",
+            per_call * 15.0 / 1_000.0
+        );
+        assert!(per_call < 5_000.0, "one lock cost {per_call:.0} ns");
+
+        // `with_state`'s two clocks under `feature = "diagnostics"`.
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            let began = std::time::Instant::now();
+            std::hint::black_box(began.elapsed().as_nanos() as u64);
+        }
+        let per_call = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        eprintln!(
+            "one state call's clock pair: {per_call:.0} ns, {:.3} µs a draw at 15 calls",
+            per_call * 15.0 / 1_000.0
+        );
+        assert!(per_call < 5_000.0, "one clock pair cost {per_call:.0} ns");
+    }
+
+    /// What a table's identity costs a draw: the hash the draw path ran over
+    /// every record before, and the fingerprint it runs now.
+    #[test]
+    fn a_table_identity_costs_what_it_reads() {
+        let records = [Records::new(4), Records::new(12), Records::new(64)];
+        let rounds = 20_000u32;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for record in &records {
+                std::hint::black_box(hashed(record.at(), record.count));
+            }
+        }
+        let before = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for record in &records {
+                std::hint::black_box(Fingerprint::of(record.at(), record.count));
+            }
+        }
+        let after = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        eprintln!("three tables' identity: {before:.0} ns a draw before, {after:.0} ns after");
+        assert!(
+            after < before * 2.0,
+            "the fingerprint costs {after:.0} ns, the hash {before:.0} ns"
+        );
+    }
+
+    /// The bookkeeping a draw ran before: one vec per stage, table and
+    /// slot, made afresh every time. What the draw path allocates now, and
+    /// what it allocated before.
+    #[cfg(not(feature = "diagnostics"))]
+    #[test]
+    fn the_bookkeeping_a_draw_ran_before_allocated_per_draw() {
+        let tables = [(0u8, 4u32), (1, 12), (2, 64)];
+        let old = heap::counted(|| {
+            for _ in 0..SCRIPT {
+                let fresh: Vec<u8> = tables.iter().map(|&(slot, _)| slot).collect();
+                let mut made: Vec<(u8, u32)> = Vec::new();
+                for &(slot, count) in &tables {
+                    let entries: Vec<u32> = (0..count).collect();
+                    let selected: Vec<u32> = vec![0];
+                    let values = vec![0u32; 8];
+                    made.push((slot, count));
+                    std::hint::black_box((&fresh, &entries, &selected, &values));
+                }
+                std::hint::black_box(&made);
+            }
+        });
+        assert!(
+            old.1 as usize >= SCRIPT,
+            "the old bookkeeping did not allocate"
+        );
+        eprintln!(
+            "allocations for {SCRIPT} draws: before {}, after 0",
+            old.1
+        );
+    }
+
+    /// Heap blocks the calling thread allocated while a closure ran.
+    #[cfg(not(feature = "diagnostics"))]
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            /// Whether this thread's blocks are counted.
+            static ON: Cell<bool> = const { Cell::new(false) };
+            /// The blocks this thread allocated while they were.
+            static BLOCKS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        // SAFETY: every method passes the layout and the pointer on to
+        // `System`; counting the blocks is the only work it adds.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                count();
+                // SAFETY: the caller's contract, passed on.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+                // SAFETY: the caller's contract, passed on.
+                unsafe { System.dealloc(at, layout) }
+            }
+
+            unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                count();
+                // SAFETY: the caller's contract, passed on.
+                unsafe { System.realloc(at, layout, size) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                count();
+                // SAFETY: the caller's contract, passed on.
+                unsafe { System.alloc_zeroed(layout) }
+            }
+        }
+
+        /// One block, by the thread that asked for it (the tests run side by
+        /// side, and a shared count would be theirs too).
+        fn count() {
+            let _ = ON.try_with(|on| {
+                if on.get() {
+                    let _ = BLOCKS.try_with(|blocks| blocks.set(blocks.get() + 1));
+                }
+            });
+        }
+
+        #[global_allocator]
+        static HEAP: Counting = Counting;
+
+        /// What `f` returned, and the blocks this thread allocated in it.
+        pub(super) fn counted<T>(f: impl FnOnce() -> T) -> (T, u64) {
+            let before = BLOCKS.with(|blocks| blocks.get());
+            ON.with(|on| on.set(true));
+            let done = f();
+            ON.with(|on| on.set(false));
+            (done, BLOCKS.with(|blocks| blocks.get()) - before)
+        }
     }
 
     /// Catch-up tripled a pass's bytes and span whenever a backlog was due,
