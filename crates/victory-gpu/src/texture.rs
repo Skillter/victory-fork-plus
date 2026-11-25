@@ -906,8 +906,11 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: `subresource_len` clamps `len` to `bytes - footprint.Offset`,
+            // keeping the slice inside the mapped staging buffer even when
+            // `GetCopyableFootprints` does not pad the final row of the final
+            // subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -1013,6 +1016,18 @@ const MAX_RUNS: usize = 4096;
 /// A run shorter than this is not kept: the question costs 0.7 µs a call
 /// there, and the title's blocks are megabytes.
 const SHORT_RUN: usize = 64 << 10;
+
+/// Bytes the staging buffer holds for a subresource at `offset` inside it.
+/// `GetCopyableFootprints` does not pad the final row of the final
+/// subresource, so `pitch * rows * depth` can exceed `total - offset`; a
+/// slice of that length would run past the mapped upload buffer.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
+}
 
 /// Whether `[at, at + len)` is committed memory the process may read
 /// (streamed textures may be unmapped until their pages arrive).
@@ -1549,5 +1564,32 @@ mod staging_ceiling_tests {
         assert!(to_ceiling(&entries, 400, 400).is_empty(), "under the ceiling");
         // A list holds the only buffer: it goes regardless of the ceiling.
         assert!(to_ceiling(&[(1, 400, true)], 400, 0).is_empty(), "held");
+    }
+}
+
+#[cfg(test)]
+mod subresource_len_tests {
+    use super::subresource_len;
+
+    /// A 4x4 RGBA8 texture is `RowPitch` 256, 4 rows, and the last row of
+    /// the last subresource is not padded to the pitch: `total` is 784.
+    #[test]
+    fn a_subresource_never_runs_past_the_staging_buffer() {
+        const ROW_PITCH: usize = 256;
+        const TOTAL: u64 = 784;
+        // The length the code took before the clamp, which is what the slice
+        // used to claim: 1024 bytes of a 784-byte mapping.
+        let unclamped = ROW_PITCH * 4 * 1;
+        assert!(
+            unclamped as u64 > TOTAL,
+            "the unpadded last row makes pitch * rows * depth overrun"
+        );
+        assert_eq!(subresource_len(0, ROW_PITCH, 4, 1, TOTAL), 784);
+        // A subresource further in gets what is left of the buffer.
+        assert_eq!(subresource_len(512, ROW_PITCH, 4, 1, TOTAL), 272);
+        // Where the buffer is padded, the whole footprint is used.
+        assert_eq!(subresource_len(0, ROW_PITCH, 4, 1, 2048), 1024);
+        // Absurd totals never overflow into a huge length.
+        assert_eq!(subresource_len(0, usize::MAX, u32::MAX, u32::MAX, u64::MAX), usize::MAX);
     }
 }
