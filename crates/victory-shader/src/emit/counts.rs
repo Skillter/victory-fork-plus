@@ -8,6 +8,7 @@ use super::lanes::all_lane_blocks;
 use super::lower::Why;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Program, Reg, Value};
+use crate::resource::Site;
 use crate::structure::Structured;
 
 /// `s_lshl_b32` shift of the primitive count in the allocation request's
@@ -48,13 +49,21 @@ pub(super) fn mesh_counts_log() -> bool {
 /// makes them uniform, and the two instructions there that read them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct OutputCounts {
-    /// The block whose end emits `setMeshOutputCounts`: it dominates every
-    /// output store, as the host requires of the one call.
+    /// The block that emits `setMeshOutputCounts`, after the later of the two
+    /// reads: it dominates every output store, as the host requires of the
+    /// one call.
     pub(super) block: usize,
     /// Instruction indices in that block of the two `v_readfirstlane_b32`
     /// whose results are the vertex and the primitive count.
     pub(super) verts: usize,
     pub(super) prims: usize,
+}
+
+impl OutputCounts {
+    /// The instruction after which the counts are known: the later read.
+    pub(super) fn after(&self) -> usize {
+        self.verts.max(self.prims)
+    }
 }
 
 /// Follows the console's output allocation request back to the two counts it
@@ -65,14 +74,16 @@ pub(super) struct OutputCounts {
 ///
 /// Returns an error, with the reason, when the program's counts are not that
 /// shape: the caller then promises the declared maxima, as it always did.
-/// `writes` are the blocks that store mesh outputs; the pair's block must
+/// `writes` are the sites that store mesh outputs; the pair's block must
 /// dominate them all, because DXIL's `SetMeshOutputCounts` is one call and
 /// the validator wants it before every store, and it must run in every lane
-/// (a call from divergent flow is undefined).
+/// (a call from divergent flow is undefined). The call lands after the later
+/// read, so a store in that block that comes before it cannot be ordered
+/// after the call: such a program keeps the maxima rather than guess.
 pub(super) fn output_counts(
     p: &Program,
     st: &Structured,
-    writes: &[usize],
+    writes: &[Site],
 ) -> Result<OutputCounts, Why> {
     // One request for the program: a group's counts are one value.
     let mut request = None;
@@ -174,14 +185,18 @@ pub(super) fn output_counts(
             b = idom[b];
         }
     };
-    if !writes.iter().all(|&w| dominates(w)) {
+    if !writes.iter().all(|&(w, _)| dominates(w)) {
         return Err("an output store the counts do not dominate");
     }
-    Ok(OutputCounts {
+    let counts = OutputCounts {
         block: a,
         verts: vi,
         prims: pi,
-    })
+    };
+    if writes.iter().any(|&(w, i)| w == a && i < counts.after()) {
+        return Err("an output store before the counts");
+    }
+    Ok(counts)
 }
 
 /// The shift an `s_lshl_b32` operand applies, when it is a constant.
@@ -221,12 +236,38 @@ mod tests {
             S_ENDPGM,
         ];
         let (p, st) = program(&words);
-        let counts = output_counts(&p, &st, &[0]).expect("the request's pair");
+        let counts = output_counts(&p, &st, &[(0, 7)]).expect("the request's pair");
         assert_eq!(
             (counts.block, counts.verts, counts.prims),
             (0, 0, 1),
             "the vertex count is the one not shifted"
         );
+        assert_eq!(counts.after(), 1, "the counts are known after the later read");
+    }
+
+    /// A store in the counts' own block that comes before them: the one
+    /// `SetMeshOutputCounts` would have to follow a store it has to precede,
+    /// so the program keeps the maxima rather than a guessed order.
+    #[test]
+    fn a_store_before_the_counts_in_their_block_keeps_the_maxima() {
+        let words = [
+            0x7E0C_0516, // v_readfirstlane_b32 s6, v22
+            0x7E0E_0522, // v_readfirstlane_b32 s7, v34
+            0x8F07_8C07, // s_lshl_b32 s7, s7, 12
+            0x8806_0607, // s_or_b32 s6, s7, s6
+            0xBEFC_0306, // s_mov_b32 m0, s6
+            0xBF90_0009, // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ, GS_OP_NOP, 0)
+            0xF800_0941,
+            0x0000_0016, // exp prim, v22, off, off, off done
+            S_ENDPGM,
+        ];
+        let (p, st) = program(&words);
+        assert_eq!(
+            output_counts(&p, &st, &[(0, 0)]),
+            Err("an output store before the counts")
+        );
+        // The same store after the later read is what the request promises.
+        assert!(output_counts(&p, &st, &[(0, 7)]).is_ok());
     }
 
     /// A program with no allocation request is not one whose counts can be
@@ -240,7 +281,10 @@ mod tests {
             S_ENDPGM,
         ];
         let (p, st) = program(&words);
-        assert_eq!(output_counts(&p, &st, &[0]), Err("no allocation request"));
+        assert_eq!(
+            output_counts(&p, &st, &[(0, 1)]),
+            Err("no allocation request")
+        );
     }
 
     /// A request whose counts are not one first-lane pair: here the vertex
@@ -261,7 +305,7 @@ mod tests {
         ];
         let (p, st) = program(&words);
         assert_eq!(
-            output_counts(&p, &st, &[0]),
+            output_counts(&p, &st, &[(0, 7)]),
             Err("a count is not a first-lane read")
         );
     }
@@ -285,7 +329,7 @@ mod tests {
             S_ENDPGM,
         ];
         let (p, st) = program(&words);
-        let why = output_counts(&p, &st, &[0]);
+        let why = output_counts(&p, &st, &[(0, 8)]);
         assert_eq!(why, Err("an output store the counts do not dominate"));
     }
 
