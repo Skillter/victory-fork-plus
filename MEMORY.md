@@ -52,9 +52,8 @@ over `<data-dir>/<title-id>/`.
     target\release\victory.exe run "<game-folder>\game_scarlett_master.exe" --execute
 
 with `VICTORY_D3D12_BACKGROUND=0` set. That is the configuration that rendered
-the cutscenes and the world. Measured on the reference rig: **473 ms/frame
-(2.1 fps)**, of which **249 ms GPU**, 62 ms uploads (158 MB), 87 ms readback
-(74 MB), the rest preparation.
+the cutscenes and the world; its 473 ms/frame (2.1 fps) is the reference rig's,
+on an older build (§5.1 splits it and has the newest numbers).
 
 `VICTORY_KEYS=12:Enter,16:Enter,...` drives the first-boot screens and the
 intro (diagnostics builds only; the key list is behind
@@ -124,7 +123,7 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 | Switch | Effect | Notes |
 |---|---|---|
 | `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off; that is now the default, so the variable is no longer read (`VICTORY_BACKGROUND_PROCESSING=normal` gives the older behaviour back) | **in the working config** |
-| `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable**: 473 → 350 ms, then `device removed after 3 submissions sent ahead` (TDR) |
+| `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable**: 473 → 350 ms on the reference rig, then `device removed after 3 submissions sent ahead` (TDR) |
 | `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as `RELAY`; assume the same risk |
 | `VICTORY_WIDE_BACK=1` | snapshot compares spread across cores | safe; sold as part of the fast config |
 | `VICTORY_CARD_BUFFERS=0` | disables the card-side buffer shadow copies | **did not change the cutscene ghosting** |
@@ -168,71 +167,93 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
   captured to `<data-dir>/world/`.
 - **The world renders** with working controls, HUD and pause menu.
 - Pipeline library accumulates across sessions. *(re-measured)*
-  `<cache-dir>/pipelines/host-pipelines.bin` measured 232,858,822 B (222 MiB)
-  in one session, 465,924,678 B (444 MiB) in the 02:56 run and 500,821,110 B
-  after it, with **2,853 → 2,893 → 2,907** names in `early-pipelines.txt`
-  beside it: it grows with the content the title has shown, at ~187 KB per
-  pipeline. The `97 KB → 231 KB → 320 KB` progression quoted by earlier notes
-  was an early-session figure, taken while most pipeline creation still
-  failed. The blob is rewritten whole on every save and is coupled to the
+  `<cache-dir>/pipelines/host-pipelines.bin` went, loaded → saved per run,
+  465,924,678 (02:56) → 501,078,276 → 580,067,610 → 582,268,008 → 737,846,212
+  (03:53) → 752,217,796 B (04:21) over ten runs; `bytes=` is what a save wrote,
+  `library=` beside it the size held in memory. `early-pipelines.txt` grew with
+  it: `early=2907` at the 02:56 save, `pipelines=2934` in every run from 03:44.
+  The blob is rewritten whole at most every 60 s (`pipeline::library::save`,
+  `SAVE_EVERY`) and nothing prunes it, so it only grows; it is coupled to the
   driver, so a driver update discards it and the next run rebuilds from empty.
+  The census's `bytes_per_pipeline` is the library's bytes over the pipelines
+  this session made or loaded (`pipeline::library::report_census`), an average
+  that falls as a session loads more, not a pipeline's size: 1,443,536 at 88
+  made + 336 loaded, 275,537 at 295 + 2,435.
   `dropped N (0 being made)` means the backlog is drained; `M being made` means
   compilation is the limit that frame.
-- With the library warm: `dropped ~350-400`, almost all `BuilderOff` (§5.2).
+- Drops with the library warm *(re-measured 04:23)*: 153.5/frame `BuilderOff`
+  against 0.1 `NoPipeline` at 114 draws; 3,362, 1,895 `Unbindable` and 118 at
+  2,298 draws.
 
 ---
 
 # 5. The four open problems
 
-## 5.1 Frame rate — 473 ms
+## 5.1 Frame rate
 
-Split measured at 4K:
+Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 
     168 ms preparing (62 ms copies / 158 MB up, 5 ms textures)
     249 ms GPU
      87 ms copying back (74 MB) — a serial stall, the card idles
 
+*(re-measured 04:23 in `run-20261125-042134.log`)* the first 114-draw frame took
+221.1 ms (4.5 fps): 158.8 ms preparing (copies 39.8 ms over 42.4 MB, textures
+1.8 ms over 6.4 MB), 1.7 ms on the GPU, 1.7 ms copying back 1.4 MB; the frame
+that first built 2,298 draws took 11,076.5 ms and dropped 3,763 of them.
+
 The readback exists because the console has unified memory and the PC does not:
 compute shaders write buffers that the title's CPU code then reads, so VIctory
-must find what changed (785 refreshes, ~427 MB checked per frame) and copy it
-back before the title proceeds. The same applies to the upload direction.
+must find what changed and copy it back, before the title proceeds.
 
-Ceiling on the reference rig: 3–4 fps with every stable trick. The fork's own
-authors report 420–450 ms → 240–350 ms with relay on a 4070, i.e. this is
-inherent to the port, not a bug.
+The line after each frame line splits the preparing (`host::phase`): `asking`
+the one write-watch asking (`watch::ask_once`), then `recording`, `flush`,
+`snapshots`, `card`, `send` (`ExecuteCommandLists`) and `settle`. Its tail,
+`asking the kernel N times for M pages (X ms finding their runs, Y ms in the
+kernel)`, counts the same asking (`watch::take_askings`): on a frame of seconds
+`asking` is the phase to read, and X against Y says whether the journal's search
+or the kernel call costs.
+
+Ceiling on the older build: 3–4 fps with every stable trick. The fork's own
+authors report 420–450 ms → 240–350 ms with relay on a 4070, and the 04:23 run
+reached 4.5 fps, so the limit is the port, not a bug.
 
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run
 (`run-20261125-025614.log`) the drops were **382.0/frame `BuilderOff` against
-5.0/frame `NoPipeline`**: the ray-tracing structure builder is off
-(`VICTORY_BVH_BUILDER` unset, `crates/victory-gpu/src/pipeline.rs:287-289`),
-and its draw stages are dropped on purpose. Shader refusals explain ~1 % of the
-loss; set `VICTORY_BVH_BUILDER=1` before blaming a rule.
+5.0/frame `NoPipeline`** (§4 has the newer split). The ray-tracing structure
+builder is off (`VICTORY_BVH_BUILDER` unset, `pipeline::builder_runs`), and its
+draw stages are dropped on purpose. Set `VICTORY_BVH_BUILDER=1` before blaming
+a rule.
 
-The refusals that remain in that run (7 programs): 4× `a descriptor read only as
-data` (pixel), 2× `a lane mask exchanged where not every lane runs` (compute),
-1× `a descriptor's address or format read as data` (compute).
+The refusals that remain *(re-measured 04:23, 3 programs, all compute)*: 1× `a
+descriptor's address or format read as data`, 1× `a lane mask exchanged where
+not every lane runs`, 1× `a lane mask holding lanes elsewhere read as data`.
+The 02:56 run had 7: 4× `a descriptor read only as data` (pixel), 2× `a lane
+mask exchanged where not every lane runs`, 1× `a descriptor's address or format
+read as data`.
 
 Separately, the host refuses 7 compute pipelines and 1 mesh pipeline with
-`0x80070057`. `pipeline::host::compute_refusal` now logs the description's
-fields, the serialised root signature, the container's parts, its `DXIL`
-part's lengths and `PSV0`'s stage, thread group and bindings, then
-`cause=<what is provably invalid>` or `cause=no cause known (<what closes
-it>)`; in the 02:56 run that line did not exist, `suspected=[]` named
-nothing, and no cause is known yet.
+`0x80070057`, in both runs. `pipeline::host::compute_refusal` logs the
+description, the root signature's bytes, the container's parts, `DXIL`'s lengths
+and `PSV0`'s stage, thread group and bindings, then `cause=<what is provably
+invalid>` or `cause=no cause known (<what closes it>)`; the 04:21 run prints the
+latter, and no cause is known yet.
 
 In the log a refusal appears as `shader does not translate; its pipelines'
 draws are dropped ... stage=... error=converter shader.dxil v1: GFX10 code at
-0x....`. Each is a bounded rule in
-`crates/victory-shader/src/emit/lower.rs`.
+0x....`, a bounded rule in `crates/victory-shader/src/emit/lower.rs`.
 
-Archive-wide census (`victory translate --list` over `shaders.rpf`, 26,599
-containers, 26,148 programs), refusal counts by reason, before → after the
-sibling-descriptor rule of `emit::lower::descriptor_data`: `a descriptor read
-only as data` 40 → 5 (all five `shadowmask:CS_TraceShadowRays_*`, a buffer
-address read as data), every other reason unchanged, vertex and pixel DXIL
-14,176 → 14,211, compute 2,724, mesh 8,762.
+Archive-wide census (`victory translate --list` over `shaders.rpf`): 26,503
+containers of which 614 duplicate, 26,084 programs; DXIL for 14,199 of 14,247
+vertex and pixel, 2,672 of 2,682 compute, 8,762 of 8,765 mesh. Its reason list
+counts refusals, not programs (256 against the 61 that emit none): `resources:
+an address in an SGPR that is no root parameter` 195, `emit: a descriptor chosen
+by control flow` 40, `emit: a hardware SGPR input` 10, `emit: a descriptor read
+only as data` 5 (all five `shadowmask:CS_TraceShadowRays_*`), `a lane mask
+holding lanes elsewhere read as data` 2, `a wave sum of 16-bit floats where not
+every lane runs` 2, and 1 each of two others.
 
 ## 5.3 Light in shadow — black interiors
 
@@ -251,8 +272,8 @@ lines can appear superimposed. Hypotheses eliminated:
   `self.execute(&[copy])` then `Present`; the sent-ahead variant only runs at
   `late_stage() > 2`, i.e. with `RELAY` / `LATE_WAIT=3`)
 
-Not yet eliminated: a missing clear or composite pass among the ~350 dropped
-draws (the doubled subtitles are two *different* strings, which is temporal
+Not yet eliminated: a missing clear or composite pass among the dropped draws
+(§5.2) (the doubled subtitles are two *different* strings, which is temporal
 blending, not a repeated frame). **Fix 5.2 first and re-check this** — it may be
 the same root cause.
 
@@ -331,8 +352,8 @@ Sample run clock:
     21:42:00  presenting to a window 3840x2160
               menus at 30 fps, 0 dropped
               pipeline prewarm queue grows (799 → 1119) during menus
-     …        intro: cutscene renders, ~1-2 fps, ~350 dropped draws
-              world: 2.1 fps, 473 ms/frame
+     …        intro: cutscene renders, ~1-2 fps, drops split as in §5.2
+              world: 2.1 fps, 473 ms/frame on the reference rig
 
 *(re-measured 02:56)* the same world at 3.8 fps / 264 ms/frame; the ~385 drops
 per frame split 382.0 `BuilderOff` + 5.0 `NoPipeline` (§5.2), so the drop count
@@ -362,7 +383,7 @@ not authoritative, but its docs map onto the gaps above:
 | `docs/shader_inputs.md` | 512-byte light records, eight-light loop, plane count at `+0x4C`, ACES LUT splines, the `+0xD0` sky-LUT output-format dword |
 | `docs/material_pass_replay.md` | how one mesh writes packed draw indices and which compute programs read them |
 | `tools/lane_masks.py` | the path-sensitive lane-mask analysis, with its docstring explaining exactly the class of failure in 5.2 ("a register counts as a mask only if every path wrote a mask", ballot materialised where the mask is written) |
-| `docs/design.md` | ~650 lines of RDNA2→SPIR-V contract; several rows (f16 semantics, `v_cvt_f32_f64`, `v_permlane*`, VINTRP) describe instructions the fork still refuses |
+| `docs/design.md` | ~650 lines of RDNA2→SPIR-V contract; several rows (f16 semantics, VINTRP) describe instructions the fork still refuses, while `v_cvt_f32_f64` and `v_permlane16_b32`/`v_permlanex16_b32` now translate (`emit::lower::Emitter::valu_op`) |
 
 Its **first** lesson is worth keeping: 100% of that title's `*Deferred*` pixel
 shaders export **compressed half-float** while declaring `float32`. If the
