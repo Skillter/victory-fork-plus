@@ -178,6 +178,13 @@ fn cut(e: &SigElement, keep: u8) -> Option<SigElement> {
     if keep == mask(e) {
         return Some(e.clone());
     }
+    // A window cannot say "these two, not the one between them", so a mask
+    // with a gap keeps the whole element: the pair then declares more than
+    // the pixel reads (the old behaviour) instead of promising a link that
+    // the emitted signature cannot make.
+    if keep.trailing_ones() != u32::from(keep.count_ones()) {
+        return Some(e.clone());
+    }
     Some(SigElement {
         col: keep.trailing_zeros() as u8,
         cols: keep.count_ones() as u8,
@@ -376,6 +383,30 @@ mod tests {
         let m = mesh(&wide(16, 0), 128);
         let p = pixel(&wide(16, 0), &[0x0f; 16]);
         assert_eq!(pair(&m, &p), None);
+    }
+
+    #[test]
+    fn a_read_with_a_gap_keeps_the_whole_element() {
+        // `.x` and `.z`: a window cannot name that pair, so nothing is cut —
+        // the pair must not promise a link the emitted signature cannot make.
+        let e = SigElement {
+            name: "TEXCOORD".to_string(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let whole = cut(&e, 0b0101).expect("the element stays");
+        assert_eq!(whole.cols, 4, "the whole four components");
+        assert_eq!(whole.col, e.col);
+        // A contiguous read still narrows to its own window.
+        let narrow = cut(&e, 0b0011).expect("two components stay");
+        assert_eq!((narrow.col, narrow.cols), (0, 2));
     }
 
     #[test]
