@@ -27,6 +27,10 @@
   `OpenExistingHeapFromFileMapping` heap. Both are off by default.
 - Cross-crate contract: CPU writes into mapped title memory call
   `kernel_will_write` first; page remapping holds `title_memory_remapping()`.
+- A cache of `shadow`'s answers (a copy for a range, a fresh table's slots)
+  carries `shadow::revision()` and is used only while that holds: remapped
+  title memory, a buffer registered or released, a window made or let go can
+  make the same address name another copy.
 
 ## Descriptors
 
@@ -82,6 +86,10 @@
 - Staging copies are capped in system RAM (`VICTORY_STAGING_MB`), coldest and
   not-held first: re-admitting from staging is one DMA, decoding the title's
   format is far more expensive.
+- A slot whose host view is unmade is looked at again in the same step
+  (`texture_slot_later`), whether or not the copy was reclaimed: unmade and
+  left due, the queue's next look takes the slot `done` and it is never made
+  again for the run.
 
 ## Diagnostics
 

@@ -133,6 +133,62 @@ const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 /// hold every window it ever saw alive until its reset.
 const COPY_CACHE: usize = 512;
 
+/// A per-list memo of answers from [`crate::shadow`]'s registry of copies,
+/// each tagged with the registry's revision when it was made
+/// ([`crate::shadow::revision`]); an answer is used only while that
+/// revision still holds.
+///
+/// A whole-cache clear at the bump was not taken: the bump happens on the
+/// drawing thread inside a frame loop, and clearing would walk up to
+/// [`COPY_CACHE`] entries for answers that must be asked again anyway,
+/// leaving the next draw to grow the map back. A tag costs one relaxed load
+/// per ask on the hit path and nothing when nothing is asked again.
+/// Reasoned, not measured: bumps are rare outside loading, because a copy
+/// is made only where the registry has none and a window is let go only
+/// after several idle frames; a re-ask is the registry lock, a walk of up
+/// to 64 range entries and, where the registry had nothing, a copy of a
+/// window (4 MiB).
+struct Memo<V> {
+    /// The answer for a key, and the registry revision it was made under.
+    answers: std::collections::HashMap<(u64, u64), (u64, V)>,
+}
+
+/// Not derived: an empty memo holds no `V`, whatever `V` is.
+impl<V> Default for Memo<V> {
+    fn default() -> Memo<V> {
+        Memo {
+            answers: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<V: Clone> Memo<V> {
+    /// The answer for `key` if it was made under revision `now`; an answer
+    /// of another revision is left where it is (the next ask of its key
+    /// replaces it).
+    fn get(&self, key: (u64, u64), now: u64) -> Option<V> {
+        match self.answers.get(&key) {
+            Some((made, answer)) if *made == now => Some(answer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Remembers `value` as the answer for `key`, made under revision
+    /// `now`. At [`COPY_CACHE`] answers the memo starts over: a list that
+    /// binds a range per draw would otherwise hold a copy of every window it
+    /// ever saw.
+    fn put(&mut self, key: (u64, u64), now: u64, value: V) {
+        if self.answers.len() >= COPY_CACHE {
+            self.answers.clear();
+        }
+        self.answers.insert(key, (now, value));
+    }
+
+    fn clear(&mut self) {
+        self.answers.clear();
+    }
+}
+
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
@@ -260,8 +316,8 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
-/// What a fresh table's records last mixed to, and the dynamic slot they
-/// were made in.
+/// What a fresh table's records last mixed to, the dynamic slot they
+/// were made in, and the registry revision they were made under.
 #[derive(Clone, Copy, Default)]
 struct Fresh {
     /// [`Fingerprint`] of the `n` records at the table.
@@ -270,6 +326,9 @@ struct Fresh {
     first: u32,
     /// The list's [`State::table_generation`] when they were.
     generation: u32,
+    /// [`crate::shadow::revision`] when they were: the slots hold the host
+    /// copies the records' descriptors found then.
+    revision: u64,
 }
 
 /// The record bytes of a fresh table, mixed to 128 bits: two multiply-xor
@@ -343,21 +402,22 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count) → the record
-    /// bytes last seen there and the dynamic slots they were made in
-    /// ([`Fresh`]). The records are held as a [`Fingerprint`] instead of
-    /// being hashed into the key: `DefaultHasher` over `3n` dwords read
-    /// unaligned from title memory ran for every fresh table of every draw.
+    /// bytes last seen there, the dynamic slots they were made in and the
+    /// registry revision they were made under ([`Fresh`]). The records are
+    /// held as a [`Fingerprint`] instead of being hashed into the key:
+    /// `DefaultHasher` over `3n` dwords read unaligned from title memory ran
+    /// for every fresh table of every draw.
     fresh_tables: std::collections::HashMap<(u64, u32), Fresh>,
     /// Bumped each time a table's records are seen to have changed: the
     /// generation of [`Fresh`], so a table rewritten in place is never
     /// served the slots made for its old records.
     table_generation: u32,
     /// Host copies found for this list's draw buffers: (address, bytes) →
-    /// the copy `crate::shadow::find_any` named, kept for the list. Every
-    /// draw asks for every buffer it binds, and each answer is a registry
-    /// lock, up to 64 range entries of a linear walk, and the chance of
-    /// making a window.
-    copies: std::collections::HashMap<(u64, u64), std::sync::Arc<crate::shadow::Shadow>>,
+    /// the copy `crate::shadow::find_any` named, kept for the list, with the
+    /// registry revision it was found under. Every draw asks for every
+    /// buffer it binds, and each answer is a registry lock, up to 64 range
+    /// entries of a linear walk, and the chance of making a window.
+    copies: Memo<std::sync::Arc<crate::shadow::Shadow>>,
     /// Scratch the draw path reuses rather than allocating per draw: the
     /// slots made afresh, the (slot, offset) pairs they became, the used
     /// resources of one slot, the indexed views it selected, and a stage's
@@ -419,19 +479,23 @@ impl State {
     }
 
     /// The dynamic slots a fresh table was made in before, if its records
-    /// still mix to `words`: the table's address and slot count name the
-    /// entry, the records say whether the entry still stands.
-    fn fresh_table(&self, identity: (u64, u32), words: Fingerprint) -> Option<u32> {
+    /// still mix to `words` and the registry of host copies still answers as
+    /// it did then: the table's address and slot count name the entry, the
+    /// records say whether the entry still stands, and the revision says its
+    /// slots still name the copies its descriptors found (neither a remap
+    /// nor a window let go makes a descriptor's address name another copy).
+    fn fresh_table(&self, identity: (u64, u32), words: Fingerprint, now: u64) -> Option<u32> {
         match self.fresh_tables.get(&identity) {
-            Some(seen) if seen.words == words => Some(seen.first),
+            Some(seen) if seen.words == words && seen.revision == now => Some(seen.first),
             _ => None,
         }
     }
 
     /// Records a fresh table's records as made in dynamic slot `first`, at a
     /// generation bumped from the one its old records were made under, so
-    /// the slots holding those are never served for these.
-    fn fresh_made(&mut self, identity: (u64, u32), words: Fingerprint, first: u32) {
+    /// the slots holding those are never served for these (`now` is the
+    /// registry revision they were made under, [`crate::shadow::revision`]).
+    fn fresh_made(&mut self, identity: (u64, u32), words: Fingerprint, first: u32, now: u64) {
         let generation = match self.fresh_tables.get(&identity) {
             Some(seen) => seen.generation.wrapping_add(1),
             None => self.table_generation.wrapping_add(1),
@@ -443,6 +507,7 @@ impl State {
                 words,
                 first,
                 generation,
+                revision: now,
             },
         );
     }
@@ -524,6 +589,7 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -1046,27 +1112,27 @@ impl State {
     /// The answer is only about which host copy covers
     /// `[address, address + len)`, and the copy is brought up to date from
     /// title memory at submission either way, so a title rewrite of the
-    /// buffer needs no invalidation. What does is the runtime changing what
-    /// title memory shows (`crate::watch::title_memory_remapping`) while the
-    /// list records: the range may then belong to another buffer, and this
-    /// cache would keep naming the copy made for the old one until the
-    /// list's tables are given back at its next submission. Closable only in
-    /// the registry: it needs a counter `crate::shadow` bumps whenever it
-    /// adds or removes an entry, which this compares before using an answer.
+    /// buffer needs no invalidation. What does is the registry answering
+    /// otherwise: title memory remapped while the list records
+    /// (`crate::watch::title_memory_remapped`), a buffer registered or
+    /// released, a window made or let go. Each answer carries the registry
+    /// revision it was made under ([`crate::shadow::revision`]) and is used
+    /// only while that holds, so the same address never names the copy made
+    /// for what was there before ([`Memo`]).
     fn copy(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         if address == 0 || len == 0 {
             return None;
         }
-        if let Some(found) = self.copies.get(&(address, len)) {
-            return Some(found.clone());
+        let key = (address, len);
+        if let Some(found) = self.copies.get(key, crate::shadow::revision()) {
+            return Some(found);
         }
         let shadow = crate::shadow::find_any(address, len)?;
-        // A list that binds a range per draw would otherwise hold a copy of
-        // every window it ever saw.
-        if self.copies.len() >= COPY_CACHE {
-            self.copies.clear();
-        }
-        self.copies.insert((address, len), shadow.clone());
+        // Under the revision the ask left the registry in, not the one
+        // before it: an ask that made a copy or a window bumped it, and an
+        // answer tagged with the old number would be stale at once and
+        // asked again by every draw of the list.
+        self.copies.put(key, crate::shadow::revision(), shadow.clone());
         Some(shadow)
     }
 
@@ -2076,14 +2142,30 @@ impl State {
                     )
                     && crate::resource::slot_only_idle(at)
                     && host.texture_slot_gone(index)
-                    && let Some(bytes) = crate::resource::let_go_for_room(at)
                 {
-                    reclaimed += 1;
-                    reclaimed_bytes += bytes;
+                    // The slot is gone from here whether or not the copy is
+                    // taken: `let_go_for_room` asks again itself (a list may
+                    // have taken a reference, or a use been recorded, since
+                    // `slot_only_idle`), and it needs the slot un-made first,
+                    // so the order cannot be swapped. So the slot is looked
+                    // at again either way: with the copy let go it is re-made
+                    // once there is room, with the copy kept it is still the
+                    // slot to make. Left due as it was, the queue entry
+                    // outlived the host slot it named -- the next look found
+                    // the slot `done` (or `recheck`ed) from what the queue
+                    // still held -- and the texture was never made again for
+                    // the run.
+                    match crate::resource::let_go_for_room(at) {
+                        Some(bytes) => {
+                            reclaimed += 1;
+                            reclaimed_bytes += bytes;
+                        }
+                        None => refused += 1,
+                    }
                     host.texture_slot_later(index, write, frame, most);
-                    continue;
+                } else {
+                    refused += 1;
                 }
-                refused += 1;
                 if refused > 256 {
                     break;
                 }
@@ -2580,10 +2662,16 @@ impl State {
             // The records at the table, mixed. The key is the table and its
             // slot count, which says nothing about what the title wrote
             // there since: the fingerprint does, so a table rewritten in
-            // place is never served the slots made for its old records.
+            // place is never served the slots made for its old records. The
+            // slots also hold the host copies the records' descriptors found
+            // then, so the registry revision they were made under is part of
+            // the answer too ([`Memo`], [`crate::shadow::revision`]).
             let words = Fingerprint::of(table, n);
             let identity = (table, n);
-            let seen = self.fresh_table(identity, words);
+            // Read once for the entry and for the one it becomes: the slots
+            // hold the host copies these records' descriptors find now.
+            let now = crate::shadow::revision();
+            let seen = self.fresh_table(identity, words, now);
             if let Some(seen) = seen
             {
                 for &i in &entries {
@@ -2620,7 +2708,7 @@ impl State {
             // identity of this table's contents is a new generation, taken
             // from the one it replaced. The run is the list's ring, given
             // back whole by `State::tables_done`.
-            self.fresh_made(identity, words, first);
+            self.fresh_made(identity, words, first, now);
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3357,6 +3445,54 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 mod tests {
     use super::*;
 
+    /// The registry revision the tests of the fresh-table cache ask under:
+    /// one of their own, so whatever the other tests do to
+    /// `crate::shadow`'s counter cannot move it.
+    const REV: u64 = 1;
+
+    /// A copy answer is used only while the registry of copies still says
+    /// the same thing (`crate::shadow::revision`): title memory remapped
+    /// under the same addresses, or a buffer or window added or let go, can
+    /// make an address name another copy, and a list that kept the old
+    /// answer would bind the copy made for what was there before until its
+    /// tables were given back. An answer of a moved revision is asked again,
+    /// and the answer asked again is the one used from then on.
+    #[test]
+    fn a_copy_answer_is_asked_again_when_the_registry_of_copies_changes() {
+        let key = (0x7ff6_2a00_1000u64, 0x40u64);
+        let mut memo = Memo::<u32>::default();
+        // The answer made under revision 5: the copy's number, here.
+        memo.put(key, 5, 1);
+        assert_eq!(memo.get(key, 5), Some(1), "the revision it was made under keeps it");
+        // The registry moved under it: not the copy the address names now.
+        assert_eq!(memo.get(key, 6), None, "an answer made under 5 is not used under 6");
+        // Asked again, the new answer is kept under the new revision.
+        memo.put(key, 6, 2);
+        assert_eq!(memo.get(key, 6), Some(2), "the answer made under 6");
+        assert_eq!(memo.get(key, 5), None, "and not the answer it replaced");
+        // A revision that moves back is no reason to serve the old answer:
+        // answers are never of two revisions at once.
+        memo.put(key, 7, 3);
+        assert_eq!(memo.get(key, 7), Some(3));
+        assert_eq!(memo.get(key, 6), None);
+    }
+
+    /// The memo keeps [`COPY_CACHE`] answers at most, starting over on the
+    /// next: a list that binds a range per draw holds a copy of every window
+    /// it ever saw otherwise.
+    #[test]
+    fn the_copy_memo_starts_over_at_its_cap() {
+        let mut memo = Memo::<u32>::default();
+        for k in 0..COPY_CACHE as u64 {
+            memo.put((k, 1), 0, k as u32);
+        }
+        assert_eq!(memo.get((0, 1), 0), Some(0), "the first answer is there");
+        // One past the cap: the memo starts over, so only the new answer is.
+        memo.put((COPY_CACHE as u64, 1), 0, 7);
+        assert_eq!(memo.get((0, 1), 0), None);
+        assert_eq!(memo.get((COPY_CACHE as u64, 1), 0), Some(7));
+    }
+
     /// The step the pass takes after looking at a texture it uploaded whole
     /// (`heap_textures`) ends the schedule after `RECHECK_FRAMES`' five
     /// looks, whether the memory changed each time or never. The fingerprint
@@ -3456,12 +3592,12 @@ mod tests {
                 let record = &records[table];
                 let identity = (record.at(), record.count);
                 let words = Fingerprint::of(record.at(), record.count);
-                let first = match state.fresh_table(identity, words) {
+                let first = match state.fresh_table(identity, words, REV) {
                     Some(first) => first,
                     None => {
                         let first = next;
                         next += record.count;
-                        state.fresh_made(identity, words, first);
+                        state.fresh_made(identity, words, first, REV);
                         first
                     }
                 };
@@ -3544,20 +3680,40 @@ mod tests {
         let identity = (record.at(), record.count);
         let mut state = State::default();
         let words = Fingerprint::of(record.at(), record.count);
-        assert_eq!(state.fresh_table(identity, words), None);
-        state.fresh_made(identity, words, 10);
-        assert_eq!(state.fresh_table(identity, words), Some(10));
+        assert_eq!(state.fresh_table(identity, words, REV), None);
+        state.fresh_made(identity, words, 10, REV);
+        assert_eq!(state.fresh_table(identity, words, REV), Some(10));
         // The title rewrites it.
         record.set(3, [1, 2, 3]);
         let words = Fingerprint::of(record.at(), record.count);
-        assert_eq!(state.fresh_table(identity, words), None, "a stale table");
-        state.fresh_made(identity, words, 20);
-        assert_eq!(state.fresh_table(identity, words), Some(20));
+        assert_eq!(state.fresh_table(identity, words, REV), None, "a stale table");
+        state.fresh_made(identity, words, 20, REV);
+        assert_eq!(state.fresh_table(identity, words, REV), Some(20));
         // And back to what it was: the old slots hold the old records, so
         // they are not served either.
         record.set(3, [0, 0, 0]);
         let words = Fingerprint::of(record.at(), record.count);
-        assert_eq!(state.fresh_table(identity, words), None, "a stale table");
+        assert_eq!(state.fresh_table(identity, words, REV), None, "a stale table");
+    }
+
+    /// A table of records the title did not rewrite is made again all the
+    /// same when the registry of host copies answered otherwise since: its
+    /// slots name the copies its descriptors found then, and the records
+    /// themselves (all the fingerprint sees) are unchanged by a remap.
+    #[test]
+    fn a_fresh_table_is_made_again_when_the_registry_of_copies_changes() {
+        let record = Records::new(8);
+        let identity = (record.at(), record.count);
+        let words = Fingerprint::of(record.at(), record.count);
+        let mut state = State::default();
+        state.fresh_made(identity, words, 10, REV);
+        assert_eq!(state.fresh_table(identity, words, REV), Some(10), "the same revision");
+        // Title memory remapped under the table, or a window it names let
+        // go: the descriptors may name other copies from now on.
+        assert_eq!(state.fresh_table(identity, words, REV + 1), None, "another revision");
+        state.fresh_made(identity, words, 20, REV + 1);
+        assert_eq!(state.fresh_table(identity, words, REV + 1), Some(20), "the slots made again");
+        assert_eq!(state.fresh_table(identity, words, REV), None, "and not the ones they replaced");
     }
 
     /// The bookkeeping a draw runs allocates nothing once its tables are
@@ -3570,14 +3726,14 @@ mod tests {
         let mut words = [Fingerprint::default(); 3];
         for (at, record) in records.iter().enumerate() {
             words[at] = Fingerprint::of(record.at(), record.count);
-            state.fresh_made((record.at(), record.count), words[at], at as u32);
+            state.fresh_made((record.at(), record.count), words[at], at as u32, REV);
         }
         let (hits, blocks) = heap::counted(|| {
             let mut hits = 0u32;
             for _ in 0..SCRIPT {
                 for (at, record) in records.iter().enumerate() {
                     let identity = (record.at(), record.count);
-                    if state.fresh_table(identity, words[at]).is_some() {
+                    if state.fresh_table(identity, words[at], REV).is_some() {
                         hits += 1;
                     }
                 }
