@@ -74,6 +74,14 @@ pub(crate) struct Lowered {
     /// the module — rather than a constant the compile fixed.
     #[cfg(test)]
     pub heap_address_indexed: Vec<bool>,
+    /// Whether each cull `emitIndices` of a followed counts request was
+    /// guarded, in emission order.
+    #[cfg(test)]
+    pub cull_guards: Vec<bool>,
+    /// The counts block and the instruction after which the counts were
+    /// emitted, when the request was followed.
+    #[cfg(test)]
+    pub counts_emit: Option<(usize, usize)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -269,6 +277,13 @@ struct Lower<'a> {
     /// Mesh: the two counts, read while their block is lowered.
     count_verts: Option<V>,
     count_prims: Option<V>,
+    /// (test) Whether each cull `emitIndices` was guarded, in emission order.
+    #[cfg(test)]
+    cull_guards: Vec<bool>,
+    /// (test) Where the counts were emitted: the counts block and the
+    /// instruction after which they were (`OutputCounts::after`).
+    #[cfg(test)]
+    counts_emit: Option<(usize, usize)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1054,6 +1069,10 @@ impl<'a> Lower<'a> {
             counts: None,
             count_verts: None,
             count_prims: None,
+            #[cfg(test)]
+            cull_guards: Vec::new(),
+            #[cfg(test)]
+            counts_emit: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1700,19 +1719,17 @@ impl<'a> Lower<'a> {
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 self.count_read(b, i);
+                self.counts_at(b, i);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.count_read(b, j);
+                        self.counts_at(b, j);
                     }
                     i = end;
                     continue;
                 }
                 i += 1;
-            }
-            // Mesh: the group's counts, at the end of the block the console
-            // makes them uniform in.
-            if self.counts.is_some_and(|c| c.block == b) {
-                self.mesh_counts();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
@@ -1743,6 +1760,10 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             heap_address_indexed,
+            #[cfg(test)]
+            cull_guards: self.cull_guards,
+            #[cfg(test)]
+            counts_emit: self.counts_emit,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3703,7 +3724,8 @@ impl<'a> Lower<'a> {
         // come down to the lane count (the lanes then write the slots the
         // counts would name).
         if mode == MeshCounts::Own && !shrunk {
-            let writes: Vec<usize> = self.x.io.exports.iter().map(|e| e.site.0).collect();
+            let writes: Vec<(usize, usize)> =
+                self.x.io.exports.iter().map(|e| e.site).collect();
             let found = output_counts(self.x.p, self.x.st, &writes);
             if mesh_counts_log() {
                 match &found {
@@ -3777,10 +3799,26 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Mesh: the group's output counts, at the end of the block the console
-    /// makes them uniform in, which dominates every output store. Both
-    /// counts or neither: a program whose request could not be read (or
-    /// whose counts went missing) promises the declared maxima, as before.
+    /// Mesh: the group's output counts, right after the later of the two
+    /// reads ([`OutputCounts::after`]) — before every output store, as DXIL
+    /// requires, and before the title's own `exp prim`, so a promised slot
+    /// keeps its cull value only until the title stores over it.
+    fn counts_at(&mut self, b: usize, i: usize) {
+        let Some(counts) = self.counts else { return };
+        if counts.block == b && i == counts.after() {
+            self.mesh_counts();
+            #[cfg(test)]
+            {
+                self.counts_emit = Some((b, i));
+            }
+        }
+    }
+
+    /// Mesh: the group's output counts, after the block that makes them
+    /// uniform has lowered its two reads, which dominates every output
+    /// store. Both counts or neither: a program whose request could not be
+    /// read (or whose counts went missing) promises the declared maxima, as
+    /// before.
     fn mesh_counts(&mut self) {
         let mesh = self.s.mesh.expect("mesh");
         let threads = self.s.threads.expect("mesh")[0];
@@ -3790,7 +3828,7 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        let (v, p) = match (self.count_verts.take(), self.count_prims.take()) {
+        let (v, p, dynamic) = match (self.count_verts.take(), self.count_prims.take()) {
             (Some(v), Some(p)) => {
                 // A count past the declared maximum is not something a
                 // console program sends, and the host faults on one: it
@@ -3798,9 +3836,9 @@ impl<'a> Lower<'a> {
                 let over = self.s.m.cmp(e, pred::IUGT, v, max_v);
                 let v = self.s.m.select(e, over, max_v, v);
                 let over = self.s.m.cmp(e, pred::IUGT, p, max_p);
-                (v, self.s.m.select(e, over, max_p, p))
+                (v, self.s.m.select(e, over, max_p, p), true)
             }
-            _ => (max_v, max_p),
+            _ => (max_v, max_p, false),
         };
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
@@ -3814,8 +3852,14 @@ impl<'a> Lower<'a> {
                 let past = self.s.m.i32(pass * threads);
                 self.s.m.bin(self.cur, Bin::Add, flat, past)
             };
-            let guard = ((pass + 1) * threads > mesh.max_primitives)
+            // A promised count is a value: every pass needs its bounds guard,
+            // or a lane past it writes a primitive the group never promised.
+            // The declared maxima are constants, so only a last pass that
+            // overshoots them needs one.
+            let guard = (dynamic || (pass + 1) * threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            #[cfg(test)]
+            self.cull_guards.push(guard.is_some());
             let at = self.begin_guarded(guard);
             self.s.op(
                 self.cur,
@@ -11155,6 +11199,94 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// Lowers a mesh program that sends the console's allocation request for
+    /// `max_vertices`/`max_primitives` in `threads` lanes and exports nothing.
+    fn lower_mesh(
+        words: &[u32],
+        max_primitives: u32,
+        threads: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
+        use crate::native::{MeshIo, StageIo};
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads,
+                max_vertices: 128,
+                max_primitives,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: threads,
+        })
+    }
+
+    /// A mesh program whose two counts are read first and packed into the
+    /// allocation request four instructions later.
+    const FOLLOWED_COUNTS: [u32; 7] = [
+        0x7E0C_0516, // v_readfirstlane_b32 s6, v22
+        0x7E0E_0522, // v_readfirstlane_b32 s7, v34
+        0x8F07_8C07, // s_lshl_b32 s7, s7, 12
+        0x8806_0607, // s_or_b32 s6, s7, s6
+        0xBEFC_0306, // s_mov_b32 m0, s6
+        0xBF90_0009, // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ, GS_OP_NOP, 0)
+        S_ENDPGM,
+    ];
+
+    /// The cull `emitIndices` of a group whose own counts were followed is
+    /// bounded by that count on every pass. 128 declared primitives over 128
+    /// lanes fills the passes exactly, so a guard on the declared maximum
+    /// alone would leave every lane culling a primitive past the promised
+    /// count: out of bounds, and a write where the group promised none.
+    #[test]
+    fn a_followed_counts_cull_is_guarded_by_the_promised_count() {
+        let l = lower_mesh(&FOLLOWED_COUNTS, 128, 128).expect("a followed request");
+        assert_eq!(
+            l.cull_guards,
+            vec![true],
+            "the cull writes only promised primitives"
+        );
+        // The declared maxima are constants: 256 primitives over 128 lanes is
+        // two full passes, and neither needs a guard on the constant.
+        let l = lower_mesh(&FOLLOWED_COUNTS, 256, 128).expect("a followed request");
+        assert_eq!(l.cull_guards, vec![true, true]);
+    }
+
+    /// The counts are emitted right after the later of their two reads, not
+    /// at the end of their block: a mesh program's `exp prim` comes later in
+    /// that block, and a cull loop after it would overwrite the indices the
+    /// title just stored.
+    #[test]
+    fn the_counts_follow_the_later_of_their_two_reads() {
+        let l = lower_mesh(&FOLLOWED_COUNTS, 128, 128).expect("a followed request");
+        assert_eq!(
+            l.counts_emit,
+            Some((0, 1)),
+            "the counts sit after the second read, before the request's pack"
+        );
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
