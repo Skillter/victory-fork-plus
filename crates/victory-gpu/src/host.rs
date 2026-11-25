@@ -5222,17 +5222,20 @@ impl Host {
         // batch signalled so far ([`CopyOrder`]), and the batches recorded from
         // here on wait for this fetch, published as [`FETCH_BARRIER`].
         //
-        // Both under [`QUEUE_ORDER`], held from the publication to the fetch's
-        // own signal: a batch takes its number and reads that barrier under
-        // both locks ([`Host::card_copies`]), so with the order held no batch
-        // is between the two. A batch is then either numbered before the
-        // publication — the fetch waits for it, and it waited for an older
-        // fetch or for nothing — or numbered after it, and it waited for this
-        // fetch, which does not wait for it. Publishing before taking the order
-        // is what used to break that: a batch numbered after the publication
-        // (and reading the new barrier) was still counted in the value the
-        // fetch waits for, so the copy queue waited for the fetch while the
-        // fetch waited for that batch, and neither queue ever moved again.
+        // Both under [`QUEUE_ORDER`], held from the publication to this fetch's
+        // own signal, list included: a batch takes its number and reads that
+        // barrier while it holds the order ([`Host::card_before`]), so no batch
+        // is recorded between the two. A batch recorded before the publication
+        // waited for nothing newer than the value this fetch waits for; one
+        // recorded after it waits for this fetch, whose list — the only thing
+        // that signals the value that batch waits for — is then already on the
+        // direct queue, ahead of the direct queue's own wait for that batch.
+        //
+        // Taking the order only after the publication gave the lists back is
+        // what used to break that: a batch recorded in the gap waited for this
+        // fetch, the direct queue then waited for that batch, and this fetch's
+        // list was enqueued behind that wait. Both queues waited for each
+        // other, and neither moved again (a TDR).
         let copies = self.copies.as_ref();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -10216,80 +10219,147 @@ mod copy_queue {
         assert!(batch_done(Some(drained), None, drained), "the drained batch is run with it");
     }
 
-    /// The steps a batch or a fetch takes on [`super::QUEUE_ORDER`]: one a
-    /// batch takes (numbered, and the [`super::FETCH_BARRIER`] it reads in the
-    /// same hold), and two a fetch takes, which may be one hold of the order or
-    /// two releases of it.
+    /// The direct queue's operations, in the order they were enqueued.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Direct {
+        /// The wait for the batch just sent on the copy queue.
+        Copies(u64),
+        /// The fetch's own signal: the value a batch waits for.
+        Fetch(u64),
+    }
+
+    /// A step of a script: a batch, or a fetch publishing the value it waits for
+    /// and the barrier the batches after it wait for, its own wait, list and
+    /// signal going to the direct queue in the same step. In the code only the
+    /// second is one hold of [`super::QUEUE_ORDER`]; [`Queues::held`] is that
+    /// hold, and the test's second half is the two steps apart.
     #[derive(Clone, Copy)]
     enum Step {
-        /// A batch: numbered now, and it waits for the fetch in force.
         Batch,
-        /// The fetch publishes its own value as the barrier.
-        FetchPublishes,
-        /// The fetch takes the last value signalled and enqueues its own signal.
-        FetchWaits,
+        Fetch,
     }
 
-    /// Runs a script of steps and names the first cycle it closes: a batch that
-    /// waits for a fetch which waits for that batch. Fence values are the
-    /// batches' own numbers, so the two are comparable.
-    fn cycle_in(script: &[Step]) -> Option<(u64, u64)> {
-        let mut order = CopyOrder::default();
-        let mut barrier: Option<u64> = None;
-        let mut own = 0u64;
-        // Every batch: its number, and the fetch it waits for.
-        let mut batches: Vec<(u64, Option<u64>)> = Vec::new();
-        // Every fetch: its own value, and the batch number it waits for.
-        let mut fetches: Vec<(u64, Option<u64>)> = Vec::new();
-        for step in script {
-            match step {
-                Step::Batch => {
-                    let number = order.sending();
-                    order.signalled(number);
-                    batches.push((number, barrier));
-                }
-                Step::FetchPublishes => {
-                    own += 2;
-                    barrier = Some(own);
-                }
-                Step::FetchWaits => fetches.push((own, fetch_waits(&order))),
-            }
-        }
-        for (number, fetch) in &batches {
-            let Some(value) = fetch else { continue };
-            let Some((_, waits)) = fetches.iter().find(|(own, _)| own == value) else {
-                continue;
-            };
-            if *waits == Some(*number) {
-                return Some((*number, *value));
-            }
-        }
-        None
+    /// The two queues and the waits between them, at the level the deadlock
+    /// lives at: a batch waits for the fetch in force when it is recorded, the
+    /// direct queue waits for every batch it sends, and the fetch's own list
+    /// sits at one place on the direct queue. A deadlock is a batch whose wait
+    /// for the fetch is remembered by the direct queue *ahead of* the fetch's
+    /// own signal: the direct queue stops at that wait, the copy queue's batch
+    /// stops at the fetch, and neither moves again.
+    #[derive(Default)]
+    struct Queues {
+        order: CopyOrder,
+        /// The direct queue, in order.
+        direct: Vec<Direct>,
+        /// Per batch: its copy value, and the fetch value it waits for.
+        batches: Vec<(u64, Option<u64>)>,
+        /// Per fetch: its own value, the copy value it waits for, and where its
+        /// own signal sits on the direct queue ([`usize::MAX`] until enqueued).
+        fetches: Vec<(u64, Option<u64>, usize)>,
+        /// The fetch in force, by its own value.
+        barrier: Option<u64>,
     }
 
-    /// What keeps the two queues in a chain and never in a cycle, modelled on
-    /// the steps under [`super::QUEUE_ORDER`] (`Host::relay_card_fetch`,
-    /// `Host::card_copies`): a fetch publishes its own value and takes the last
-    /// signalled one in one hold, and a batch takes its number and reads that
-    /// barrier in another. So a batch that waits for a fetch was numbered after
-    /// every batch that fetch waits for, and no fetch waits for a batch that
-    /// waits for it. Publishing the barrier before taking the order — what the
-    /// fetch used to do, the two steps separated — is the cycle the queues died
-    /// in: the copy queue waited for the fetch while the fetch waited for the
-    /// batch that had just read the new barrier.
+    impl Queues {
+        fn batch(&mut self) {
+            let number = self.order.sending();
+            self.order.signalled(number);
+            self.batches.push((number, self.barrier));
+            self.direct.push(Direct::Copies(number));
+        }
+
+        /// The fetch's wait for the copy queue, and the barrier the batches
+        /// recorded from here on wait for.
+        fn publishes(&mut self) {
+            let own = (self.fetches.len() as u64 + 1) * 2;
+            self.fetches.push((own, fetch_waits(&self.order), usize::MAX));
+            self.barrier = Some(own);
+        }
+
+        /// The fetch's own wait, list and signal on the direct queue.
+        fn enqueues(&mut self) {
+            let last = self.fetches.len() - 1;
+            let (own, waits, _) = self.fetches[last];
+            if let Some(waits) = waits {
+                self.direct.push(Direct::Copies(waits));
+            }
+            self.direct.push(Direct::Fetch(own));
+            self.fetches[last] = (own, waits, self.direct.len() - 1);
+        }
+
+        /// The first batch that waits for a fetch whose own signal is behind the
+        /// direct queue's wait for that batch, named with the value it waits
+        /// for.
+        fn deadlock(&self) -> Option<(u64, u64)> {
+            for &(number, fetch) in &self.batches {
+                let Some(value) = fetch else { continue };
+                let Some(&(_, _, at)) = self.fetches.iter().find(|(own, _, _)| *own == value)
+                else {
+                    continue;
+                };
+                let Some(here) = self
+                    .direct
+                    .iter()
+                    .position(|op| *op == Direct::Copies(number))
+                else {
+                    continue;
+                };
+                if at > here {
+                    return Some((number, value));
+                }
+            }
+            None
+        }
+
+        /// Runs a script: the two steps of a fetch are one hold of the order,
+        /// so nothing is recorded between them.
+        fn held(script: &[Step]) -> Self {
+            let mut queues = Self::default();
+            for step in script {
+                match step {
+                    Step::Batch => queues.batch(),
+                    Step::Fetch => {
+                        queues.publishes();
+                        queues.enqueues();
+                    }
+                }
+            }
+            queues
+        }
+    }
+
+    /// What keeps the two queues in a chain and never in a cycle, modelled at
+    /// the level the deadlock lives at (`Host::relay_card_fetch`,
+    /// `Host::card_before` → `Host::card_copies`): a fetch publishes the value
+    /// it waits for and puts its own wait, list and signal on the direct queue
+    /// in one hold of [`super::QUEUE_ORDER`]; a batch takes its number, reads
+    /// that barrier and records the direct queue's wait for itself in another.
+    /// So a batch that reads the barrier is recorded after the fetch's list is
+    /// on the direct queue: the fetch's signal is ahead of the direct queue's
+    /// wait for that batch, and the chain holds.
+    ///
+    /// Publishing the barrier before taking the order, as the fetch used to, is
+    /// the cycle: the batch waits for the fetch's value, the direct queue waits
+    /// for that batch, and the fetch's own signal — the only thing that carries
+    /// the value — is behind that wait.
     #[test]
     fn a_fetch_and_the_batches_that_wait_for_it_form_a_chain() {
-        use Step::{Batch, FetchPublishes, FetchWaits};
-        let held = [Batch, Batch, FetchPublishes, FetchWaits];
-        let held = [held.as_slice(), &held, &held].concat();
-        assert_eq!(cycle_in(&held), None, "the publication and the wait, one hold");
-        // The shape that deadlocked: the publication, a batch numbered against
-        // it, and only then the value the fetch waits for.
-        let split = [Batch, FetchPublishes, FetchWaits, Batch, FetchPublishes, Batch, FetchWaits];
+        use Step::{Batch, Fetch};
+        let script = [Batch, Batch, Fetch, Batch, Batch, Fetch, Batch];
+        let held = Queues::held(&script);
+        assert!(held.fetches.len() == 2 && held.batches.len() == 5, "the script ran both");
+        assert_eq!(held.deadlock(), None, "the fetch's signal is ahead of every wait for it");
+        // The shape that deadlocked: the publication, a batch recorded against
+        // it, and only then the fetch's own list and signal.
+        let mut split = Queues::default();
+        split.batch();
+        split.publishes();
+        split.batch();
+        split.enqueues();
         assert_eq!(
-            cycle_in(&split),
-            Some((3, 4)),
-            "the copy queue and the fetch wait for each other"
+            split.deadlock(),
+            Some((2, 2)),
+            "the copy queue's batch and the direct queue wait for each other"
         );
     }
 
