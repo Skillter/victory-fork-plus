@@ -121,6 +121,13 @@ pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
 /// A mesh shader's output size as the DXIL validator measures it against
 /// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
 /// and primitive element, times the maxima rounded up to multiples of 32.
+///
+/// Only the number of declared components counts: register rows, how many
+/// components an element puts in a row, and whether a component is 16-bit
+/// on the console ([`SigElement::half`]) do not enter it. So at the 128
+/// lanes a group has, a mesh program may declare 64 vertex components and
+/// not 65 (4 * 65 * 128 = 33280), and no repacking of the signature can
+/// bring a wider one under the cap: only dropping components does.
 pub(crate) fn mesh_output_bytes(
     vertex: &[SigElement],
     primitive: &[SigElement],
@@ -415,5 +422,68 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// A `TEXCOORD`, `cols` components from component `col` of `row`.
+    fn element(row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(row),
+            col,
+            cols,
+            usage: (((1u16 << cols.min(8)) - 1) as u8) << col,
+            half: false,
+        }
+    }
+
+    /// 4 bytes per declared component times the maxima, and the maxima
+    /// rounded up to 32: 64 components fit at the 128 lanes a group has,
+    /// 65 do not, and 127 vertices cost what 128 cost.
+    #[test]
+    fn mesh_output_budget_is_four_bytes_a_component_at_the_maxima() {
+        let wide = |cols: u8| vec![element(0, 0, cols)];
+        assert_eq!(mesh_output_bytes(&wide(64), &[], 128, 128), MESH_OUTPUT_LIMIT);
+        assert_eq!(mesh_output_bytes(&wide(65), &[], 128, 128), 33280);
+        assert_eq!(
+            mesh_output_bytes(&wide(65), &[], 127, 128),
+            mesh_output_bytes(&wide(65), &[], 128, 128)
+        );
+        assert_eq!(mesh_output_bytes(&wide(65), &[], 96, 128), 4 * 65 * 96);
+        assert_eq!(mesh_output_bytes(&[], &wide(64), 128, 128), MESH_OUTPUT_LIMIT);
+    }
+
+    /// The same components cost the same in one row, in 66 rows, or
+    /// declared 16-bit: only how many a signature declares counts, so
+    /// neither repacking rows nor narrowing a component's type brings a
+    /// program under the cap. The pedestrian mesh programs declare 20 rows
+    /// of 66 components and land on 33792.
+    #[test]
+    fn mesh_output_budget_counts_components_only() {
+        let spaced: Vec<SigElement> = (0..66).map(|row| element(row, 0, 1)).collect();
+        let mut packed: Vec<SigElement> = Vec::new();
+        for row in 0..14 {
+            packed.push(element(row, 0, 4));
+        }
+        for row in 14..16 {
+            packed.push(element(row, 0, 3));
+        }
+        for row in 16..20 {
+            packed.push(element(row, 0, 1));
+        }
+        assert_eq!(spaced.len(), 66);
+        assert_eq!(packed.iter().map(|e| u32::from(e.cols)).sum::<u32>(), 66);
+        assert_eq!(mesh_output_bytes(&packed, &[], 128, 128), 33792);
+        assert_eq!(
+            mesh_output_bytes(&spaced, &[], 128, 128),
+            mesh_output_bytes(&packed, &[], 128, 128)
+        );
+        for e in &mut packed {
+            e.half = true;
+        }
+        assert_eq!(mesh_output_bytes(&packed, &[], 128, 128), 33792);
     }
 }
