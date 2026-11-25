@@ -91,6 +91,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod hw_sgpr;
+#[cfg(all(test, windows))]
+mod image_tests;
 mod lanes;
 mod lower;
 mod own_bits;

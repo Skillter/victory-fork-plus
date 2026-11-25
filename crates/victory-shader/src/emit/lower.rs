@@ -9462,6 +9462,15 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
+                // A level query takes only the spatial coordinates: DXIL
+                // wants those past the image's dimensions undef, and the
+                // layer of an array image is not one of them ("out of bound
+                // coord must be undef": the title's three level queries of a
+                // `Texture2DArray`, `PS_VfxVBuffer_AlphaClip_0e67afa3`).
+                let mut lod_coords = [cs[0], cs[1], cs[2]];
+                for slot in lod_coords.iter_mut().skip(spatial) {
+                    *slot = fu;
+                }
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
@@ -9475,7 +9484,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lod_coords[0], lod_coords[1], lod_coords[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);

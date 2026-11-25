@@ -69,10 +69,20 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
     out.extend(8u32.to_le_bytes());
-    // Validator 1.6 writes one name per element in element order, repeats
-    // included, except that system values share theirs (it keys names by
-    // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // `dxil.dll` regenerates this part with `DxilProgramSignatureWriter` and
+    // compares it byte for byte against ours ("Container part 'Program Output
+    // Signature' does not match expected for module"), so the order here is
+    // the writer's order and nothing else: rows by `(stream, register)` with
+    // ties left in element order — `std::sort` there is `sort_sig`, whose key
+    // is `(Stream, Register, SemanticName-offset)`, and the offset of two
+    // elements of one register ties only when they share a semantic, so in
+    // practice a stable sort by register — and the names in *element* order
+    // (`calcSizes` registers them before any row is written), one per element
+    // and not deduplicated, because our modules declare `dx.valver` 1.6 and
+    // the writer only dedups and 4-aligns for 1.7 and later. Sorting the rows
+    // by column inside a register, as this did, and writing them in element
+    // order, both disagree with the writer: 81 of the title's programs placed
+    // an element in a register that is not its element's register order.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -89,8 +99,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
             }
         }
     }
+    // Stable, so elements sharing a register keep the order the module's
+    // metadata declares them in.
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -558,6 +570,65 @@ mod tests {
         let mut els = [el(Some(0), 0, 4, 1, 0), el(Some(0), 2, 2, 1, 0)];
         share_row_interp(&mut els);
         assert_eq!([els[0].interp, els[1].interp], [1, 1]);
+    }
+
+    /// The title's `VS_PedTransformSkin_*` writes `TEXCOORD22` into `.yz` of
+    /// register 14 and `COLOR0` into `.x` of it, and the elements in between
+    /// are in no register order at all; a part that breaks either tie is
+    /// rejected whole ("Container part 'Program Output Signature' does not
+    /// match expected for module").
+    #[test]
+    fn rows_follow_the_register_and_keep_element_order_within_one() {
+        // `dxil.dll` rewrites this part with `DxilProgramSignatureWriter` and
+        // compares it byte for byte, so both halves of that writer's order are
+        // load-bearing: rows ascend by register, and two elements the console
+        // packed into one register stay in the order the module's metadata
+        // declares them, columns included.
+        let el = |name: &str, index: u32, row: u32, col: u8, cols: u8| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(
+            &[
+                // The high column of a shared register comes first, and the
+                // element in the lower register comes last: element order,
+                // register order and column order all differ.
+                el("TEXCOORD", 22, 2, 1, 2),
+                el("COLOR", 0, 2, 0, 1),
+                el("TEXCOORD", 1, 1, 0, 4),
+            ],
+            false,
+        );
+        let back = super::super::signature(&part).expect("our own part parses");
+        let order: Vec<(&str, u32, u32, u8)> = back
+            .iter()
+            .map(|e| (e.name.as_str(), e.index, e.row.unwrap_or(u32::MAX), e.col))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("TEXCOORD", 1, 1, 0),
+                ("TEXCOORD", 22, 2, 1),
+                ("COLOR", 0, 2, 0)
+            ],
+            "rows must ascend by register and keep element order inside one"
+        );
+        // The names keep element order, so the first row names the second
+        // element: `calcSizes` registers them before any row is written.
+        let base = 8 + 32 * back.len();
+        assert_eq!(
+            &part[base..],
+            b"TEXCOORD\0COLOR\0TEXCOORD\0",
+            "the name blob is in element order, one name per element"
+        );
     }
 
     #[test]
