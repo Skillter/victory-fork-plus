@@ -232,6 +232,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_LOG_FILE=<path>` | also write the log to that file; `0` disables the file |
 | `VICTORY_SHADER_CACHE_KEY=<text>` | start the shader cache cold (it is keyed by the translator, so rebuilds keep it) |
+| `VICTORY_MESH_GROUPS=<n>` | a measurement, not a fix: a mesh dispatch runs `n` groups at most (default 65,535), fewer than the title asked for where it asked for more, so the image changes; `on the GPU` did not follow it (see `MEMORY.md` §5.1) |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

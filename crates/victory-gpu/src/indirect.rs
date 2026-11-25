@@ -59,6 +59,10 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+#ifndef MESHCAP
+// The most groups one mesh dispatch runs.
+#define MESHCAP 65535u
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -107,7 +111,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint was;
         budget.InterlockedMax(4, g.x, was);
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        g = uint3(min(g.x, MESHCAP), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
@@ -242,28 +246,59 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
-/// The `NOCOUNT` define, as `D3DCompile` takes it: one macro, then the
+/// `VICTORY_MESH_GROUPS=<n>`: the most groups one mesh dispatch runs, for
+/// measurement only. The title asks for more (its groups cull themselves),
+/// so whatever a dispatch asked for past `n` does not run and what the title
+/// sees changes; the frame line still says the groups it asked for.
+fn mesh_cap() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let n = std::env::var("VICTORY_MESH_GROUPS").ok()?.parse::<u32>().ok()?;
+        let n = n.max(1);
+        tracing::warn!(
+            groups = n,
+            "VICTORY_MESH_GROUPS: a mesh dispatch runs this many groups at most, fewer than the \
+             title asked for where it asked for more: a measurement, so what the title sees changes"
+        );
+        Some(n)
+    })
+}
+
+/// The macros `D3DCompile` takes for the clamp: `NOCOUNT` when the clamp has
+/// no count buffer, `MESHCAP` under `VICTORY_MESH_GROUPS`, then the
 /// terminator (a null name).
-fn no_count() -> [D3D_SHADER_MACRO; 2] {
-    [
-        D3D_SHADER_MACRO {
+fn macros(no_count: bool) -> Vec<D3D_SHADER_MACRO> {
+    let mut out = Vec::new();
+    if no_count {
+        out.push(D3D_SHADER_MACRO {
             Name: s!("NOCOUNT"),
             Definition: s!("1"),
-        },
-        // The last macro names nothing (a null name, not an empty one): the
-        // compiler stops there, and reads nothing past it.
-        D3D_SHADER_MACRO {
-            Name: PCSTR::null(),
-            Definition: PCSTR::null(),
-        },
-    ]
+        });
+    }
+    if let Some(n) = mesh_cap() {
+        // The compiler reads it while it runs, and the clamp is made once
+        // per run: the text outlives both.
+        let text =
+            Box::leak(std::ffi::CString::new(n.to_string()).expect("digits").into_boxed_c_str());
+        out.push(D3D_SHADER_MACRO {
+            Name: s!("MESHCAP"),
+            Definition: PCSTR(text.as_ptr().cast()),
+        });
+    }
+    // The last macro names nothing (a null name, not an empty one): the
+    // compiler stops there, and reads nothing past it.
+    out.push(D3D_SHADER_MACRO {
+        Name: PCSTR::null(),
+        Definition: PCSTR::null(),
+    });
+    out
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let counted = compile_bound(device, s!("clamp"), None)?;
+    let counted = compile_bound(device, s!("clamp"), &macros(false))?;
     // One root view less to set per clamp without a count buffer. A second
     // source the system's compiler refuses keeps every clamp as it was.
-    let plain = match compile_bound(device, s!("clamp"), Some(&no_count())) {
+    let plain = match compile_bound(device, s!("clamp"), &macros(true)) {
         Ok(plain) => Some(plain),
         Err(e) => {
             tracing::warn!(
@@ -279,7 +314,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 fn compile_bound(
     device: &ID3D12Device,
     name: windows::core::PCSTR,
-    defines: Option<&[D3D_SHADER_MACRO]>,
+    defines: &[D3D_SHADER_MACRO],
 ) -> windows::core::Result<Bound> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -290,7 +325,7 @@ fn compile_bound(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             name,
-            defines.map(<[D3D_SHADER_MACRO]>::as_ptr),
+            Some(defines.as_ptr()),
             None,
             s!("main"),
             s!("cs_5_1"),

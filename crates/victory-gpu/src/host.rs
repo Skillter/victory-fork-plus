@@ -8030,8 +8030,21 @@ impl Meter {
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        // Every group our translation dispatches promises the program's
+        // declared counts whatever the title's culling decided (`emit::lower`'s
+        // `mesh_prologue`): this is what that promises per frame, against the
+        // vertices the title's culling would have kept.
+        let declared = crate::pipeline::host::mesh_declared().map(|((v, p), differ)| {
+            let at = if differ { "at most" } else { "at" };
+            format!(
+                ", {:.0} output vertices and {:.0} primitives {at} {v} of each a group",
+                mesh_groups * v as f64,
+                mesh_groups * p as f64
+            )
+        });
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame{}",
+            declared.unwrap_or_default()
         );
         late_line(frames);
         card_clock_line(frames, ms);

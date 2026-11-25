@@ -129,7 +129,7 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 | `VICTORY_CARD_BUFFERS=0` | disables the card-side buffer shadow copies | **did not change the cutscene ghosting** |
 | `VICTORY_DISPLAY_MODE=WxH` | display size reported to the title | **useless for resolution**, see §6 |
 | `--console series-s` | title targets 1080p | renders at 1920x1080; the black screen on record is unverified against this tree, see §6 |
-| `VICTORY_MESH_GROUPS=n` | caps mesh dispatch groups | upstream tree only, not present here; default 65535; added while chasing the upstream TDR |
+| `VICTORY_MESH_GROUPS=n` | caps the groups one mesh dispatch runs (default 65,535) | **present** since the mesh-cost measurement (§5.1): a measurement switch, so the title sees fewer groups than it asked for; it moved nothing measurable |
 | `VICTORY_SHADER_LOOP_LIMIT=n` | bounds translated loops | did not stop the upstream TDR |
 | `VICTORY_D3D12_DRED=1` | on device loss, name the faulting command | how the upstream TDR was identified |
 | `VICTORY_CAPTURE=<dir>` / `VICTORY_CAPTURE_FRAMES=` / `VICTORY_DUMP_TARGETS=1` | save presented frames / every render target | diagnostics builds only |
@@ -254,6 +254,40 @@ switch off, `on the GPU` 93.8-102.5 ms against 97.7-98.1, the card 75-81 %
 busy in every arm: the spread inside one arm is as wide as between arms, so
 the switch stays off by default, and 4,500 draws cost their submission, not
 the pixels each one covers.
+
+The meshes are what the card does spend, and they cost their dispatches. Five
+runs of the same world (`run-20261125-120438` normal, `-121011`
+`VICTORY_MESH_TEST=scissor`, `-121518` `=skip`, `-122247` and `-122817`
+`VICTORY_MESH_GROUPS=4096` and `=256`):
+
+| arm | fps | ms/frame | `on the GPU` | draws/frame |
+|---|---|---|---|---|
+| normal | 4.8 | 208.9 | 87.8 | 4,398 |
+| mesh shaders run, one pixel rasterised | 4.7 | 212.3 | 102.8 | 4,555 |
+| no mesh dispatch at all | 10.4 | 96.0 | 6.6 | 787 |
+| groups capped at 4,096 | 5.8 | 173.8 | 76.3 | 4,404 |
+| groups capped at 256 | 5.5 | 182.2 | 85.5 | 4,462 |
+
+Mesh geometry is 81 of the 88 ms the card spends, and it is neither the pixels
+it covers (scissor, which runs every shader and rasterises one pixel each,
+does not move the frame) nor the groups inside each dispatch (capping the
+groups 256-fold leaves 85.5 ms against 87.8, and 4,096 leaves 76.3: the spread
+inside one arm is again as wide as between arms). A frame asks for 23,000 to
+98,000 groups in 3,588 mesh dispatches, so it is roughly 20 µs per dispatch
+(`the card's clock per frame` over `4,404 draws/frame` in the same lines),
+against an average of a dozen groups each: the title's own submission, which
+the console pays too. The frame line now prints the groups the title asked for
+beside what our translation promises for them (`host.rs::MESH_GROUPS`,
+`pipeline::host::mesh_declared`): 3 to 12 million output vertices and
+primitives a frame at the 128 declared by every one of the 7,412 cached mesh
+programs (128 threads each). Those maxima are the `shortcut:` in
+`emit::lower::mesh_prologue`: DXIL sets one count for the whole group before
+any output write, while the console's counts come from one lane's allocation
+request, so a group the title culls still writes its 128 cull primitives
+(one `emitIndices` per lane, all indices 0). Lowering them is not open to us
+without that hardware feature, and the cap above says the size of the promise
+is not what the frame pays.
+
 
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 
