@@ -270,6 +270,24 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Whether a container with no `DXIL` part has its programs read from the
+/// `ACCC` part. Off unless `VICTORY_FSPX=1`: a package read this way is the
+/// title's FidelityFX upscale chain, and until every program in it translates
+/// the title stops writing the frame it presents (the world is black behind
+/// its overlays). Refused, the title takes the path it took before the
+/// translator could read these at all, and the frame is drawn again.
+fn fspx_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var_os("VICTORY_FSPX")
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("1") | Some("on")
+        )
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -278,7 +296,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     // `DXIL` part beside it, is in the `ACCC` one.
     let native = match (c.part(FourCC::DXIL), c.part(FourCC::ACCC)) {
         (Some(dxil), _) => crate::native_programs(dxil.data)?,
-        (None, Some(accc)) => crate::fspx::programs(accc.data, &c)?,
+        (None, Some(accc)) if fspx_on() => crate::fspx::programs(accc.data, &c)?,
+        (None, Some(_)) => {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a FidelityFX package of programs (VICTORY_FSPX=1 reads them)",
+            });
+        }
         (None, None) => {
             return Err(ShaderError::Unsupported {
                 offset: 0,

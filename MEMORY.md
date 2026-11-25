@@ -219,6 +219,18 @@ failed to create with `0x80070057`. `VICTORY_DISPLAY_MODE=1920x1080` and
 `resolutionFullscreen` 1920x1080 in `settings.xml` change nothing on series-x:
 the title sizes its targets from the console model, not from either.
 
+*(re-measured, `run-20261125-135405.log`)* reading the FidelityFX package's
+programs (`61bb4d6`, `ACCC`/`FSPX` parts) makes the title take its upscale
+chain. Four of its compute programs still refuse (`a lane mask exchanged where
+not every lane runs`, `a lane mask holding lanes elsewhere read as data`, `a
+descriptor's address or format read as data`, `a 16-bit image atomic`), so the
+title **clears the frame it presents and never draws into it**: `present.
+fallback.cleared` 302 times in `run-20261125-132005.log`, and the window shows
+its overlays over black. Refusing the package again (`VICTORY_FSPX` off by
+default, `run-20261125-135405.log`) restores the path the title took before:
+`the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
+loading screen.
+
 *(re-measured, `run-20261125-092842.log`)* series-s now reaches the world with
 **no failed texture create and no device removal**: `R9G9B9E5` (console format
 67) has neither `RENDER_TARGET` nor `TYPED_UNORDERED_ACCESS_VIEW` support on
@@ -375,6 +387,21 @@ card work is waited for once wherever the landing splits it —
 `run-20261125-100317.log`), and `VICTORY_COPY_QUEUE=1` only moves it into
 preparing, 96 → 168 ms, 205 ms a frame (`run-20261125-101119.log`); measured
 25 Nov.
+
+The argument clamp is not a lever either: with the indirect window off
+(`VICTORY_INDIRECT_WINDOW=0`, `indirect.rs::record_clamp_as` once a record) the
+world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the GPU and 1.04 clamps a
+draw; with the window on, 4,423 draws at 217.6 ms and 0.52 clamps a draw
+(`run-20261125-123322.log` against `-114852.log`) — doubling the clamps did not
+slow the frame, and the 45 ms between the two runs (21 % of the frame, world
+state and machine load included) is larger than anything the clamp
+contributes. A clamp emits 5–6 barrier records (`argument clamp: N clamped and
+M barrier records`), so at 0.52 clamps a draw it owns 3.1 of the 3.20 barrier
+records a draw on the list, against the title's own 0.07. It cannot be removed
+to check: `VICTORY_CLAMP=off` crashed the title in the loading scene after
+2 min 36 s with `0xC0000005` and no frame line (`run-20261125-115523.log`), so
+the arguments there are genuinely malformed and the clamp is load-bearing.
+Measured 25 Nov.
 
 ## 5.2 Missing content — clothes and materials
 

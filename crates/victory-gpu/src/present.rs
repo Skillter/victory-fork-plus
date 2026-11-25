@@ -32,7 +32,9 @@
 //!   frame of a title that pads 1080 lines to 1088 is either texture, and
 //!   guessing between them draws the wrong one.
 //!
-//! `VICTORY_PRESENT_FALLBACK=0` turns the fallback off; it is on by default.
+//! `VICTORY_PRESENT_FALLBACK=1` turns the fallback on; it is off by default,
+//! because a substituted frame can lack the layers the title composites into
+//! the frame it presents (the world's own draw is one of them).
 #![cfg_attr(not(windows), allow(dead_code))] // the decision is tested everywhere
 
 use std::sync::Mutex;
@@ -74,6 +76,15 @@ impl Target {
     /// The title texture this names.
     pub(crate) fn this(&self) -> This {
         self.key as This
+    }
+
+    /// One target, named for a log line: the texture, its shape, and whether a
+    /// shader read it.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{:#x} {}x{} format={} flags={:#x} sampled={}",
+            self.key, self.width, self.height, self.format, self.flags, self.sampled
+        )
     }
 }
 
@@ -143,10 +154,10 @@ fn note(list: &mut Vec<usize>, at: usize) {
     }
 }
 
-/// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=0` turns it off).
+/// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=1` turns it on).
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_some_and(|v| v == "1"))
 }
 
 /// A draw, dispatch, copy or resolve rendered into `this`: it holds a frame.
@@ -278,19 +289,24 @@ pub(crate) fn pick(
     if shaped.is_empty() {
         return Err(Why::Nothing);
     }
-    // A frame is never larger than the one it is shown in: the title draws it
-    // at its render size and upscales, or draws it at the presented size. A
-    // larger target of the same shape is a shadow map or a UI layer, and
-    // showing it shows the wrong picture.
+    // A fallback may only show a frame the title drew smaller than the one it
+    // presents by more than a few lines of padding: that is the upscale's
+    // source, and the presented frame provably cannot hold it. A target of the
+    // frame's own size, or larger, is a guess with no evidence behind it, so
+    // the frame is shown as it is instead.
     let presented = u64::from(size.0) * u64::from(size.1);
     let fits: Vec<usize> = shaped
         .iter()
         .copied()
         .filter(|&i| {
-            u64::from(since.targets[i].width) * u64::from(since.targets[i].height) <= presented
+            let t = &since.targets[i];
+            u64::from(t.width) * u64::from(t.height) * 100 < presented * 99
         })
         .collect();
-    let shaped = if fits.is_empty() { shaped } else { fits };
+    if fits.is_empty() {
+        return Err(Why::Nothing);
+    }
+    let shaped = fits;
     // A target a shader read is the frame's own source; failing that, the
     // largest of the frame's shape.
     let read: Vec<usize> = shaped
@@ -480,12 +496,15 @@ mod tests {
         assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
     }
 
-    /// When every written target is larger than the frame, the largest is
-    /// still shown rather than nothing.
+    /// When every written target is larger than the frame, the frame is shown
+    /// as it is: a target of its own size or larger is a guess.
     #[test]
     fn a_larger_target_is_shown_when_it_is_all_there_is() {
         let targets = vec![target(0x20, 3840, 2160, false)];
-        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+        assert_eq!(
+            pick((1920, 1080), &since(false, targets), |_| true),
+            Err(Why::Nothing)
+        );
     }
 
     /// Another shape is another picture: a shadow atlas or a 4:3 probe of the
@@ -499,12 +518,16 @@ mod tests {
         );
     }
 
-    /// 1088 lines for 1080 is the same shape (scanout padding), and one such
-    /// target alone is shown.
+    /// 1088 lines for 1080 is the same shape (scanout padding), but a padded
+    /// target is not a frame the title drew smaller: the frame is shown as it
+    /// is rather than guessed at.
     #[test]
-    fn padding_of_a_few_lines_is_the_same_shape() {
+    fn padding_of_a_few_lines_is_no_smaller_frame() {
         let targets = vec![target(0x10, 1920, 1088, false)];
-        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+        assert_eq!(
+            pick((1920, 1080), &since(false, targets), |_| true),
+            Err(Why::Nothing)
+        );
     }
 
     /// A target the pass cannot read (an integer or shader-unreadable format)

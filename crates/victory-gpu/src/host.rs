@@ -8385,6 +8385,7 @@ impl Host {
         // (`crate::present`). Everything below reads the size, the format and
         // the state of whichever it is, so the fallback is shown exactly as a
         // frame of its size would be.
+        present_window_line((desc.Width as u32, desc.Height as u32), since);
         let mut picture = texture;
         let mut picture_state = state;
         let mut picture_this = None;
@@ -8425,7 +8426,7 @@ impl Host {
                             victory_core::logging::warn_once("present.fallback", || {
                                 format!(
                                     "presented frame was not written; showing the {}x{} frame it \
-                                     did write (VICTORY_PRESENT_FALLBACK=0 turns this off)",
+                                     did write (VICTORY_PRESENT_FALLBACK=1 turns this on)",
                                     desc.Width, desc.Height
                                 )
                             });
@@ -8734,6 +8735,43 @@ fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
     unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     (w > 0 && h > 0).then_some((w as u32, h as u32))
+}
+
+/// Every couple of seconds: what the present was told the window did, so a black
+/// window can be traced to the texture the title really writes. Names the frame's
+/// size and, for each target rendered into since the last present, the texture,
+/// its shape and flags, and whether a shader read it.
+fn present_window_line(frame: (u32, u32), since: &crate::present::Since) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// Presents between lines, at ~20 fps a line every two seconds.
+    const EVERY: u32 = 40;
+    static PRESENTS: AtomicU32 = AtomicU32::new(0);
+    if PRESENTS.fetch_add(1, Ordering::Relaxed) % EVERY != 0 {
+        return;
+    }
+    let (width, height) = frame;
+    let mut named: Vec<String> = since
+        .targets
+        .iter()
+        .take(6)
+        .map(crate::present::Target::describe)
+        .collect();
+    if since.targets.len() > named.len() {
+        named.push(format!("and {} more", since.targets.len() - named.len()));
+    }
+    let names = if named.is_empty() {
+        "none".to_string()
+    } else {
+        named.join("; ")
+    };
+    tracing::info!(
+        frame_width = width,
+        frame_height = height,
+        written = since.written,
+        cleared = since.cleared,
+        targets = %names,
+        "the window a present closes"
+    );
 }
 
 /// Once: a present whose frame nothing wrote, and no target of its shape to
