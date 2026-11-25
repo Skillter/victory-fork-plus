@@ -10,13 +10,16 @@
 //! per level, counted in bytes), with at most the staging buffer's worth of
 //! compressed source in flight. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
-//! destination (an address, or physical pages). Files are read through a
-//! second, unbuffered handle: the package is 208 GB and the title's working
-//! set is its GPU memory living in host RAM, so passing every byte through
-//! the Windows file cache costs more than the read. A request whose offset or
-//! length is not on a sector boundary, or a file the host would not open that
-//! way, goes through the title's buffered handle; the five-second line counts
-//! both. `VICTORY_DSTORAGE_WORKERS` (default `min(64, 4 x cores)`) and
+//! destination (an address, or physical pages). Files are read through second
+//! handles that leave the Windows file cache out: the package is 208 GB and
+//! the title's working set is its GPU memory living in host RAM, so passing
+//! every byte through the cache costs more than the read. A synchronous handle
+//! allows one I/O at a time, so each file carries a pool of them; and a
+//! compressed block's length is not a sector multiple, so a request is read as
+//! the whole sectors that hold it and copied out of them. Only a file the host
+//! would not open unbuffered goes through the title's cached handle, and the
+//! five-second line counts that. `VICTORY_DSTORAGE_WORKERS` (default
+//! `min(64, 4 x cores)`) and
 //! `VICTORY_DSTORAGE_STAGING_MB` (default the console's 32) bound the pool and
 //! the compressed bytes in flight. Completion is what stays
 //! in order: a status entry is written once every request enqueued before
@@ -152,7 +155,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     }
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let direct = direct_handle(path);
+    let direct = direct_handles(path);
     tracing::info!(
         path = name,
         iid = iid_text(iid),
@@ -291,18 +294,97 @@ struct File {
     direct: Option<Direct>,
 }
 
-/// A handle the file cache stays out of. Reads are positioned, so it carries
-/// no file pointer and every worker may read through it at once; a worker
-/// waiting in a read is one request outstanding at the drive, which is why
-/// the pool's size is what sets the queue depth.
+/// The handles a file's reads go through, and the workers waiting for one.
+///
+/// They leave the file cache out: the package is 208 GB, and read through the
+/// cache every byte of it evicts the title's working set, which is its GPU
+/// memory living in host RAM. Each is positioned, so it carries no file
+/// pointer, and each is synchronous, so it carries one I/O at a time: the pool
+/// is what puts reads at the drive together (36 KiB reads on a 990 EVO Plus:
+/// one handle served 64 workers at 171 MB/s, eight at 255, and asynchronous
+/// reads on one at 365).
 struct Direct {
-    file: std::fs::File,
+    /// Handles no read is using. Never empty for long: a lease returns its own.
+    free: Mutex<Vec<std::fs::File>>,
+    /// A lease returned a handle.
+    returned: Condvar,
 }
 
-/// A second handle on the file `path` names, opened without the file cache;
-/// `None` when the host refuses one (a file system or a share that does not
-/// allow it). Reads then stay buffered, and the five-second line counts them.
-fn direct_handle(path: *const u16) -> Option<Direct> {
+/// Unbuffered handles per file: the knee of that curve, and eight reads at the
+/// drive from every file the title streams from.
+const HANDLES: usize = 8;
+
+impl Direct {
+    fn new(files: Vec<std::fs::File>) -> Direct {
+        Direct {
+            free: Mutex::new(files),
+            returned: Condvar::new(),
+        }
+    }
+
+    /// One handle for the length of a read, waiting when every other is out.
+    fn lease(&self) -> Lease<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(file) = free.pop() {
+                return Lease {
+                    direct: self,
+                    file: Some(file),
+                };
+            }
+            free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A file's unbuffered handle, held for the length of one read and given back
+/// to the pool when dropped, whatever the read did.
+struct Lease<'a> {
+    direct: &'a Direct,
+    file: Option<std::fs::File>,
+}
+
+impl std::ops::Deref for Lease<'_> {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &std::fs::File {
+        // A lease always holds a handle; `Drop` takes it out.
+        self.file.as_ref().expect("a lease holds a handle")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        self.direct
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(file);
+        self.direct.returned.notify_one();
+    }
+}
+
+/// The unbuffered handles for the file `path` names, `HANDLES` of them at most;
+/// `None` when the host refuses even one (a file system or a share that does
+/// not allow it). Reads then stay buffered, and the five-second line counts
+/// them.
+fn direct_handles(path: *const u16) -> Option<Direct> {
+    let first = direct_handle(path)?;
+    let mut files = vec![first];
+    while files.len() < HANDLES {
+        match direct_handle(path) {
+            Some(file) => files.push(file),
+            None => break,
+        }
+    }
+    Some(Direct::new(files))
+}
+
+/// One handle the file cache stays out of.
+fn direct_handle(path: *const u16) -> Option<std::fs::File> {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
@@ -323,9 +405,7 @@ fn direct_handle(path: *const u16) -> Option<Direct> {
         return None;
     }
     // SAFETY: a handle we just opened and nobody else owns.
-    Some(Direct {
-        file: unsafe { std::fs::File::from_raw_handle(handle) },
-    })
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -595,6 +675,7 @@ impl Lanes {
                     read_mb_per_s = format_args!("{:.1}", window.read_mb_per_s()),
                     staging_waits = window.staging_waits,
                     buffered_reads = window.buffered,
+                    widened_reads = window.widened,
                     "{}",
                     window.sentence()
                 );
@@ -620,6 +701,7 @@ impl Lanes {
             read_ns,
             read_worst_ns,
             buffered: BUFFERED.swap(0, Ordering::Relaxed),
+            widened: WIDENED.swap(0, Ordering::Relaxed),
             started: self.started,
             finished: self.done.0,
             bytes: self.done.1,
@@ -731,6 +813,8 @@ struct Window {
     read_worst_ns: u64,
     /// Reads that went through the title's buffered handle instead.
     buffered: u64,
+    /// Reads served by reading the sectors that hold them.
+    widened: u64,
     started: u64,
     finished: u64,
     /// Destination bytes written, and worker time spent on the requests.
@@ -779,10 +863,11 @@ impl Window {
             "dstorage: last {secs:.1} s: {read_mb:.0} MB read in {count} reads ({read_rate:.1} MB/s), \
              {mb:.0} MB written at {rate:.1} MB/s, {started} requests started and {finished} finished; \
              a read took {mean_ms:.1} ms on average and {worst:.1} ms at worst, {buffered} through the \
-             file cache; staging peaked at {staged:.1} MB of {budget:.1} MB with {waits} waits, \
-             {running} requests ran at once of {pool:.0} workers ({busy:.2} busy, {reading:.2} waiting on \
-             the drive); {waiting} requests were queued; zlib made {zlib:.0} MB in {zlib_workers:.2} \
-             workers of time, BCPack {bcpack:.0} MB in {bcpack_workers:.2} workers",
+             file cache, {widened} through a sector window; staging peaked at {staged:.1} MB of \
+             {budget:.1} MB with {waits} waits, {running} requests ran at once of {pool:.0} workers \
+             ({busy:.2} busy, {reading:.2} waiting on the drive); {waiting} requests were queued; \
+             zlib made {zlib:.0} MB in {zlib_workers:.2} workers of time, BCPack {bcpack:.0} MB in \
+             {bcpack_workers:.2} workers",
             secs = self.secs(),
             read_mb = self.read_bytes as f64 / 1e6,
             count = count,
@@ -794,6 +879,7 @@ impl Window {
             mean_ms = mean_ms,
             worst = self.read_worst_ns as f64 / 1e6,
             buffered = self.buffered,
+            widened = self.widened,
             staged = self.staged_high as f64 / 1e6,
             budget = self.staging as f64 / 1e6,
             waits = self.staging_waits,
@@ -1233,10 +1319,12 @@ fn sector_aligned(address: usize) -> bool {
     address.is_multiple_of(SECTOR)
 }
 
-/// Whether a request may take the unbuffered path: its file offset and its
-/// length are multiples of `SECTOR`. The title's DirectStorage contract aligns
-/// both, so this is the common case; anything else goes through the title's
-/// buffered handle.
+/// Whether a request is on the sectors the drive takes: its file offset and
+/// its length are both multiples of `SECTOR`. Such a read lands in the
+/// destination itself; anything else is read as the sectors that hold it. A
+/// compressed block's length is where its stream ends, so it almost never is:
+/// the run that reported 2211 reads "through the file cache" had 2211 of 2211
+/// off a sector and 79 of 79 files open unbuffered.
 fn unbuffered_fits(offset: u64, size: usize) -> bool {
     offset.is_multiple_of(SECTOR as u64) && size.is_multiple_of(SECTOR)
 }
@@ -1282,9 +1370,14 @@ impl Meter {
 /// File reads, and zlib output with the time it took.
 static READS: Meter = Meter::new();
 static INFLATED: Meter = Meter::new();
-/// Reads that stayed on the title's buffered handle: offset or length off a
-/// sector, or a file the host would not open unbuffered.
+/// Reads that stayed on the title's buffered handle: a file the host would not
+/// open unbuffered, or an unbuffered read the host refused. Everything else is
+/// read through the pool, a sector window at a time when the request is not on
+/// one.
 static BUFFERED: AtomicU64 = AtomicU64::new(0);
+/// Reads widened to the whole sectors that hold them: a compressed block ends
+/// where its stream does, which is never a sector boundary.
+static WIDENED: AtomicU64 = AtomicU64::new(0);
 
 /// A compressed request's source: borrowed from title memory or from the
 /// worker's read buffer, or a buffer of its own when it is too large to keep.
@@ -1310,8 +1403,9 @@ fn read_source<'a>(
 }
 
 /// Fills `out` (the source size) from the request's file or memory, through
-/// the handle that leaves the file cache out when the request allows it.
-/// `copy` takes a read whose destination is not on a sector boundary.
+/// one of the handles that leave the file cache out. `copy` takes a read whose
+/// request is not the whole sectors a drive takes, or whose destination is not
+/// on a sector boundary.
 fn read_into(request: &Request, out: &mut [u8], copy: &mut Vec<u8>) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
@@ -1322,39 +1416,74 @@ fn read_into(request: &Request, out: &mut [u8], copy: &mut Vec<u8>) -> Result<()
     let file = unsafe { &(*request.source.cast::<Instance<File>>()).state };
     let started = std::time::Instant::now();
     let result = match &file.direct {
-        Some(direct) if unbuffered_fits(request.offset, out.len()) => {
-            read_unbuffered(direct, request.offset, out, copy)
-        }
-        _ => {
-            BUFFERED.fetch_add(1, Ordering::Relaxed);
-            read_span(&file.file, request.offset, out)
-        }
+        Some(direct) => read_direct(direct, &file.file, request.offset, out, copy),
+        None => read_cached(&file.file, request.offset, out),
     };
     READS.add(if result.is_ok() { out.len() } else { 0 }, started.elapsed());
     result
 }
 
-/// Reads `out` at `offset` through the handle that leaves the file cache out,
-/// copying through `copy` when the destination's own address is not on a
-/// sector boundary: an unbuffered read needs the buffer and the offset both
-/// aligned. The read is a positioned one, so the handle carries no file
-/// pointer and every worker may use it at once.
-fn read_unbuffered(
+/// A read the file cache serves, for a file the host would not open unbuffered
+/// or one whose unbuffered read failed. The five-second line counts these.
+fn read_cached(file: &std::fs::File, offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
+    BUFFERED.fetch_add(1, Ordering::Relaxed);
+    read_span(file, offset, out)
+}
+
+/// Reads `out` at `offset` through one of the file's unbuffered handles, and
+/// falls back to the title's cached one when the host refuses the read (the
+/// drive takes whole sectors, so a request that ends at the file's last,
+/// partial one has no window).
+fn read_direct(
     direct: &Direct,
+    cached: &std::fs::File,
     offset: u64,
     out: &mut [u8],
     copy: &mut Vec<u8>,
 ) -> Result<(), HRESULT> {
-    if sector_aligned(out.as_ptr() as usize) {
-        return read_span(&direct.file, offset, out);
+    let leased = {
+        let lease = direct.lease();
+        sectors(&lease, offset, out, copy)
+    };
+    match leased {
+        Ok(()) => Ok(()),
+        Err(hr) => {
+            tracing::debug!(
+                offset,
+                len = out.len(),
+                hr = format_args!("{hr:#010x}"),
+                "dstorage: an unbuffered read failed; the cached handle serves it"
+            );
+            read_cached(cached, offset, out)
+        }
     }
-    // The handle leaves the file cache out, so the kernel reads straight into
-    // the buffer: that buffer has to start on a sector boundary, which a
-    // `Vec<u8>`'s own pointer is not. Take an aligned window of one that is
-    // a sector larger than asked, kept between requests.
-    let buffer = aligned_in(copy, out.len());
-    read_span(&direct.file, offset, buffer)?;
-    out.copy_from_slice(buffer);
+}
+
+/// The unbuffered read: `out` starts on a sector and holds whole sectors, or
+/// else the sectors that hold the request are read into `copy` and the request
+/// is copied out of them. Every byte asked for comes from the right place,
+/// once, and an unbuffered read needs the buffer, the offset and the length on
+/// a sector boundary.
+fn sectors(
+    file: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+    copy: &mut Vec<u8>,
+) -> Result<(), HRESULT> {
+    let len = out.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if sector_aligned(out.as_ptr() as usize) && unbuffered_fits(offset, len) {
+        return read_span(file, offset, out);
+    }
+    let start = offset & !(SECTOR as u64 - 1);
+    let end = (offset + len as u64).div_ceil(SECTOR as u64) * SECTOR as u64;
+    let window = aligned_in(copy, (end - start) as usize);
+    read_span(file, start, window)?;
+    let skip = (offset - start) as usize;
+    out.copy_from_slice(&window[skip..skip + len]);
+    WIDENED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2090,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn only_sector_aligned_requests_take_the_unbuffered_path() {
+    fn only_sector_aligned_requests_land_in_the_destination_itself() {
         assert!(unbuffered_fits(0, 0), "nothing to read needs no alignment");
         assert!(unbuffered_fits(0, SECTOR));
         assert!(unbuffered_fits(SECTOR as u64 * 7, 2 * SECTOR));
@@ -2110,8 +2239,8 @@ mod tests {
         assert!(sector_aligned(grown.as_ptr() as usize));
     }
 
-    /// A handle opened the way `direct_handle` opens one, over a temp file:
-    /// nothing here needs the title.
+    /// A pool of handles opened the way `direct_handles` opens them, over a
+    /// temp file: nothing here needs the title.
     fn direct_file(bytes: &[u8]) -> (tempfile::TempDir, Direct) {
         use std::os::windows::fs::OpenOptionsExt;
         const NO_BUFFERING: u32 = 0x2000_0000;
@@ -2123,7 +2252,7 @@ mod tests {
             .custom_flags(NO_BUFFERING)
             .open(&path)
             .expect("this volume takes unbuffered reads");
-        (dir, Direct { file })
+        (dir, Direct::new(vec![file]))
     }
 
     #[test]
@@ -2145,32 +2274,113 @@ mod tests {
     }
 
     #[test]
-    fn unbuffered_reads_serve_aligned_requests_and_copy_for_the_rest() {
+    fn unbuffered_reads_serve_on_sector_requests_and_widen_the_rest() {
         let contents = pattern(3 * SECTOR);
         let (_dir, direct) = direct_file(&contents);
         let mut scratch = Scratch::default();
 
-        // An aligned destination is the buffer the read lands in.
+        // A destination that is whole sectors, on an offset that is one, is
+        // the buffer the read lands in.
         let out = scratch.read.prepare(contents.len());
-        read_unbuffered(&direct, 0, out, &mut scratch.packed).unwrap();
+        sectors(&direct.lease(), 0, out, &mut scratch.packed).unwrap();
         assert_eq!(out, &contents[..]);
 
         // A destination off a sector boundary goes through the copy buffer,
         // which must still hold every byte.
         let mut unaligned = vec![0u8; contents.len() + 1];
-        read_unbuffered(&direct, 0, &mut unaligned[1..], &mut scratch.packed).unwrap();
+        sectors(&direct.lease(), 0, &mut unaligned[1..], &mut scratch.packed).unwrap();
         assert_eq!(&unaligned[1..], &contents[..]);
         assert_eq!(unaligned[0], 0, "the byte before the destination is untouched");
+
+        // A compressed block: an offset inside a sector and a length that ends
+        // inside one. The sectors that hold it are read and the request copied
+        // out of them, which is what every compressed request needs.
+        let mut block = [0u8; 1000];
+        sectors(&direct.lease(), 5000, &mut block, &mut scratch.packed).unwrap();
+        assert_eq!(block, contents[5000..6000]);
 
         // Past the end is the end of the file, and nothing is written: the
         // buffer still holds what the earlier read left in it.
         let before = out[..SECTOR].to_vec();
         let tail = scratch.read.prepare(SECTOR);
         assert_eq!(
-            read_unbuffered(&direct, contents.len() as u64, tail, &mut scratch.packed),
+            sectors(&direct.lease(), contents.len() as u64, tail, &mut scratch.packed),
             Err(END_OF_FILE)
         );
         assert_eq!(tail, &before[..]);
+    }
+
+    /// A large batch of requests, run the way the pool runs them: every byte
+    /// asked for arrives, once, in the right place, whatever the request's
+    /// alignment and however many requests share the file.
+    #[test]
+    fn a_batch_of_requests_gets_every_byte_once_and_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::Arc;
+        const NO_BUFFERING: u32 = 0x2000_0000;
+        // Bytes are their own address, so a read that lands elsewhere cannot
+        // pass, and the file is whole sectors plus a tail a window must not
+        // read past.
+        let len = 1 << 20;
+        let contents: Vec<u8> = (0..len).map(|i| (i as u8) ^ (i >> 7) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.bin");
+        std::fs::write(&path, &contents).unwrap();
+        let files: Vec<std::fs::File> = (0..HANDLES)
+            .map(|_| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(NO_BUFFERING)
+                    .open(&path)
+                    .expect("this volume takes unbuffered reads")
+            })
+            .collect();
+        let direct = Arc::new(Direct::new(files));
+
+        // Requests of every shape: whole sectors, a block that ends anywhere,
+        // a destination off a sector, and a request that starts inside one.
+        const LARGEST: usize = 256 * 1024 + 3;
+        let shapes: [(usize, usize, usize); 6] = [
+            (0, 3 * SECTOR, 0),
+            (SECTOR, 40_000, 0),
+            (7, 1000, 0),
+            (3 * SECTOR + 1, 2 * SECTOR + 5, 1),
+            (0, 1, 0),
+            (5 * SECTOR, LARGEST, 3),
+        ];
+        // Every request plus the sectors its window may widen to ends inside
+        // the file, so a window never runs into the end of it.
+        let room = len - (LARGEST + 8 * SECTOR);
+        let mut workers = Vec::new();
+        for (t, _) in (0..8).enumerate() {
+            let direct = Arc::clone(&direct);
+            let expected = contents.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut copy = Vec::new();
+                let mut reads = 0;
+                for i in 0..64 {
+                    let (offset, ask, skew) = shapes[(i + t) % shapes.len()];
+                    let at = (i * SECTOR * 7 + offset) % room;
+                    let mut buffer = vec![0xAAu8; ask + skew + 1];
+                    let out = &mut buffer[skew..skew + ask];
+                    sectors(&direct.lease(), at as u64, out, &mut copy).unwrap();
+                    assert_eq!(
+                        out,
+                        &expected[at..at + ask],
+                        "request {i} on thread {t} at {at} for {ask} bytes"
+                    );
+                    assert!(
+                        buffer[..skew].iter().all(|&b| b == 0xAA)
+                            && buffer[skew + ask..].iter().all(|&b| b == 0xAA),
+                        "a request wrote outside its destination"
+                    );
+                    reads += 1;
+                }
+                reads
+            }));
+        }
+        let reads: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(reads, 8 * 64, "every request ran");
     }
 
     #[test]
@@ -2182,6 +2392,7 @@ mod tests {
             read_ns: 1_000_000_000,
             read_worst_ns: 40_000_000,
             buffered: 3,
+            widened: 97,
             started: 100,
             finished: 100,
             bytes: 120_000_000,
@@ -2207,6 +2418,7 @@ mod tests {
         assert!(line.contains("8 requests ran at once"), "{line}");
         assert!(line.contains("10.0 ms on average and 40.0 ms at worst"), "{line}");
         assert!(line.contains("3 through the file cache"), "{line}");
+        assert!(line.contains("97 through a sector window"), "{line}");
         assert!(line.contains("2 requests were queued"), "{line}");
     }
 }
