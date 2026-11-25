@@ -12,6 +12,13 @@
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
 //!
+//! The folder keeps more than the live library: a start that could not
+//! replace a mapped file leaves the newer one beside it ([`NEXT_FILE`]), and
+//! a save killed while it wrote the whole library leaves one as `.tmp`. No
+//! run ever reads those back, so opening the folder drops them ([`prune`]):
+//! the live file and one other generation stay, and a generation nothing has
+//! read for [`MAX_IDLE`] goes, whatever else is there.
+//!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
@@ -48,17 +55,20 @@
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::time::{Duration, SystemTime};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on, after
+/// dropping the library files this run will not read ([`prune`]).
 pub fn use_pipeline_cache(dir: PathBuf) {
+    prune(&dir, SystemTime::now());
     let _ = DIR.set(dir);
 }
 
@@ -429,6 +439,10 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// What the library's own files begin with: the live one, and beside it the
+/// generations [`prune`] drops (`host-pipelines.next`, `.tmp`, and a
+/// generation named after an adapter or driver key if one is ever added).
+const LIBRARY_STEM: &str = "host-pipelines";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
@@ -438,6 +452,106 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// stops recording: a name first drawn after it is filled is not listed, and
 /// the next run loses that early start. [`note_used`] says so once.
 const EARLY_MAX: usize = 8192;
+
+/// Generations of the library's file kept beside the live one: one. A start
+/// that could not replace a mapped file leaves the newer library beside it
+/// as [`NEXT_FILE`], and the next start promotes it; a save killed while it
+/// wrote the whole library leaves one as `.tmp` instead, which no run reads
+/// back. One of those is worth keeping, and every further one is hundreds of
+/// megabytes nothing will open again.
+const OTHERS_KEPT: usize = 1;
+
+/// How long a generation of the library's file may go unread before it goes
+/// however few are beside it: a month, the same rule the shader cache keeps
+/// (`victory_pipeline::PrunePolicy`). The host refuses a library of another
+/// adapter, driver or generator, so such a generation is never read again,
+/// and at 187 KB to 1.4 MB a pipeline it is 232 MB to 737 MB each.
+const MAX_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// What one pruning pass removed from the pipelines folder.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pruned {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Drops the library's own older generations in `dir`, and says one line when
+/// it removed anything (nothing at all when there was nothing to remove).
+///
+/// Only files named after the library are looked at, so the early list beside
+/// them and anything someone else put there are left alone. Of those:
+/// - the live file this run opens ([`LIBRARY_FILE`]) is never a candidate;
+/// - a `.tmp` is a save that never finished, and is a candidate whatever its
+///   age: no run reads one back, and the next save truncates it;
+/// - one other generation stays, the newest of them (the [`NEXT_FILE`] the
+///   next start promotes), and any generation nothing has read for
+///   [`MAX_IDLE`] goes whatever else is beside it.
+///
+/// A file another run has open for writing, or one this account may not
+/// remove, is a warning and nothing more: a cache that cannot be pruned must
+/// not stop the run. `now` is given so that a test can run the rule without
+/// waiting a month.
+pub(crate) fn prune(dir: &Path, now: SystemTime) -> Pruned {
+    let mut pruned = Pruned::default();
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        // Nothing was ever written here: the first run.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return pruned,
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "cannot read the pipeline library folder");
+            return pruned;
+        }
+    };
+    // Path, last write, bytes, and whether it is a save that never finished.
+    let mut candidates: Vec<(PathBuf, SystemTime, u64, bool)> = Vec::new();
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // The live library, the early list and everything else here belongs
+        // to this run, to a title, or to someone who put it there.
+        if !name.starts_with(LIBRARY_STEM) || name == LIBRARY_FILE {
+            continue;
+        }
+        // `file_type` describes the entry itself, never what it points at: a
+        // link out of the folder is not ours to remove, and neither is a
+        // directory in a generation's place.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(modified) = metadata.modified() else { continue };
+        candidates.push((entry.path(), modified, metadata.len(), name.ends_with(".tmp")));
+    }
+    // Newest first: the one generation worth keeping is the newest one.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+    let mut kept = 0usize;
+    for (path, modified, bytes, unfinished) in candidates {
+        // A time in the future (a clock that moved) counts as untouched.
+        let idle = now.duration_since(modified).unwrap_or_default();
+        if !unfinished && idle <= MAX_IDLE && kept < OTHERS_KEPT {
+            kept += 1;
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                pruned.files += 1;
+                pruned.bytes += bytes;
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot prune a pipeline library generation");
+            }
+        }
+    }
+    if pruned.files > 0 {
+        tracing::info!(
+            files = pruned.files,
+            bytes = pruned.bytes,
+            dir = %dir.display(),
+            "pruned older pipeline library generations"
+        );
+    }
+    pruned
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -544,12 +658,18 @@ impl Census {
         }
     }
 
-    /// Pipelines, distinct root signatures, names that shared one, and the
-    /// bytes a pipeline takes in a library of `library` bytes when `handled`
-    /// pipelines (made or loaded this run) are what it holds.
-    fn counts(&self, library: u64, handled: u64) -> (u64, u64, u64, u64) {
-        let per_pipeline = library.checked_div(handled).unwrap_or(0);
-        (self.names.len() as u64, self.signatures.len() as u64, self.shared, per_pipeline)
+    /// Pipeline and signature counts, and the sizes [`Figures`] reports.
+    fn figures(&self, library: u64, opened: u64, made: u64) -> Figures {
+        let grown = library.saturating_sub(opened);
+        Figures {
+            pipelines: self.names.len() as u64,
+            signatures: self.signatures.len() as u64,
+            shared: self.shared,
+            library,
+            opened,
+            grown,
+            per_pipeline: (made > 0 && grown > 0).then(|| grown / made),
+        }
     }
 
     fn classes(&self) -> String {
@@ -561,37 +681,73 @@ impl Census {
     }
 }
 
-/// The census, once per session, at the first save that knows the library's
-/// size: distinct root signatures against distinct pipelines and stage
-/// classes, what the root-signature cache reused and created, and the bytes
-/// a pipeline takes in the library's file.
+/// What one census line reports. The library's size and what this run's own
+/// pipelines added to it are kept apart on purpose: dividing the whole
+/// library (which already holds every pipeline of every earlier run) by the
+/// pipelines of this one gave "1,443,536 bytes a pipeline" on a warm library
+/// and 187,257 for the same code on a cold one, and neither was a figure
+/// anyone could use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Figures {
+    /// Distinct pipelines this run made or loaded.
+    pub(crate) pipelines: u64,
+    /// Distinct root signatures they were made with.
+    pub(crate) signatures: u64,
+    /// Those that found their signature in the set already.
+    pub(crate) shared: u64,
+    /// The library's serialised size now, on disk and in memory alike.
+    pub(crate) library: u64,
+    /// Its size when this run opened it; 0 when it started empty.
+    pub(crate) opened: u64,
+    /// What this run's own pipelines added: the library now, less what it
+    /// was. The host need not grow a library linearly, so this is measured,
+    /// never assumed.
+    pub(crate) grown: u64,
+    /// [`Figures::grown`] over the pipelines this run made: the bytes one
+    /// pipeline of this run added. `None` when it made none (nothing to
+    /// divide by) and when the library did not grow.
+    pub(crate) per_pipeline: Option<u64>,
+}
+
+/// The save a reader will look at: the forced save a run ends with, and every
+/// save of a diagnostics build, to watch the figures move. The 60-second
+/// saves of a normal run stay quiet: the warm-up's figures are not the run's,
+/// and the one shot this replaces printed them once, a minute in, forever.
+fn census(now: bool, library: &Library) {
+    if !now && !cfg!(feature = "diagnostics") {
+        return;
+    }
+    // SAFETY: a plain query on a live library.
+    let size = unsafe { library.library.GetSerializedSize() };
+    report_census(size as u64);
+}
+
+/// Distinct root signatures against distinct pipelines and stage classes,
+/// what the root-signature cache reused and created, the library's size, and
+/// what a pipeline this run made added to it.
 fn report_census(library: u64) {
-    static SAID: AtomicBool = AtomicBool::new(false);
-    let (pipelines, signatures, shared, per_pipeline, classes) = {
+    let made = MADE.load(Ordering::Relaxed);
+    let (figures, classes) = {
         let census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(census) = census.as_ref() else { return };
         if census.names.is_empty() {
             return;
         }
-        let made = MADE.load(Ordering::Relaxed);
-        let loaded = LOADED.load(Ordering::Relaxed);
-        let (pipelines, signatures, shared, per_pipeline) = census.counts(library, made + loaded);
-        (pipelines, signatures, shared, per_pipeline, census.classes())
+        (census.figures(library, BLOB.load(Ordering::Relaxed), made), census.classes())
     };
-    if SAID.swap(true, Ordering::Relaxed) {
-        return;
-    }
     let (hits, created) = super::host::root_signature_counts();
     tracing::info!(
-        pipelines,
-        signatures,
-        shared,
+        pipelines = figures.pipelines,
+        signatures = figures.signatures,
+        shared = figures.shared,
         created,
         hits,
-        library,
-        made = MADE.load(Ordering::Relaxed),
+        library_bytes = figures.library,
+        opened_bytes = figures.opened,
+        grown_bytes = figures.grown,
+        made,
         loaded = LOADED.load(Ordering::Relaxed),
-        bytes_per_pipeline = per_pipeline,
+        bytes_per_pipeline_made = ?figures.per_pipeline,
         classes = %classes,
         "pipeline census"
     );
@@ -680,17 +836,18 @@ pub(crate) fn save(now: bool) {
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). `None`: there is nothing
+    // to write at all.
+    let bytes: Option<usize> = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
-        }
-        if added == 0 {
-            0
+        let changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !changed && added == 0 {
+            None
+        } else if added == 0 {
+            Some(0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -702,8 +859,15 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            Some(size)
         }
+    };
+    let Some(bytes) = bytes else {
+        // Nothing to write, but a forced save is still the one a reader looks
+        // at: the census of a run that only loaded pipelines is due here and
+        // nowhere else.
+        census(now, library);
+        return;
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
@@ -739,7 +903,7 @@ pub(crate) fn save(now: bool) {
                 started_early = EARLY.load(Ordering::Relaxed),
                 "host pipeline library saved"
             );
-            report_census(size as u64);
+            census(now, library);
         }
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
@@ -845,21 +1009,40 @@ mod tests {
     }
 
     /// The census counts one pipeline once, however often it is named, and
-    /// holds the root signature it shares with another pipeline apart from
-    /// the ones only one of them has.
+    /// the per-pipeline figure is what this run's own pipelines added, never
+    /// the whole library over this run's count.
     #[test]
-    fn the_census_counts_pipelines_signatures_and_classes() {
+    fn the_census_counts_pipelines_and_what_each_added() {
         let mut census = Census::default();
         census.add("compute", b"root A", "one");
         census.add("compute", b"root A", "two");
         census.add("graphics", b"root B", "three");
         census.add("compute", b"root A", "one"); // the same pipeline again
-        let (pipelines, signatures, shared, per_pipeline) = census.counts(600, 3);
-        assert_eq!((pipelines, signatures, shared), (3, 2, 1));
-        assert_eq!(per_pipeline, 200, "600 bytes over the three pipelines made");
         assert_eq!(census.classes(), "compute 2, graphics 1");
-        // Nothing made: no bytes claimed, and no divide by zero.
-        assert_eq!(census.counts(600, 0).3, 0);
+
+        // A cold run: a library of 600 bytes, made by three pipelines.
+        let cold = census.figures(600, 0, 3);
+        assert_eq!((cold.pipelines, cold.signatures, cold.shared), (3, 2, 1));
+        assert_eq!((cold.library, cold.opened, cold.grown), (600, 0, 600));
+        assert_eq!(cold.per_pipeline, Some(200));
+
+        // A warm run: the library already held 737,846,212 bytes, and the two
+        // pipelines this run made added 2,097,152. Dividing the whole library
+        // by the session's count gave the 1,443,536-byte "pipeline" of the
+        // newest log and 187,257 for the same code on a cold cache; the
+        // growth over what was made is 1,048,576 either way.
+        let warm = census.figures(737_846_212 + 2_097_152, 737_846_212, 2);
+        assert_eq!(warm.grown, 2_097_152);
+        assert_eq!(warm.per_pipeline, Some(1_048_576));
+
+        // Nothing made (a run that only loaded pipelines): no figure, and no
+        // divide by zero.
+        let idle = census.figures(737_846_212, 737_846_212, 0);
+        assert_eq!((idle.grown, idle.per_pipeline), (0, None));
+        // A library that shrank (the host reorganises its own): no figure
+        // rather than a wrapped one.
+        let shrank = census.figures(700, 900, 4);
+        assert_eq!((shrank.grown, shrank.per_pipeline), (0, None));
     }
 
     #[test]
@@ -973,5 +1156,139 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    /// A file of `len` bytes called `name` in `dir`, last written `when`: a
+    /// generation of the library's file as a start leaves one.
+    fn planted(dir: &Path, name: &str, len: usize, when: SystemTime) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; len]).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        path
+    }
+
+    fn ago(now: SystemTime, days: u64) -> SystemTime {
+        now - Duration::from_secs(days * 24 * 60 * 60)
+    }
+
+    /// A clock a test can reason about: every planted time is relative to it.
+    fn a_fixed_now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 * 24 * 60 * 60)
+    }
+
+    /// The file this run opens and replaces is never a candidate, however
+    /// little anything has read it: a run that dropped its own library would
+    /// rebuild thousands of pipelines.
+    #[test]
+    fn the_live_library_is_never_pruned() {
+        // The pruner protects the name the library is opened under: the two
+        // must not drift apart.
+        assert!(LIBRARY_FILE.starts_with(LIBRARY_STEM));
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 4_096, ago(now, 400));
+        // The early list beside it is the title's, not a generation.
+        let early = planted(dir.path(), EARLY_FILE, 40, ago(now, 400));
+        assert_eq!(prune(dir.path(), now), Pruned::default(), "nothing to prune");
+        assert!(live.exists(), "the live library stays whatever its age");
+        assert!(early.exists(), "the early list is not the library's");
+    }
+
+    /// Beyond the live file one generation stays, the newest: the one a start
+    /// left for the next to promote. Older ones are the hundreds of megabytes
+    /// a driver or key change leaves behind.
+    #[test]
+    fn one_generation_beside_the_live_library_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 100, ago(now, 4));
+        let next = planted(dir.path(), NEXT_FILE, 300, ago(now, 1));
+        // A generation of another adapter or driver, and a save of a build
+        // that named the library differently: neither is ever read again.
+        let older = planted(dir.path(), "host-pipelines-0f3a.bin", 200, ago(now, 2));
+        let oldest = planted(dir.path(), "host-pipelines-9c11.bin", 500, ago(now, 3));
+        let pruned = prune(dir.path(), now);
+        assert_eq!((pruned.files, pruned.bytes), (2, 700));
+        assert!(live.exists() && next.exists(), "the live file and the newest other stay");
+        assert!(!older.exists() && !oldest.exists(), "the rest go");
+    }
+
+    /// The age rule holds under the cap: one generation beside the live one,
+    /// and still gone when nothing has read it for a month.
+    #[test]
+    fn a_generation_nobody_read_for_a_month_goes_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 100, ago(now, 1));
+        let stale = planted(dir.path(), NEXT_FILE, 400, ago(now, 31));
+        let pruned = prune(dir.path(), now);
+        assert_eq!((pruned.files, pruned.bytes), (1, 400));
+        assert!(live.exists());
+        assert!(!stale.exists(), "a month unread is dead whatever the count");
+        // A time in the future (a clock that moved) counts as untouched.
+        let ahead = planted(dir.path(), "host-pipelines-0f3a.bin", 64, now + Duration::from_secs(86_400));
+        assert_eq!(prune(dir.path(), now), Pruned::default());
+        assert!(ahead.exists(), "a stamp after the clock is not an old file");
+    }
+
+    /// A save killed while it wrote the whole library leaves a full-size
+    /// `.tmp` no run reads back: it goes whatever its age, not one of the
+    /// generations the cap counts.
+    #[test]
+    fn a_save_that_never_finished_goes_whatever_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 100, ago(now, 1));
+        let next = planted(dir.path(), NEXT_FILE, 300, ago(now, 2));
+        let half = planted(dir.path(), "host-pipelines.tmp", 250, now - Duration::from_secs(60));
+        let pruned = prune(dir.path(), now);
+        assert_eq!((pruned.files, pruned.bytes), (1, 250));
+        assert!(live.exists() && next.exists(), "the promotion candidate stays");
+        assert!(!half.exists(), "an unfinished save is never read back");
+    }
+
+    /// A generation the file system refuses to remove is left where it is and
+    /// counted as nothing: a warning, never a panic. A directory in a
+    /// generation's place is the one shape of that refusal a test can make
+    /// without a second process; a read-only file is not one, because the
+    /// standard library deletes it (measured here: 900 bytes taken from under
+    /// `FILE_ATTRIBUTE_READONLY`).
+    #[test]
+    fn a_generation_that_cannot_be_removed_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 100, ago(now, 1));
+        let guarded = dir.path().join("host-pipelines-0f3a.bin");
+        std::fs::create_dir(&guarded).unwrap();
+        std::fs::write(guarded.join("kept.bin"), vec![b'x'; 900]).unwrap();
+        assert_eq!(prune(dir.path(), now), Pruned::default(), "nothing was removed");
+        assert!(guarded.join("kept.bin").exists(), "a generation that could not be removed stays");
+        assert!(live.exists());
+        // A read-only file is removed like any other, so the pass reports it.
+        let readonly = planted(dir.path(), "host-pipelines-9c11.bin", 300, ago(now, 40));
+        let mut permissions = std::fs::metadata(&readonly).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&readonly, permissions).unwrap();
+        assert_eq!(prune(dir.path(), now), Pruned { files: 1, bytes: 300 });
+        assert!(live.exists() && guarded.exists());
+    }
+
+    /// A directory where a generation would be is not ours to remove, and
+    /// neither is a file that is not the library's.
+    #[test]
+    fn only_the_librarys_own_files_are_looked_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = a_fixed_now();
+        let live = planted(dir.path(), LIBRARY_FILE, 100, ago(now, 1));
+        // A folder in a generation's place, and a neighbour's file.
+        let in_the_way = dir.path().join("host-pipelines-0f3a.bin");
+        std::fs::create_dir(&in_the_way).unwrap();
+        let theirs = planted(dir.path(), "notebook.bin", 64, ago(now, 400));
+        assert_eq!(prune(dir.path(), now), Pruned::default());
+        assert!(in_the_way.is_dir() && theirs.exists() && live.exists());
+        // An empty folder that was never written is the first run: no warning,
+        // nothing to do.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(prune(&empty.path().join("pipelines"), now), Pruned::default());
     }
 }
