@@ -653,16 +653,28 @@ struct Looked {
     again: Option<(u64, u8)>,
 }
 
+/// Whether a look's fingerprints differ **and** some of the memory is still
+/// there: only then is the difference content the title put in after the
+/// upload. `texture::fingerprint` reads through the kernel, which reads what
+/// is not mapped as zeros, so a texture the title streamed out differs at
+/// every look with nothing written to it: 233 warnings in
+/// `run-20261125-055341.log`, 170 slots, for changes this pass could not tell
+/// from those (the slot is taken as gone just below, [`Looked`]).
+/// `mapped` is asked only when the bytes differ.
+fn look_changed(print: u64, seen: u64, mapped: impl FnOnce() -> bool) -> bool {
+    seen != print && mapped()
+}
+
 /// The step after one look (`heap_textures`): the look that finds a change
 /// counts as one and the schedule goes on from there. Restarting it at
 /// `RECHECK_FRAMES[0]` uploaded a texture the title rewrites for ever every
 /// fourth frame, for the rest of the run.
-fn recheck_step(frame: u64, looks: u8, print: u64, seen: u64) -> Looked {
+fn recheck_step(frame: u64, looks: u8, changed: bool) -> Looked {
     let next = looks.saturating_add(1);
     let again = RECHECK_FRAMES
         .get(usize::from(next))
         .map(|&wait| (frame + wait, next));
-    Looked { changed: seen != print, again }
+    Looked { changed, again }
 }
 
 /// Looks at uploaded textures picked by index that found the memory as it
@@ -2070,7 +2082,10 @@ impl State {
             // own step.
             let mut relook = Some((frame + RECHECK_FRAMES[0], 0u8));
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                let looked = recheck_step(frame, looks, print, crate::texture::fingerprint(at, len));
+                let changed = look_changed(print, crate::texture::fingerprint(at, len), || {
+                    crate::texture::mapped_bytes(at as *const u8, len as usize) > 0
+                });
+                let looked = recheck_step(frame, looks, changed);
                 if !looked.changed {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match looked.again {
@@ -3516,7 +3531,7 @@ mod tests {
                 made += 1;
                 // The upload's own fingerprint, or another one each look.
                 let seen = if changed { print ^ made as u64 } else { print };
-                let looked = recheck_step(frame, looks, print, seen);
+                let looked = recheck_step(frame, looks, look_changed(print, seen, || true));
                 assert_eq!(looked.changed, changed, "look {made}, changed {changed}");
                 match looked.again {
                     Some((next_due, next_looks)) => {
@@ -3538,6 +3553,34 @@ mod tests {
         }
         // The first look is the first wait of the schedule.
         assert_eq!(RECHECK_FRAMES[0], 4);
+    }
+
+    /// A look at a texture whose memory is not there is no evidence of
+    /// content: `texture::fingerprint` reads a page the title demapped as
+    /// zeros, so a texture streamed out differs at every look with nothing
+    /// written to it. Read as a change, it was warned about (`with nothing to
+    /// tell of it`, 233 times in `run-20261125-055341.log`) and uploaded
+    /// again with zeros. The mapping is asked only when the bytes differ.
+    #[test]
+    fn a_texture_streamed_out_is_no_change_of_content() {
+        let print = 0x1234_5678_9abc_def1u64;
+        // Its memory is gone: what the kernel reads is zeros, not content.
+        assert!(!look_changed(print, 0, || false), "a demapped texture is no change");
+        // Its memory is there and the bytes are its own: no change either,
+        // and the mapping is not asked for.
+        let mut asked = 0;
+        assert!(!look_changed(print, print, || {
+            asked += 1;
+            true
+        }));
+        assert_eq!(asked, 0, "the mapping was asked of a texture that did not change");
+        // Its memory is there and the bytes differ: content arrived.
+        assert!(look_changed(print, print ^ 1, || true));
+        // A texture streamed out is left to the pass's own check
+        // (`texture_slot_gone`, `texture_slot_later`), on the same schedule.
+        let looked = recheck_step(4, 0, look_changed(print, 0, || false));
+        assert!(!looked.changed);
+        assert_eq!(looked.again, Some((4 + RECHECK_FRAMES[1], 1)), "the look still counts");
     }
 
     /// The records of one descriptor table, as the title writes them: three
