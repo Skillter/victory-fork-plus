@@ -82,12 +82,14 @@
 
 mod bitcode;
 mod container;
+mod counts;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lanes;
 mod lower;
 mod own_bits;
 mod rect;

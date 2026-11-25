@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
+use super::counts::{MeshCounts, OutputCounts, mesh_counts, mesh_counts_log, output_counts};
+use super::lanes::{all_lane_blocks, lane_regions};
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -25,7 +27,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
-type Why = &'static str;
+pub(super) type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +114,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
-const GS_ALLOC_REQ: u16 = 9;
+pub(super) const GS_ALLOC_REQ: u16 = 9;
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
@@ -260,6 +262,12 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: where the console asks for the group's output counts, when the
+    /// request was followed ([`output_counts`]).
+    counts: Option<OutputCounts>,
+    /// Mesh: the two counts, read while their block is lowered.
+    count_verts: Option<V>,
+    count_prims: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -365,84 +373,6 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
-
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
-    let n = st.exits.len();
-    let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
-}
-
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
-    Some(regions)
-}
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
@@ -1573,6 +1503,9 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             flat: None,
+            counts: None,
+            count_verts: None,
+            count_prims: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2218,6 +2151,7 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                self.count_read(b, i);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2226,6 +2160,11 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            // Mesh: the group's counts, at the end of the block the console
+            // makes them uniform in.
+            if self.counts.is_some_and(|c| c.block == b) {
+                self.mesh_counts();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
@@ -4143,7 +4082,9 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
+        let mut shrunk = false;
         if !fits(mesh) {
+            shrunk = true;
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
@@ -4157,6 +4098,36 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.entry;
         let void = self.s.t.void;
+        let mode = mesh_counts();
+        if mode == MeshCounts::Zero {
+            // Experiment: promise the group nothing and write nothing.
+            let z = self.s.m.i32(0);
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[z, z]);
+            return Ok(());
+        }
+        // The counts the console asks for, emitted where it packs them
+        // (which DXIL allows: one call, before every store). The maxima when
+        // the request cannot be followed, and always when the maxima had to
+        // come down to the lane count (the lanes then write the slots the
+        // counts would name).
+        if mode == MeshCounts::Own && !shrunk {
+            let writes: Vec<usize> = self.x.io.exports.iter().map(|e| e.site.0).collect();
+            let found = output_counts(self.x.p, self.x.st, &writes);
+            if mesh_counts_log() {
+                match &found {
+                    Ok(c) => eprintln!(
+                        "MESH-COUNTS followed block={} verts={} prims={}",
+                        c.block, c.verts, c.prims
+                    ),
+                    Err(why) => eprintln!("MESH-COUNTS maxima {why}"),
+                }
+            }
+            if let Ok(counts) = found {
+                self.counts = Some(counts);
+                return Ok(());
+            }
+        }
         let (v, p) = (
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
@@ -4192,6 +4163,79 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// Mesh: holds on to a count read in the block that packs the console's
+    /// allocation request ([`output_counts`]).
+    fn count_read(&mut self, b: usize, i: usize) {
+        let Some(counts) = self.counts else { return };
+        if counts.block != b || (i != counts.verts && i != counts.prims) {
+            return;
+        }
+        let got = self.x.p.blocks[b].insts[i]
+            .writes
+            .first()
+            .and_then(|&(_, v)| match self.vals.get(&v) {
+                Some(Val::I32(x)) => Some(*x),
+                _ => None,
+            });
+        if i == counts.verts {
+            self.count_verts = got;
+        } else {
+            self.count_prims = got;
+        }
+    }
+
+    /// Mesh: the group's output counts, at the end of the block the console
+    /// makes them uniform in, which dominates every output store. Both
+    /// counts or neither: a program whose request could not be read (or
+    /// whose counts went missing) promises the declared maxima, as before.
+    fn mesh_counts(&mut self) {
+        let mesh = self.s.mesh.expect("mesh");
+        let threads = self.s.threads.expect("mesh")[0];
+        let e = self.cur;
+        let void = self.s.t.void;
+        let (max_v, max_p) = (
+            self.s.m.i32(mesh.max_vertices),
+            self.s.m.i32(mesh.max_primitives),
+        );
+        let (v, p) = match (self.count_verts.take(), self.count_prims.take()) {
+            (Some(v), Some(p)) => {
+                // A count past the declared maximum is not something a
+                // console program sends, and the host faults on one: it
+                // comes down to the maximum instead.
+                let over = self.s.m.cmp(e, pred::IUGT, v, max_v);
+                let v = self.s.m.select(e, over, max_v, v);
+                let over = self.s.m.cmp(e, pred::IUGT, p, max_p);
+                (v, self.s.m.select(e, over, max_p, p))
+            }
+            _ => (max_v, max_p),
+        };
+        self.s
+            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        let flat = self.mesh_thread();
+        let z = self.s.m.i32(0);
+        let passes = mesh.max_primitives.div_ceil(threads.max(1));
+        for pass in 0..passes {
+            let index = if pass == 0 {
+                flat
+            } else {
+                let past = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, past)
+            };
+            let guard = ((pass + 1) * threads > mesh.max_primitives)
+                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            let at = self.begin_guarded(guard);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[index, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and

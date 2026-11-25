@@ -276,17 +276,30 @@ inside one arm is again as wide as between arms). A frame asks for 23,000 to
 98,000 groups in 3,588 mesh dispatches, so it is roughly 20 µs per dispatch
 (`the card's clock per frame` over `4,404 draws/frame` in the same lines),
 against an average of a dozen groups each: the title's own submission, which
-the console pays too. The frame line now prints the groups the title asked for
-beside what our translation promises for them (`host.rs::MESH_GROUPS`,
-`pipeline::host::mesh_declared`): 3 to 12 million output vertices and
-primitives a frame at the 128 declared by every one of the 7,412 cached mesh
-programs (128 threads each). Those maxima are the `shortcut:` in
-`emit::lower::mesh_prologue`: DXIL sets one count for the whole group before
-any output write, while the console's counts come from one lane's allocation
-request, so a group the title culls still writes its 128 cull primitives
-(one `emitIndices` per lane, all indices 0). Lowering them is not open to us
-without that hardware feature, and the cap above says the size of the promise
-is not what the frame pays.
+the console pays too. The frame line prints the groups the title asked for
+beside what a group is promised at most (`host.rs::MESH_GROUPS`,
+`pipeline::host::mesh_declared`): 128 output vertices and 128 primitives each,
+3 to 12 million a frame. "At most" is literal now: `emit::lower::output_counts`
+follows the console's allocation request (`s_sendmsg GS_ALLOC_REQ`,
+`m0 = vertices | primitives << 12`) back to the two `v_readfirstlane_b32`
+values that pack it, and a group is promised that pair, clamped to 128 and
+emitted where it dominates every output store. All 8,797 mesh programs of this
+title follow (`VICTORY_MESH_COUNTS_LOG=1`); a program whose request cannot be
+followed keeps the declared maxima, which is the `shortcut:` still in
+`emit::lower::mesh_prologue` for it. `VICTORY_MESH_COUNTS=max` restores the
+maxima, `=zero` promises nothing.
+
+The size of the promise is not what the frame pays; the caps above say so, and
+so does promising nothing. Last ten frames of three runs minutes apart
+(`run-20261125-125520` `zero`, `-131331` `max`, `-132005` `own`), `on the GPU`
+and draws/frame: 74.7 at 4,440, 96.5 at 6,909, 62.0 at 4,502. The same draw
+count costs different times in different runs: 4,550 to 4,610 draws cost 91 to
+158 ms with `own` (`-132005`) and 108 to 161 ms with `max` (`-133938`), while
+4,430 to 4,850 cost 74 to 93 ms with `zero` (`-125520`). Two runs of one arm
+spread as widely as any two arms, and `copying back` grew from 175 to 200 ms as
+the machine's pagefile filled, so a promise this size does not move the frame:
+the 81 ms is inside the dispatches, where neither the group count nor the
+promised output changes it.
 
 
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
