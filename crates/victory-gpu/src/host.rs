@@ -62,6 +62,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// The pixel shading rate every host graphics list carries
+    /// (`VICTORY_SHADING_RATE`); `None` when the switch is off or the device
+    /// has no variable shading rate above tier 1 ([`shading_rate`]).
+    shading: Option<ShadingRate>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -818,6 +822,120 @@ fn background_processing(named: Option<&str>) -> Background {
     }
 }
 
+/// What `VICTORY_SHADING_RATE` asks of the pixel shading rate: one pixel
+/// shader invocation over a rectangle of pixels, on every host graphics list
+/// ([`HostList::shade`]). Measured on the world it changed nothing
+/// (`MEMORY.md` §5.1): the cost there is per draw, not per pixel, so the
+/// switch is off unless asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShadingRate {
+    /// One invocation per pixel, the console's own rate.
+    Off,
+    X1Y2,
+    X2Y1,
+    X2Y2,
+    X4Y4,
+}
+
+impl ShadingRate {
+    /// The one spelling of each rate, case aside: text that names none is
+    /// refused to `off` by [`shading_rate_asked`] rather than guessed at.
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "1x2" => Some(Self::X1Y2),
+            "2x1" => Some(Self::X2Y1),
+            "2x2" => Some(Self::X2Y2),
+            "4x4" => Some(Self::X4Y4),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::X1Y2 => "1x2",
+            Self::X2Y1 => "2x1",
+            Self::X2Y2 => "2x2",
+            Self::X4Y4 => "4x4",
+        }
+    }
+
+    fn d3d12(self) -> D3D12_SHADING_RATE {
+        match self {
+            Self::Off => D3D12_SHADING_RATE_1X1,
+            Self::X1Y2 => D3D12_SHADING_RATE_1X2,
+            Self::X2Y1 => D3D12_SHADING_RATE_2X1,
+            Self::X2Y2 => D3D12_SHADING_RATE_2X2,
+            Self::X4Y4 => D3D12_SHADING_RATE_4X4,
+        }
+    }
+}
+
+/// `VICTORY_SHADING_RATE`, default `off`: nothing named is `off`, and text
+/// that names no rate is warned about once and refused to `off`.
+fn shading_rate_asked(named: Option<&str>) -> ShadingRate {
+    match named.and_then(ShadingRate::parse) {
+        Some(asked) => asked,
+        None => {
+            if let Some(text) = named {
+                victory_core::logging::warn_once("gpu.shading_rate.value", || {
+                    format!(
+                        "VICTORY_SHADING_RATE: off, 1x2, 2x1, 2x2 or 4x4; off is used; value={text}"
+                    )
+                });
+            }
+            ShadingRate::Off
+        }
+    }
+}
+
+/// The rate the lists carry, from the switch and the device's tier. A device
+/// whose feature query failed (`None`) or that knows only tier 1 keeps 1x1:
+/// `RSSetShadingRate` there is a no-op or refused, and a pipeline or a list
+/// must never fail over a switch.
+fn shading_rate_in_force(
+    asked: ShadingRate,
+    tier: Option<D3D12_VARIABLE_SHADING_RATE_TIER>,
+) -> Option<ShadingRate> {
+    match tier {
+        Some(tier) if tier.0 >= D3D12_VARIABLE_SHADING_RATE_TIER_2.0 => match asked {
+            ShadingRate::Off => None,
+            asked => Some(asked),
+        },
+        _ => None,
+    }
+}
+
+/// Reads `VICTORY_SHADING_RATE` and the device's variable shading rate tier
+/// once, logs both once (the tier is logged even when the switch is off), and
+/// returns the rate every host graphics list carries.
+fn shading_rate(device: &ID3D12Device) -> Option<ShadingRate> {
+    let named = std::env::var("VICTORY_SHADING_RATE").ok();
+    let asked = shading_rate_asked(named.as_deref());
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    // SAFETY: writes `options` of the given size.
+    let tier = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS6,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+    }
+    .then_some(options.VariableShadingRateTier);
+    let in_force = shading_rate_in_force(asked, tier);
+    tracing::info!(
+        asked = asked.name(),
+        tier = tier.map_or(-1, |tier| tier.0),
+        in_force = in_force.map_or("off", |rate| rate.name()),
+        "variable shading rate: asked, the device's tier (tier 2 is required), and what the \
+         host graphics lists carry"
+    );
+    in_force
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -986,6 +1104,9 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // `VICTORY_SHADING_RATE`, and what this device makes of it, before a
+        // list exists to carry it.
+        let shading = shading_rate(&device);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1003,6 +1124,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            shading,
         })
     }
 }
@@ -1054,6 +1176,54 @@ mod tests {
         };
         assert_eq!(count("present.frame_format"), Some(10), "{totals:?}");
         assert_eq!(count("present.resize"), Some(2), "{totals:?}");
+    }
+
+    /// The shading rate switch names five states, case aside, and refuses
+    /// anything else to `off`; a device whose query failed or that knows only
+    /// tier 1 keeps 1x1, and `off` is 1x1 even on a tier-2 device.
+    #[test]
+    fn the_shading_rate_switch_names_five_rates() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        use super::{ShadingRate, shading_rate_asked, shading_rate_in_force};
+        assert_eq!(ShadingRate::parse("off"), Some(ShadingRate::Off));
+        assert_eq!(ShadingRate::parse(" 1X2 "), Some(ShadingRate::X1Y2));
+        assert_eq!(ShadingRate::parse("2x1"), Some(ShadingRate::X2Y1));
+        assert_eq!(ShadingRate::parse("2x2"), Some(ShadingRate::X2Y2));
+        assert_eq!(ShadingRate::parse("4x4"), Some(ShadingRate::X4Y4));
+        assert_eq!(ShadingRate::parse("1x1"), None, "1x1 is spelled off");
+        assert_eq!(ShadingRate::parse("4x2"), None, "a rate the switch does not name");
+        assert_eq!(ShadingRate::parse("3x3"), None);
+        assert_eq!(ShadingRate::parse(""), None);
+        assert_eq!(shading_rate_asked(None), ShadingRate::Off, "nothing named is off");
+        assert_eq!(shading_rate_asked(Some("typo")), ShadingRate::Off);
+        assert_eq!(shading_rate_asked(Some("4x4")), ShadingRate::X4Y4);
+        assert_eq!(ShadingRate::X2Y2.name(), "2x2");
+        assert_eq!(ShadingRate::X4Y4.d3d12(), D3D12_SHADING_RATE_4X4);
+        assert_eq!(ShadingRate::Off.d3d12(), D3D12_SHADING_RATE_1X1);
+        let tier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
+        assert_eq!(shading_rate_in_force(ShadingRate::X2Y2, None), None, "no query");
+        assert_eq!(
+            shading_rate_in_force(
+                ShadingRate::X2Y2,
+                Some(D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED)
+            ),
+            None
+        );
+        assert_eq!(
+            shading_rate_in_force(ShadingRate::X2Y2, Some(D3D12_VARIABLE_SHADING_RATE_TIER_1)),
+            None,
+            "tier 1 keeps 1x1"
+        );
+        assert_eq!(
+            shading_rate_in_force(ShadingRate::X2Y2, Some(tier)),
+            Some(ShadingRate::X2Y2)
+        );
+        assert_eq!(
+            shading_rate_in_force(ShadingRate::Off, Some(tier)),
+            None,
+            "off sets nothing"
+        );
     }
 
     /// The switch has three spellings, unknown text is refused to `off`
@@ -1163,6 +1333,11 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// The list as `ID3D12GraphicsCommandList5` and the shading rate it
+    /// carries (`VICTORY_SHADING_RATE`), `None` when the switch is off or the
+    /// interface is missing. A reset returns the rate to 1x1, so it is set
+    /// again after every reset ([`HostList::shade`]).
+    shading: Option<(ID3D12GraphicsCommandList5, D3D12_SHADING_RATE)>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -4025,6 +4200,10 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
+    ///
+    /// No shading rate: a prelude carries texture transitions and the twin
+    /// copies, whose work is per-pixel writes, so it keeps 1x1 even with
+    /// `VICTORY_SHADING_RATE` on.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
@@ -4081,9 +4260,27 @@ impl Host {
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
+            let shading = self.shading.and_then(|rate| {
+                match list.cast::<ID3D12GraphicsCommandList5>() {
+                    Ok(list5) => {
+                        list5.RSSetShadingRate(rate.d3d12(), None);
+                        Some((list5, rate.d3d12()))
+                    }
+                    Err(e) => {
+                        victory_core::logging::warn_once("gpu.shading_rate.interface", || {
+                            format!(
+                                "no ID3D12GraphicsCommandList5 for VICTORY_SHADING_RATE ({e}); \
+                                 1x1 is used"
+                            )
+                        });
+                        None
+                    }
+                }
+            });
             Ok(HostList {
                 allocator,
                 list,
+                shading,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -6040,8 +6237,19 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.shade();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Sets the list's pixel shading rate (`VICTORY_SHADING_RATE`); a reset
+    /// returns it to 1x1, so this runs after every reset as well as at
+    /// creation.
+    fn shade(&self) {
+        if let Some((list5, rate)) = &self.shading {
+            // SAFETY: our list, open for recording.
+            unsafe { list5.RSSetShadingRate(*rate, None) };
+        }
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

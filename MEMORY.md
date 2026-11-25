@@ -245,6 +245,16 @@ operation, a 16-bit image atomic and a descriptor neither loaded nor built;
 2728 of 2762 compute programs still emit and validate), so the upscale never
 runs and the presented texture stays as created.
 
+Pixel shading is not what the world costs. `VICTORY_SHADING_RATE=2x2|4x4` sets
+the base shading rate on every host graphics list (`host.rs::shading_rate`,
+preludes excepted; the card reports variable shading rate tier 2), and the same
+world measured **4.90 and 5.10 fps / 203.3 and 195.6 ms** at 2x2, **5.05 fps /
+198.1 ms** at 4x4 and **4.60 and 5.00 fps / 217.9 and 199.1 ms** with the
+switch off, `on the GPU` 93.8-102.5 ms against 97.7-98.1, the card 75-81 %
+busy in every arm: the spread inside one arm is as wide as between arms, so
+the switch stays off by default, and 4,500 draws cost their submission, not
+the pixels each one covers.
+
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 
     168 ms preparing (62 ms copies / 158 MB up, 5 ms textures)
@@ -378,11 +388,9 @@ Not yet eliminated: a missing clear or composite pass among the dropped draws
 blending, not a repeated frame). **Fix 5.2 first and re-check this** — it may be
 the same root cause.
 
-**Also missing, in one line:** variable-rate shading is not implemented
-anywhere — there is no shading-rate code in `crates/victory-gpu` or
-`crates/victory-hle` — so a title that asks for it silently gets full rate.
-`settings.xml` carries a `vrsEnabled` key (§6), which is the only place the
-request is visible today.
+**Also missing, in one line:** `settings.xml`'s `vrsEnabled` key (§6) is still
+not read — the title's own request for variable-rate shading is ignored — and
+the layer's own lever, `VICTORY_SHADING_RATE`, measured no gain at all (§5.1).
 
 - **The two unknown pipeline creations** (`device::unknown_pipeline`, slots
   `0x1c8` and `0x218`, 16,384 + 2,048 calls) are handed one pointer each, not a
