@@ -34,11 +34,13 @@
   widened and sent to the host's `W` twin; do not rewrite twice.
 - Any CPU write into title memory calls `victory_gpu::kernel_will_write` first
   (`ReadFile`, `fread` and DirectStorage destinations already do).
-- DirectStorage reads the package through a second handle opened
-  `FILE_FLAG_NO_BUFFERING` (`modules::dstorage::direct_handle`), positioned so
-  every worker may use it; a request whose offset or length is off a 4096-byte
-  sector falls back to the title's buffered handle. 208 GB through the file
-  cache evicts the title's working set, which is its GPU memory in host RAM.
+- DirectStorage reads the package through eight `FILE_FLAG_NO_BUFFERING`
+  handles per file (`modules::dstorage::direct_handles`): 208 GB through the
+  file cache evicts the title's working set (its GPU memory in host RAM), and
+  one synchronous handle allows one I/O at a time. A request off a sector is
+  read as the sectors that hold it and copied out (`sectors`). Only a file the
+  host will not open unbuffered falls back to the title's cached handle, and
+  the five-second line counts it.
 - Saves are versioned directories committed by one `rename`, with `sync_all`
   per file. Keep that shape; it is what makes a kill at any step safe.
 
