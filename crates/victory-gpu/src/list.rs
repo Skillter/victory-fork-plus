@@ -784,6 +784,11 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        crate::draw::emitted(crate::draw::Command::Barrier, 1);
+    } else {
+        // The list has the texture in that state: a draw asks for its
+        // targets and depth buffer every time and records no barrier.
+        crate::draw::spared_command(crate::draw::Command::Barrier);
     }
 }
 
