@@ -23,6 +23,14 @@ Largest crate. Change it with the pipeline order in mind (`emit::translate`):
   through as `Err(<mnemonic>)`.
 - Add a case to `emit::valu_tests` (synthetic shader, validated with
   `dxil.dll`, run on GPU and WARP) or the relevant `*_tests` module.
+- A packed operation encoded as VOP2 (`v_pk_fmac_f16`, opcode table `VOP2`)
+  has no half selectors: each half reads its own half (`packed_src`). Only a
+  VOP3P encoding carries `opsel`/`opsel_hi`.
+- GFX10's DOT instructions treat a byte of `0x80` as absent, so that pair's
+  product is zero rather than `-128 * x` (`emit::lower::dot_byte`).
+- Where the accumulator lives follows the encoding, not the mnemonic:
+  `v_dot4c_i32_i8` (VOP2) adds to its destination, `v_dot4_i32_i8` (VOP3P)
+  adds its third source.
 - Keep `what` strings stable and specific; logs and tests match on them.
 
 ## Wave size
