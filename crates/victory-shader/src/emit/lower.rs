@@ -1750,6 +1750,12 @@ impl<'a> Lower<'a> {
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+        // Every step the simulation does not follow leaves its writes unknown, and the
+        // first reader that needs one refuses the program here. The retail archive's
+        // remaining case is a section that *sums doubles*: `v_add_f64` over the
+        // `v_permlanex16`/`v_readlane` tree, taken out dword by dword into two SGPRs. A
+        // carry crosses the pair, so the dwords are not separable and [`super::wave`] is a
+        // per-dword model: the section stays refused rather than approximated.
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
