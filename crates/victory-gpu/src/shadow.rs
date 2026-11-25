@@ -52,9 +52,9 @@ pub(crate) struct Shadow {
     /// Offsets of the copy whose bytes [`Shadow::copy_back_with`] put back
     /// into title memory, where the copy holds what title memory holds: a
     /// refresh compares those pages with title memory instead of copying
-    /// them. A hint (the compare decides), joined as ranges and never
-    /// freed one at a time.
-    backed: Mutex<Pending>,
+    /// them. A hint (the compare decides), joined as ranges ([`Held`]) and
+    /// cut back where that compare finds the title wrote the bytes itself.
+    backed: Mutex<Held>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -645,7 +645,7 @@ impl Pending {
             ends.insert(at, to);
         }
         if self.current {
-            self.join(from, to);
+            join_into(&mut self.union, from, to);
         }
     }
 
@@ -718,32 +718,9 @@ impl Pending {
         out
     }
 
-    /// Whether one of the declared ranges holds all of `[from, to)`.
-    fn covers(&mut self, from: usize, to: usize) -> bool {
-        if from >= to {
-            return false;
-        }
-        self.unify();
-        matches!(self.union.range(..=from).next_back(), Some((&a, &e)) if e >= to && a <= from)
-    }
-
     /// Puts `[from, to)` into the union, joined with what it touches.
     fn join(&mut self, from: usize, to: usize) {
-        let (mut from, mut to) = (from, to);
-        if let Some((&a, &e)) = self.union.range(..=from).next_back()
-            && e >= from
-        {
-            self.union.remove(&a);
-            from = a;
-            to = to.max(e);
-        }
-        let after: Vec<usize> = self.union.range(from..=to).map(|(&a, _)| a).collect();
-        for a in after {
-            if let Some(e) = self.union.remove(&a) {
-                to = to.max(e);
-            }
-        }
-        self.union.insert(from, to);
+        join_into(&mut self.union, from, to);
     }
 
     /// Rebuilds the union from the declared ranges, if a free left it stale.
@@ -760,6 +737,91 @@ impl Pending {
         }
         self.declared = declared;
         self.current = true;
+    }
+}
+
+/// Puts `[from, to)` into a joined interval set (`start -> end`), joined with
+/// every range it touches or overlaps: the step [`Pending`] and [`Held`] both
+/// take to stay as few ranges as the bytes they hold.
+fn join_into(union: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    let (mut from, mut to) = (from, to);
+    if let Some((&a, &e)) = union.range(..=from).next_back()
+        && e >= from
+    {
+        union.remove(&a);
+        from = a;
+        to = to.max(e);
+    }
+    let after: Vec<usize> = union.range(from..=to).map(|(&a, _)| a).collect();
+    for a in after {
+        if let Some(e) = union.remove(&a) {
+            to = to.max(e);
+        }
+    }
+    union.insert(from, to);
+}
+
+/// The bytes of title memory a copy's own write put there ([`Shadow::backed`]):
+/// the ranges that hold them, joined, and nothing else.
+///
+/// [`Pending`] keeps the ranges as declared because a free is by them, and
+/// [`Pending::parts`] tells a declaration what no other holds. `backed` is
+/// only asked whether a range is held ([`Held::covers`]) and told when it is
+/// not ([`Held::free`]), so it keeps the union alone and cannot keep the
+/// pairs. A merge hands back the bytes a shader changed, a span at a time
+/// ([`Shadow::copy_back_with`]), and each joins the range it touches; a page
+/// the title wrote back itself leaves the set the first time a refresh reads
+/// it ([`Shadow::copy_unless_there`]). The set therefore follows the pages
+/// that still hold our bytes instead of growing for the session.
+#[derive(Default)]
+struct Held {
+    /// The ranges held, joined and apart, in order.
+    union: BTreeMap<usize, usize>,
+}
+
+impl Held {
+    /// Holds `[from, to)`, joined with what it touches.
+    fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        join_into(&mut self.union, from, to);
+    }
+
+    /// Whether one of the held ranges holds all of `[from, to)`.
+    fn covers(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        matches!(self.union.range(..=from).next_back(), Some((&a, &e)) if e >= to && a <= from)
+    }
+
+    /// Forgets `[from, to)`: the title (or a shader) wrote those bytes back.
+    /// A range half taken leaves its rest held, one cut in two leaves both
+    /// parts held, and a hole is never joined over again except by a later
+    /// [`Held::add`], which says the bytes are ours once more.
+    fn free(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let mut hit: Vec<(usize, usize)> = Vec::new();
+        // The held ranges are apart, so only the one starting before `from`
+        // can reach it.
+        if let Some((&a, &e)) = self.union.range(..from).next_back()
+            && e > from
+        {
+            hit.push((a, e));
+        }
+        hit.extend(self.union.range(from..to).map(|(&a, &e)| (a, e)));
+        for (a, e) in hit {
+            self.union.remove(&a);
+            if a < from {
+                self.union.insert(a, from);
+            }
+            if e > to {
+                self.union.insert(to, e);
+            }
+        }
     }
 }
 
@@ -796,9 +858,15 @@ mod pending_tests {
             for from in [0usize, 3, 7, 100, 1000, 1599] {
                 for to in [from, from + 1, 20, 300, 1200, 2000] {
                     assert_eq!(pending.parts(from, to), walked(from, to, &held), "{set:?} {from} {to}");
-                    // Held whole or not at all: exactly when no byte is free.
+                    // Held whole or not at all: the union holds the query
+                    // whole exactly when no byte of it is free.
                     let free = pending.parts(from, to);
-                    assert_eq!(pending.covers(from, to), from < to && free.is_empty(), "{set:?} {from} {to}");
+                    let held = pending.over(from, to);
+                    if from < to {
+                        assert_eq!(held == vec![(from, to)], free.is_empty(), "{set:?} {from} {to}");
+                    } else {
+                        assert!(held.is_empty() && free.is_empty(), "{set:?} {from} {to}");
+                    }
                 }
             }
             // What is held: the union of the declarations, cut to the query.
@@ -912,6 +980,162 @@ mod pending_tests {
         pending.free(c.0, c.1);
         assert!(pending.is_empty());
         assert_eq!(pending.parts(0x1000, 0x4000), vec![(0x1000, 0x4000)]);
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::Held;
+
+    /// The bytes a merge hands back in one page, a span at a time
+    /// (`copy_back_with`: 64 KiB pieces, each merged byte run its own add),
+    /// are one range: the set cannot keep the pairs.
+    #[test]
+    fn a_page_held_a_span_at_a_time_is_one_range() {
+        let mut held = Held::default();
+        let (from, to) = (0x1_0000, 0x2_0000);
+        for at in (from..to).step_by(64) {
+            held.add(at, at + 64);
+        }
+        assert_eq!(held.union.len(), 1);
+        assert!(held.covers(from, to));
+        // The page next to it joins the range it touches.
+        held.add(to, to + 0x1000);
+        assert_eq!(held.union.len(), 1);
+        assert!(held.covers(from, to + 0x1000));
+    }
+
+    /// A range the title took back is let go across a hole: what is left
+    /// answers as it did, and nothing spans the hole.
+    #[test]
+    fn a_range_let_go_leaves_a_hole_nothing_spans() {
+        let mut held = Held::default();
+        held.add(100, 200);
+        held.free(140, 160);
+        assert_eq!(held.union.len(), 2);
+        assert!(held.covers(100, 140));
+        assert!(held.covers(160, 200));
+        assert!(!held.covers(100, 200), "nothing spans the hole");
+        assert!(!held.covers(130, 170));
+        assert!(!held.covers(139, 141));
+        // Freeing what is not held changes nothing.
+        held.free(300, 400);
+        held.free(150, 150);
+        assert_eq!(held.union.len(), 2);
+        // Ours again: the hole joins, both sides held.
+        held.add(120, 180);
+        assert_eq!(held.union.len(), 1);
+        assert!(held.covers(100, 200));
+        // Freed whole, the set is empty.
+        held.free(0, 1000);
+        assert!(held.union.is_empty());
+        assert!(!held.covers(100, 200));
+        assert!(!held.covers(100, 100));
+    }
+
+    /// Adds and frees in any order answer what a byte-by-byte model of the
+    /// same operations answers, over every range of a small span, and the
+    /// ranges held stay apart and in order.
+    #[test]
+    fn the_union_answers_as_a_byte_model_does() {
+        const N: usize = 64;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let mut held = Held::default();
+        let mut model = [false; N];
+        for _ in 0..200 {
+            let (a, b) = (next() % N, next() % N);
+            let (from, to) = (a.min(b), a.max(b) + 1);
+            if next() & 1 == 0 {
+                held.add(from, to);
+                model[from..to].fill(true);
+            } else {
+                held.free(from, to);
+                model[from..to].fill(false);
+            }
+            for from in 0..N {
+                for to in from + 1..=N {
+                    assert_eq!(held.covers(from, to), model[from..to].iter().all(|&held| held), "{from} {to}");
+                }
+            }
+            let mut end: Option<usize> = None;
+            for (&a, &e) in &held.union {
+                assert!(a < e, "{a} {e}");
+                // Apart: never two ranges that touch, never out of order.
+                if let Some(end) = end {
+                    assert!(end < a, "ranges {end} and {a} touch: {:?}", held.union);
+                }
+                end = Some(e);
+            }
+            // Every byte held is one the model holds, and the other way.
+            let inside = |at: usize| {
+                matches!(held.union.range(..=at).next_back(), Some((&a, &e)) if e > at && a <= at)
+            };
+            for at in 0..N {
+                assert_eq!(inside(at), model[at], "{at}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod backed_tests {
+    use super::{ID3D12Resource, PAGE, Shadow};
+
+    /// A copy of `len` bytes at `data` over the title bytes at `title`'s
+    /// address: a refresh reads title memory with `ReadProcessMemory`, which
+    /// takes any readable address of ours, so no heap or device is needed.
+    fn copy_over(title: &mut [u8], data: &mut [u8]) -> Shadow {
+        use windows::core::Interface;
+        // SAFETY: a buffer interface with no object behind it: no test calls
+        // a method of it (a copy only holds its address) and the copy it is
+        // given to is never dropped (`ManuallyDrop`). The type holds a
+        // non-null pointer, so a dangling one stands in for a real one.
+        let buffer = unsafe { ID3D12Resource::from_raw(std::ptr::NonNull::dangling().as_ptr()) };
+        Shadow::new(buffer, data.as_mut_ptr(), 0, title.as_ptr() as u64, title.len() as u64)
+    }
+
+    /// A page the copy's own write put into title memory, then written back
+    /// by the title: the refresh copies it up once, because title memory
+    /// holds other bytes, and lets it go, so that the page is copied as any
+    /// other from then on and the set stops growing with pages the title has
+    /// taken back.
+    #[test]
+    fn a_page_the_title_wrote_back_is_copied_once_and_let_go() {
+        let mut title = vec![0x11u8; PAGE];
+        let mut data = vec![0x22u8; PAGE];
+        // SAFETY: never dropped: no object stands behind its buffer.
+        let shadow = std::mem::ManuallyDrop::new(copy_over(&mut title, &mut data));
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        // What `copy_back_with` does where the shaders' bytes went back.
+        shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        assert!(shadow.backed(from, to), "the page holds the copy's bytes");
+        // The title writes its own bytes over them.
+        title.fill(0x33);
+        let mut scratch = Vec::new();
+        assert_eq!(shadow.copy_unless_there(from, to, &mut scratch), to - from);
+        assert_eq!(&data[..], &title[..], "the copy took the title's bytes");
+        assert!(!shadow.backed(from, to), "the page is the title's: let go");
+        assert!(shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).union.is_empty());
+    }
+
+    /// The bytes the copy put into title memory and the title did not touch
+    /// stay held: the fast path is only given up where the title wrote.
+    #[test]
+    fn a_page_the_title_left_alone_stays_held() {
+        let mut title = vec![0x11u8; PAGE];
+        let mut data = vec![0x11u8; PAGE];
+        // SAFETY: as above: never dropped.
+        let shadow = std::mem::ManuallyDrop::new(copy_over(&mut title, &mut data));
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        shadow.backed.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        let mut scratch = Vec::new();
+        // Nothing to copy: title memory already holds the copy's bytes.
+        assert_eq!(shadow.copy_unless_there(from, to, &mut scratch), 0);
+        assert!(shadow.backed(from, to), "still ours: compared, not copied");
     }
 }
 
@@ -2967,6 +3191,13 @@ impl Shadow {
         unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), self.data.add(from - start), n) };
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        // Title memory holds other bytes than the ones put there: the title
+        // wrote the page back itself, so the bytes are its own and not ours
+        // to compare. Let go, the next refresh copies such a page as it
+        // copies any other ([`Shadow::copy_stale`] takes the plain path where
+        // [`Shadow::backed`] says nothing), and the set stops growing with
+        // pages the title has already taken back.
+        self.backed.lock().unwrap_or_else(|e| e.into_inner()).free(from, to);
         n
     }
 
