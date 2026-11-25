@@ -211,6 +211,14 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
 
 ## 5.1 Frame rate
 
+`--console series-s` makes the title render **1920x1080** instead of 3840x2160
+(`frame_width=1920` in `run-20261125-073731.log`, against 3840 on series-x);
+that run reached 20.4 fps / 49.1 ms on the loading screen, then the device was
+removed at frame 1937 with `0x887A0005` after a 1920x1080 `R9G9B9E5` 3D texture
+failed to create with `0x80070057`. `VICTORY_DISPLAY_MODE=1920x1080` and
+`resolutionFullscreen` 1920x1080 in `settings.xml` change nothing on series-x:
+the title sizes its targets from the console model, not from either.
+
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 
     168 ms preparing (62 ms copies / 158 MB up, 5 ms textures)

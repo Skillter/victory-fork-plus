@@ -375,7 +375,7 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
 /// The copies to issue to fetch `pieces` — `(who, from, to)`, naming a copy
 /// of title memory and the bytes of it a fetch brings down — with those of
 /// one copy that touch or overlap as one run (`Host::card_back`,
-/// `Host::relay_card_back`). Returns the runs (`who`, `from`, `to`, and
+/// `Host::relay_card_fetch`). Returns the runs (`who`, `from`, `to`, and
 /// where the run's first byte goes in the fetch buffer), where each piece's
 /// own first byte goes in it, and the bytes the runs move.
 ///

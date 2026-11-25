@@ -43,6 +43,11 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
+    /// The copies of title memory into its copies in the card's memory, on
+    /// a queue of their own ([`copy_queue`]); `None` when the switch is off
+    /// or the device would not make the queue, and the copies then go in the
+    /// direct list ahead of the submission that reads them.
+    copies: Option<CopyQueue>,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -951,6 +956,19 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        // The uploads' own queue ([`copy_queue`]): a device that refuses one
+        // leaves them on the direct queue, as without the switch.
+        let copies = if copy_queue() {
+            match make_copy_queue(&device) {
+                Ok(copies) => Some(copies),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no copy queue for the copies into the card's memory; they stay on the direct queue");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -975,6 +993,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
+            copies,
             rtvs,
             rtv_size,
             dsvs,
@@ -1838,6 +1857,165 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Whether the copies of title memory into its copies in the card's memory
+/// go on a COPY queue of their own (`VICTORY_COPY_QUEUE=1`) instead of the
+/// direct queue ahead of the submission that reads them (**off** by
+/// default).
+///
+/// Those copies are one system-memory-to-card DMA of ~140 MB a frame (the
+/// card line's "sent up"), and on the direct queue it sits between the
+/// flights before a submission and the submission's own lists. A copy queue
+/// can run it beside them, but only where nothing reads the copies: the
+/// copies write the buffers the title's shaders read, so every list that
+/// reads them waits for the copy fence, and the copy queue in turn waits for
+/// the flights already sent, which read those buffers with the bytes from
+/// before. What the split buys is one submission's DMA running while the
+/// flights before it finish, and nothing more, which is why it is off: the
+/// win it cannot give needs the copies double buffered, or the wait narrowed
+/// to the flights that named the copies being uploaded (those numbers are
+/// in `crate::shadow`'s flights, today only with the relay).
+/// [`COPY_QUEUE_STATS`] is what a run of it reports, and its third figure is
+/// whether anything overlapped at all.
+fn copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_QUEUE").is_ok_and(|v| v == "1"))
+}
+
+/// The run's copies into the card's copies on their own queue
+/// ([`copy_queue`]): batches sent, their bytes, batches whose run had
+/// finished when the next was ready (they ran beside the direct queue), and
+/// batches still running then.
+static COPY_QUEUE_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// What the copy queue and the direct queue know of each other: every batch
+/// of copies is signalled on the copy fence ([`CopyOrder::sending`]), the
+/// direct queue waits for that value before any list that reads a copy
+/// ([`CopyOrder::wait`]), and the copy queue waits for the direct queue's
+/// last send before it writes one ([`CopyOrder::direct_sent`]). One queue
+/// needs none of this: the order of that queue says it.
+#[derive(Default)]
+struct CopyOrder {
+    /// The last value signalled on the copy fence.
+    sent: u64,
+    /// The last value the direct queue was told to wait for.
+    waited: u64,
+    /// The last value signalled on the direct queue's fence.
+    direct: u64,
+}
+
+impl CopyOrder {
+    /// A batch is going to the copy queue: the value it is signalled with.
+    fn sending(&mut self) -> u64 {
+        self.sent += 1;
+        self.sent
+    }
+
+    /// The value the direct queue must wait for before a list that reads a
+    /// copy, if any batch was sent whose completion it has not waited for.
+    fn wait(&self) -> Option<u64> {
+        (self.sent > self.waited).then_some(self.sent)
+    }
+
+    /// The direct queue waits for `value`: every batch sent before it is in
+    /// the card's copies.
+    fn waited(&mut self, value: u64) {
+        self.waited = self.waited.max(value);
+    }
+
+    /// The direct queue signalled `value`.
+    fn direct_sent(&mut self, value: u64) {
+        self.direct = value;
+    }
+}
+
+/// The state a copy destination is in when the direct queue's list reads it
+/// after the copies into it: `COMMON` when they ran on the copy queue (a
+/// resource accessed on a copy queue decays to `COMMON` when that
+/// `ExecuteCommandLists` completes, and a copy queue may touch a resource
+/// only in `COMMON` or a copy state), `COPY_DEST` when they are in the same
+/// list, which promoted it and left it there.
+fn copied_state(on_copy_queue: bool) -> D3D12_RESOURCE_STATES {
+    if on_copy_queue {
+        D3D12_RESOURCE_STATE_COMMON
+    } else {
+        D3D12_RESOURCE_STATE_COPY_DEST
+    }
+}
+
+/// The copy queue ([`copy_queue`]), the fence a batch is signalled on, and
+/// the event for the one wait a full pool makes on this thread.
+struct CopyQueue {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    lists: Mutex<CopyLists>,
+}
+
+/// The copy queue's lists, and the order the two queues keep
+/// ([`CopyOrder`]). A list is recorded, sent, and given back only when the
+/// batch it recorded has completed: an allocator cannot be reset while the
+/// card runs it.
+#[derive(Default)]
+struct CopyLists {
+    order: CopyOrder,
+    /// Lists whose batch has completed: free to record again.
+    idle: Vec<Prelude>,
+    /// Batches sent and not completed: the value signalled after each and
+    /// the list that recorded it.
+    flying: std::collections::VecDeque<(u64, Prelude)>,
+}
+
+impl CopyLists {
+    /// Gives back the lists of the batches the card has finished.
+    fn free(&mut self, fence: &ID3D12Fence) {
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { fence.GetCompletedValue() };
+        while self.flying.front().is_some_and(|(value, _)| *value <= done) {
+            if let Some((_, prelude)) = self.flying.pop_front() {
+                self.idle.push(prelude);
+            }
+        }
+    }
+
+    /// A list to record the next batch in: one whose batch completed, or
+    /// the oldest batch's when none has and all are in the air.
+    fn take(&mut self, fence: &ID3D12Fence, event: HANDLE) -> Option<Prelude> {
+        self.free(fence);
+        if self.idle.is_empty()
+            && let Some((value, _)) = self.flying.front()
+        {
+            // SAFETY: our fence and event; the batch is on the card.
+            unsafe {
+                fence.SetEventOnCompletion(*value, event).ok()?;
+                let _ = WaitForSingleObject(event, INFINITE);
+            }
+            self.free(fence);
+        }
+        self.idle.pop()
+    }
+}
+
+/// The copy queue, made or not: a device that will not give a COPY queue
+/// leaves the copies on the direct queue, as without the switch.
+fn make_copy_queue(device: &ID3D12Device) -> windows::core::Result<CopyQueue> {
+    // SAFETY: plain object creation; the event is ours.
+    unsafe {
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let event = CreateEventW(None, false, false, None)?;
+        Ok(CopyQueue {
+            queue,
+            fence,
+            event,
+            lists: Mutex::new(CopyLists::default()),
+        })
+    }
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2452,11 +2630,149 @@ enum Late {
     Signal(usize, u64),
 }
 
+/// The title memory the flights in the air, and the flights whose merge is
+/// held back ([`lazy_merge`]), may write, per declaration: each range with
+/// the submissions that declared it and have not merged it yet.
+///
+/// A range two flights declared stays held after the first of them merges
+/// (`merged` is per submission): it is closed to refreshes until the last
+/// does, as `shadow::Flights` keeps it. A held range is what [`blocked_by`]
+/// tests, and what a settle waits to be gone.
+#[derive(Default)]
+struct Held {
+    /// Each declared range, with the submissions that declared it and have
+    /// not merged it.
+    ranges: Vec<((usize, usize), Vec<u64>)>,
+    /// The union of `ranges`, in order and joined: what is tested.
+    joined: Vec<(usize, usize)>,
+}
+
+impl Held {
+    const fn new() -> Held {
+        Held { ranges: Vec::new(), joined: Vec::new() }
+    }
+
+    /// Submission `number` declares `ranges` (each once): each is held for
+    /// it, however many times the submission declares it.
+    fn declare(&mut self, ranges: impl IntoIterator<Item = (usize, usize)>, number: u64) {
+        let mut any = false;
+        for range in ranges {
+            if range.0 >= range.1 {
+                continue;
+            }
+            match self.ranges.iter_mut().find(|(r, _)| *r == range) {
+                Some((_, held)) => {
+                    if !held.contains(&number) {
+                        held.push(number);
+                    }
+                }
+                None => self.ranges.push((range, vec![number])),
+            }
+            any = true;
+        }
+        if any {
+            self.rejoin();
+        }
+    }
+
+    /// Submission `number`'s shaders' writes are in title memory: the
+    /// ranges no other submission still holds are free again, and the ones
+    /// it still holds are not.
+    fn merged(&mut self, number: u64) {
+        if !self.ranges.iter().any(|(_, held)| held.contains(&number)) {
+            return;
+        }
+        self.ranges.retain_mut(|(_, held)| {
+            held.retain(|&n| n != number);
+            !held.is_empty()
+        });
+        self.rejoin();
+    }
+
+    /// Whether a range that no submission merged yet touches `[from, to)`.
+    fn touches(&self, from: usize, to: usize) -> bool {
+        touches(&self.joined, from, to)
+    }
+
+    /// The held ranges, in order and joined: [`blocked_by`]'s argument.
+    fn joined(&self) -> &[(usize, usize)] {
+        &self.joined
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.joined.clear();
+    }
+
+    fn rejoin(&mut self) {
+        let all: Vec<(usize, usize)> = self.ranges.iter().map(|(range, _)| *range).collect();
+        self.joined.clear();
+        join_ranges(&mut self.joined, all);
+    }
+}
+
+/// A flight whose shaders' writes are in copies in the PC's memory and not
+/// in title memory yet, and that told the title nothing when it landed
+/// ([`lazy_merge`]): merged at the first point that reads those bytes, at
+/// the next landing, or at the next settle, whichever comes first.
+struct HeldBack {
+    /// Its number among the submissions started (what [`Held::merged`] and
+    /// `Shadow::copy_back_done` end).
+    number: u64,
+    /// The ranges its shaders may write, per copy, as declared.
+    back: Vec<Declared>,
+}
+
+/// Whether what a flight's shaders wrote in a copy in the PC's memory is
+/// merged at the first point that reads it rather than when it lands
+/// (`VICTORY_LAZY_MERGE=1`; off by default).
+///
+/// A flight that tells the title nothing when it lands (no bottom-of-pipe
+/// write, no fence signal behind it) leaves bytes in title memory that only
+/// a later submission's preparation, a present, a fence or a refresh can
+/// observe ([`late`]'s points). Until one of them does, the merge is work
+/// on the landing thread that no one is waiting for, and the landing is
+/// what the submitting thread waits for ([`relay_wait`]): holding it back
+/// lands the flight sooner and lets the merge run beside the card, or in
+/// the next landing with the flights after it.
+///
+/// Off unless the card copies' fetch runs on a thread of its own
+/// ([`relay`]: without it the merging thread is the submitting one and
+/// holding a merge back only moves it), and never together with a pinned
+/// `VICTORY_LATE_WAIT`, whose runs this must not change.
+fn lazy_merge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LAZY_MERGE").is_some_and(|v| v != "0")
+            && relay()
+            && std::env::var_os("VICTORY_LATE_WAIT").is_none()
+    })
+}
+
+/// Whether a landing holds a flight's merge back ([`lazy_merge`]): it wrote
+/// something in a copy in the PC's memory, and the items after it in this
+/// landing tell the title nothing (`Late::Write`, `Late::Signal`), which
+/// would put its bytes in the title's hands unwritten.
+fn holds_back(wrote: bool, after: &[Late]) -> bool {
+    wrote && !after.iter().any(|item| matches!(item, Late::Write(..) | Late::Signal(..)))
+}
+
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
-    written: Vec<(usize, usize)>,
+    /// The title memory the flights' shaders may write, and the flights
+    /// that have not merged theirs yet (`Held`).
+    held: Held,
+    /// With [`lazy_merge`]: the flights that landed and told nobody, whose
+    /// shaders' writes title memory does not hold yet.
+    deferred: Vec<HeldBack>,
+    /// Threads waiting in [`Host::settle`]: a landing holds nothing back
+    /// while one is, a settle being one of the points the title must see
+    /// title memory at.
+    settles: usize,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2482,7 +2798,9 @@ unsafe impl Send for Line {}
 
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
-    written: Vec::new(),
+    held: Held::new(),
+    deferred: Vec::new(),
+    settles: 0,
     lists: 0,
     target: 0,
     settling: false,
@@ -2522,13 +2840,17 @@ const WHY_FENCE: usize = 10;
 /// and it is worth a wait for the card.
 pub(crate) const WHY_DYNAMIC: usize = 18;
 
+/// With [`lazy_merge`]: flights a landing did not merge, by index in
+/// [`LATE_STATS`].
+const DEFERRED: usize = 19;
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
+/// copy, a fill of upload memory, a texture), and the merges held back
+/// ([`DEFERRED`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2573,28 +2895,28 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let held = {
         let line = line();
-        if line.written.is_empty() {
+        if line.held.is_empty() {
             return None;
         }
-        line.written.clone()
+        line.held.joined().to_vec()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&held, runs, true)
 }
 
-/// [`late_blocked`] against `written`, the title memory flights' shaders
-/// may write (in order, joined); `count` whether the kind of read is
+/// [`late_blocked`] against `held`, the title memory flights' shaders may
+/// write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if written.is_empty() {
+fn blocked_by(held: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    if held.is_empty() {
         return None;
     }
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if touches(held, src, src + len) || touches(held, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2602,7 +2924,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if touches(held, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2611,7 +2933,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
+                    if touches(held, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2624,7 +2946,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 // from work that writes host memory only).
                 Step::Rectangles(work) => {
                     let (at, len) = work.source();
-                    if touches(written, at, at + len) {
+                    if touches(held, at, at + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2706,7 +3028,7 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if line.line.is_empty() && line.in_hand.is_empty() {
             return false;
         }
-        let mut unsure = touches(&line.written, address, address + bytes);
+        let mut unsure = line.held.touches(address, address + bytes);
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
             Late::Write(at, what, n) => Some((at, what, n)),
@@ -2885,6 +3207,26 @@ struct RelayFetch {
     buffer: Option<(ID3D12Resource, usize, u64)>,
 }
 
+/// A fetch of card copies' pieces sent to the card and not waited for yet
+/// ([`Host::relay_card_fetch`]): what it will merge, where it lands, and
+/// the signals its waits are for.
+struct FetchRun {
+    /// The piece of each copy, its offsets in that copy, and where its
+    /// bytes come down.
+    pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+    /// The mapping of the memory the pieces come down to.
+    data: usize,
+    /// Bytes fetched.
+    total: u64,
+    /// The fetch's number on [`RelayFetch::fence`] (values `2n-1` and `2n`).
+    sent: u64,
+    /// The queue's count when the fetch was sent: a send to a card copy
+    /// made after it is not named by what the fetch brings.
+    after: u64,
+    /// The copies the fetch was made in.
+    runs: usize,
+}
+
 /// The thread that lands flights ([`relay`]): as soon as the card has run
 /// the first flights of the line it takes them, with what follows them,
 /// and does what they left to do ([`Host::relay_land`]); else it waits for
@@ -2998,6 +3340,55 @@ fn relay_hand_back(back: &[Declared]) {
     }
 }
 
+/// Merges what a landing held back ([`lazy_merge`], [`HeldBack`]): what the
+/// shaders of flights that landed and told nobody wrote in copies in the
+/// PC's memory, which title memory does not hold yet.
+///
+/// Called at the first point that must see those bytes (a preparation that
+/// reads them, a `Map`, a refresh that would write over them), at every
+/// settle, and at the start of every landing. Merges all of them: each is
+/// about to be read, or the landing is about to tell the title its flight
+/// is done. The entries are taken out of the line first, so exactly one
+/// thread merges each.
+fn drain_deferred() -> usize {
+    let entries = {
+        let mut line = line();
+        std::mem::take(&mut line.deferred)
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut back: Vec<Declared> = Vec::new();
+    for entry in &entries {
+        for (shadow, ranges) in &entry.back {
+            match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                Some((_, all)) => {
+                    for range in ranges {
+                        if !all.contains(range) {
+                            all.push(*range);
+                        }
+                    }
+                }
+                None => back.push((shadow.clone(), ranges.clone())),
+            }
+        }
+    }
+    relay_hand_back(&back);
+    for entry in &entries {
+        for (shadow, ranges) in &entry.back {
+            shadow.copy_back_done(ranges);
+        }
+    }
+    {
+        let mut line = line();
+        for entry in &entries {
+            line.held.merged(entry.number);
+        }
+    }
+    LINE_LANDED.notify_all();
+    entries.len()
+}
+
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
@@ -3069,6 +3460,14 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
     }
+    if lazy_merge() {
+        tracing::info!(
+            "merges held back per frame (VICTORY_LAZY_MERGE=1): {:.1} flights landed and told nobody, \
+             whose shaders' writes in card copies go into title memory at the first read, present, \
+             fence or landing after them",
+            s[DEFERRED]
+        );
+    }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -3128,6 +3527,79 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// A range a flight declared is held until that flight's merge, however
+    /// many times it declares it; the ranges of two flights join without
+    /// touching, and merging one number leaves the other's as they were.
+    #[test]
+    fn a_flight_holds_its_ranges_until_it_merges() {
+        use super::Held;
+        let mut held = Held::new();
+        held.declare([(100, 200), (100, 200)], 1);
+        held.declare([(160, 300)], 2);
+        assert_eq!(held.joined(), [(100, 300)]);
+        held.merged(1);
+        assert_eq!(held.joined(), [(160, 300)]);
+        assert!(held.touches(150, 170));
+        assert!(!held.touches(100, 120));
+        // A number that declared nothing ends nothing.
+        held.merged(9);
+        assert_eq!(held.joined(), [(160, 300)]);
+        held.merged(2);
+        assert!(held.is_empty());
+        assert!(held.joined().is_empty());
+    }
+
+    /// A range two flights declared stays held after the first of them
+    /// merges, and is free only when the last does: a refresh may not write
+    /// over what the second flight's shaders wrote.
+    #[test]
+    fn a_range_two_flights_declared_stays_held_until_both_merge() {
+        use super::Held;
+        let mut held = Held::new();
+        held.declare([(100, 200)], 1);
+        held.declare([(100, 200)], 2);
+        assert!(held.touches(150, 160));
+        held.merged(1);
+        assert!(held.touches(150, 160), "the second flight still holds it");
+        assert_eq!(held.joined(), [(100, 200)]);
+        held.merged(2);
+        assert!(!held.touches(150, 160));
+        assert!(held.is_empty());
+    }
+
+    /// A settle — a present, a fence the title blocks on, a read — merges
+    /// what a landing held back: its flight's ranges are free afterwards,
+    /// and a second one finds nothing left to merge. The entry is taken out
+    /// of the line once, so no other thread merges the same flight.
+    #[test]
+    fn a_settle_drains_what_a_landing_held_back() {
+        use super::{HeldBack, drain_deferred, line};
+        {
+            let mut guard = line();
+            guard.held.declare([(4096, 8192)], 7);
+            guard.deferred.push(HeldBack { number: 7, back: Vec::new() });
+        }
+        assert!(line().held.touches(5000, 6000), "held while its merge waits");
+        assert_eq!(drain_deferred(), 1);
+        assert!(line().deferred.is_empty());
+        assert!(!line().held.touches(5000, 6000), "free after the merge");
+        assert_eq!(drain_deferred(), 0);
+    }
+
+    /// A landing holds a flight's merge back only when the flight wrote
+    /// something in a copy in the PC's memory and the line after it in the
+    /// same landing tells the title nothing: a bottom-of-pipe write or a
+    /// fence signal behind it puts its bytes in the title's hands, and what
+    /// the title does after that may read them.
+    #[test]
+    fn a_merge_is_held_back_only_when_the_title_is_told_nothing() {
+        use super::{Late, holds_back};
+        assert!(holds_back(true, &[]));
+        assert!(!holds_back(false, &[]));
+        assert!(!holds_back(true, &[Late::Signal(0, 1)]));
+        assert!(!holds_back(true, &[Late::Signal(0, 1), Late::Signal(0, 2)]));
     }
 }
 
@@ -3576,6 +4048,23 @@ impl Host {
         }
     }
 
+    /// An allocator and a closed list on the copy queue ([`copy_queue`]).
+    fn make_copy_prelude(&self) -> Option<Prelude> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList =
+                self.device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)
+                    .ok()?;
+            list.Close().ok()?;
+            Some((allocator, list))
+        }
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -3726,6 +4215,116 @@ impl Host {
         }
     }
 
+    /// The copies of the dirty ranges into their copies in the card's
+    /// memory, on the copy queue ([`copy_queue`]), and the wait that makes
+    /// the direct queue see them: `direct` is the last value signalled on
+    /// the direct queue's fence, which the batch waits for (the flights
+    /// already sent read those copies with the bytes from before it), and
+    /// the value returned is the one signalled after it, which every list
+    /// the direct queue runs next waits for ([`copied_state`] for the state
+    /// the batch leaves a copy in). `None` with the switch off, no copy
+    /// queue, or no list to record in: the caller copies in its own list.
+    fn card_copies(
+        &self,
+        dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+        direct: u64,
+    ) -> Option<u64> {
+        let copies = self.copies.as_ref()?;
+        let mut lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+        let (allocator, list) = lists
+            .take(&copies.fence, copies.event)
+            .or_else(|| self.make_copy_prelude())?;
+        // Whether the batch before this one overlapped the direct queue: a
+        // batch still on the card when the next is ready held it, and is
+        // what the split buys or does not ([`COPY_QUEUE_STATS`]).
+        if lists.order.sent > 0 {
+            // SAFETY: a plain query of our fence.
+            let done = unsafe { copies.fence.GetCompletedValue() };
+            COPY_QUEUE_STATS[2 + usize::from(done < lists.order.sent)].fetch_add(1, Ordering::Relaxed);
+        }
+        let mut bytes = 0u64;
+        let mut ranges = 0u64;
+        // SAFETY: a list whose last batch has completed (`CopyLists::take`),
+        // live buffers, and ranges that lie in them.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                if direct > lists.order.direct {
+                    copies.queue.Wait(&self.fence, direct)?;
+                    lists.order.direct_sent(direct);
+                }
+                for (shadow, dirty) in dirty {
+                    let Some((staging, _, _)) = shadow.card_sides() else {
+                        continue;
+                    };
+                    for &(a, b) in dirty {
+                        list.CopyBufferRegion(
+                            &shadow.buffer,
+                            a as u64,
+                            staging,
+                            a as u64,
+                            (b - a) as u64,
+                        );
+                        bytes += (b - a) as u64;
+                        ranges += 1;
+                    }
+                    // A copy queue may touch a copy only in `COMMON` or a
+                    // copy state, and the next reader is on the direct
+                    // queue, which cannot take it in `COPY_DEST` from here:
+                    // the batch leaves it in `COMMON`, where a buffer is
+                    // read and written without a transition (D3D12's state
+                    // decay, [`copied_state`]).
+                    if !dirty.is_empty() {
+                        list.ResourceBarrier(&[transition(
+                            &shadow.buffer,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )]);
+                    }
+                }
+                list.Close()?;
+                copies.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            // Nothing reached the card: the list is closed again, free to
+            // record, and the caller copies in its own list.
+            // SAFETY: a list of ours, recorded in part or not at all.
+            let _ = unsafe { list.Close() };
+            lists.idle.push((allocator, list));
+            tracing::warn!(error = %e, "the copies into the card's memory failed on the copy queue; they go back to the direct queue");
+            return None;
+        }
+        let value = lists.order.sending();
+        // SAFETY: our copy queue and its fence; the batch is on the queue.
+        let signalled = unsafe { copies.queue.Signal(&copies.fence, value) };
+        if let Err(ref e) = signalled {
+            tracing::warn!(error = %e, "no signal for the copies into the card's memory");
+        }
+        lists.flying.push_back((value, (allocator, list)));
+        crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
+        crate::shadow::CARD_STATS[1].fetch_add(ranges, Ordering::Relaxed);
+        COPY_QUEUE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        COPY_QUEUE_STATS[1].fetch_add(bytes, Ordering::Relaxed);
+        // The direct queue waits for the batch before its next list: the
+        // hash passes below read the copies it wrote, and so does the
+        // submission. A batch nothing can be told about waits for nothing:
+        // its copies are then ordered only by the submissions that follow.
+        if signalled.is_ok()
+            && let Some(value) = lists.order.wait()
+        {
+            // SAFETY: our copy queue, its fence, and the direct queue.
+            let waited = unsafe { self.queue.Wait(&copies.fence, value) };
+            if let Err(e) = waited {
+                fail(format_args!("the direct queue could not wait for the copies into the card's memory ({e})"));
+            }
+            lists.order.waited(value);
+        }
+        Some(value)
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
     /// the last submission goes to their card side (a list of ours, run
@@ -3735,8 +4334,10 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
-    /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    /// `relay`). `direct`: the last value signalled on the direct queue's
+    /// fence, which the copy queue waits for before it writes a copy
+    /// ([`Host::card_copies`]).
+    fn card_before(&self, runs: &[&HostList], flown: bool, direct: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3793,10 +4394,18 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
+            // The copies of the dirty ranges: on the copy queue, beside the
+            // flights that are still reading those copies with the bytes
+            // from before, or (the switch off, or no list for it) in this
+            // list, ahead of the hash passes that read them.
+            let copied = self.card_copies(&dirty, direct);
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            // Where the copies left the copies: `COMMON` after the copy
+            // queue's run ([`copied_state`]), `COPY_DEST` in this list.
+            let from_state = copied_state(copied.is_some());
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -3805,15 +4414,17 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let Some((staging, twin, size)) = shadow.card_sides() else {
                             continue;
                         };
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                        if copied.is_none() {
+                            for &(a, b) in ranges {
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            }
+                            crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
+                        let Some(before) = twin else {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -3825,7 +4436,7 @@ impl Host {
                         if !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                from_state,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
@@ -3981,7 +4592,7 @@ impl Host {
         }
     }
 
-    /// The relay's own list, fence, event for [`Host::relay_card_back`].
+    /// The relay's own list, fence, event for [`Host::relay_card_fetch`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         // SAFETY: plain objects of our own.
@@ -4008,7 +4619,7 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    fn relay_card_fetch(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) -> Option<FetchRun> {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -4070,7 +4681,7 @@ impl Host {
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-            return;
+            return None;
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
@@ -4086,8 +4697,7 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let waiting = std::time::Instant::now();
+        let ((allocator, list), fence, sent) = (f.list.clone(), f.fence.clone(), f.sent);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -4114,8 +4724,6 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent * 2)?;
-                fence.SetEventOnCompletion(sent * 2 - 1, event)?;
-                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -4123,6 +4731,30 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        Some(FetchRun { pieces, data, total, sent, after, runs: runs.len() })
+    }
+
+    /// [`Host::relay_card_fetch`]'s wait: the card is waited for, and what
+    /// shaders wrote in the fetched pieces goes into title memory
+    /// (`Shadow::card_merge_relay`). Runs after the copies in the PC's
+    /// memory are merged, so the card runs the fetch while the landing
+    /// thread has work of its own.
+    fn relay_fetch_merge(&self, run: FetchRun, fetch: &Option<RelayFetch>) {
+        let FetchRun { pieces, data, total, sent, after, runs } = run;
+        let Some(fetched) = fetch.as_ref() else {
+            return;
+        };
+        let (fence, event) = (fetched.fence.clone(), fetched.event);
+        // SAFETY: this thread's fence and event, and the two signals the
+        // waits are for were sent by `relay_card_fetch`.
+        //
+        // Each wait is timed on its own: between the two, this thread has
+        // merged copies of its own, which is not time the card kept it.
+        let waiting = std::time::Instant::now();
+        if let Err(e) = unsafe { fence.SetEventOnCompletion(sent * 2 - 1, event) } {
+            fail(format_args!("what shaders wrote to the card's memory could not be waited for ({e}, VICTORY_RELAY=1)"));
+        }
+        unsafe { WaitForSingleObject(event, INFINITE) };
         let drained = waiting.elapsed();
         // The fetch's own run: what the card takes for the copies, once the
         // work sent before it is done (nothing if it had run by the time
@@ -4145,7 +4777,7 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
-            CARD_STATS[7].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            CARD_STATS[7].fetch_add(runs as u64, Ordering::Relaxed);
         }
         let mut title = Vec::new();
         let mut written = 0;
@@ -4160,6 +4792,52 @@ impl Host {
         crate::shadow::relay_fetched(after);
     }
 
+    /// [`relay`], on the thread that lands flights: what their shaders
+    /// wrote in copies in the PC's memory goes into title memory
+    /// (`relay_hand_back`), then their ranges are done with, each by its
+    /// own number: a range another flight in the air declared too stays
+    /// closed to refreshes. `run` is the card copies' fetch this landing
+    /// made, if any: it is waited for between the two, so the card runs it
+    /// while this thread compares and merges the others.
+    fn merge_flights(&self, flights: &[&Flight], run: Option<FetchRun>, fetch: &Option<RelayFetch>) {
+        if flights.is_empty() {
+            // The fetch was sent all the same, and its list must not be
+            // reset until it has run.
+            if let Some(run) = run {
+                self.relay_fetch_merge(run, fetch);
+            }
+            return;
+        }
+        let mut back: Vec<Declared> = Vec::new();
+        for flight in flights {
+            for (shadow, ranges) in &flight.back {
+                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, all)) => {
+                        for range in ranges {
+                            if !all.contains(range) {
+                                all.push(*range);
+                            }
+                        }
+                    }
+                    None => back.push((shadow.clone(), ranges.clone())),
+                }
+            }
+        }
+        relay_hand_back(&back);
+        if let Some(run) = run {
+            self.relay_fetch_merge(run, fetch);
+        }
+        for flight in flights {
+            for (shadow, ranges) in &flight.back {
+                shadow.copy_back_done(ranges);
+            }
+        }
+        let mut line = line();
+        for flight in flights {
+            line.held.merged(flight.number);
+        }
+    }
+
     /// [`relay`], on the thread that lands flights: `items` are the first
     /// things of the line, flights the card has run and what follows them.
     /// What their shaders wrote goes into title memory (copies in the
@@ -4168,8 +4846,17 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
+    ///
+    /// With [`lazy_merge`], a flight whose landing tells the title nothing
+    /// (no bottom-of-pipe write, no fence signal after it in this landing)
+    /// keeps its ranges held and is merged later ([`drain_deferred`]): the
+    /// copies in the PC's memory are the ones that wait.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // What an earlier landing held back is merged first: this is one of
+        // the points a read, a present or a fence comes by, and the items
+        // of this landing may tell the title its writes are there.
+        drain_deferred();
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -4191,29 +4878,49 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
-                let mut back: Vec<Declared> = Vec::new();
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                // The fetch goes to the queue first and is waited for
+                // after the copies in the PC's memory are merged: the card
+                // runs it while this thread compares and merges its own.
+                let run = self.relay_card_fetch(&plans, fetch);
+                // The flights this landing does not merge ([`lazy_merge`]):
+                // those the line after them in this landing tells the title
+                // nothing about. They keep their ranges held, so no refresh
+                // writes over what their shaders wrote before it is in
+                // title memory.
+                let mut held_back: Vec<u64> = Vec::new();
+                if lazy_merge() {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Late::Run(flight) = item
+                            && holds_back(!flight.back.is_empty(), &items[i + 1..])
+                        {
+                            held_back.push(flight.number);
                         }
                     }
                 }
-                relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
+                let (merging, later): (Vec<&Flight>, Vec<&Flight>) =
+                    flights.iter().partition(|f| !held_back.contains(&f.number));
+                self.merge_flights(&merging, run, fetch);
+                // What this landing does not merge, pushed now or merged
+                // now: `settles` is read and the entries are pushed in one
+                // lock section, so a settle is either counted there (and
+                // its flights are merged here) or drains them itself.
+                let hold = {
+                    let mut line = line();
+                    if line.settles > 0 {
+                        false
+                    } else {
+                        for flight in &later {
+                            line.deferred.push(HeldBack {
+                                number: flight.number,
+                                back: flight.back.clone(),
+                            });
+                        }
+                        LATE_STATS[DEFERRED].fetch_add(later.len() as u64, Ordering::Relaxed);
+                        true
                     }
+                };
+                if !hold {
+                    self.merge_flights(&later, None, fetch);
                 }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4249,7 +4956,6 @@ impl Host {
             let mut line = line();
             let Line {
                 line: items,
-                written,
                 lists,
                 settling,
                 poke,
@@ -4259,17 +4965,16 @@ impl Host {
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
-            // What is still in the air, from the flights that are.
-            written.clear();
+            // What is still in the air, from the flights that are. What
+            // they declared is held already (`Held`), each by its number,
+            // and what this landing merged is not (`Held::merged`); what
+            // it held back is, until its own merge (`Line::deferred`).
             *lists = 0;
-            let mut ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                 }
             }
-            join_ranges(written, ranges);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -4463,8 +5168,8 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, held, lists: flying, target, .. } = &mut *line;
+            held.declare(sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()), sent.number);
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4507,8 +5212,8 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, held, lists: flying, target, .. } = &mut *line;
+            held.declare(sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()), number);
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4551,7 +5256,22 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
+            //
+            // Counted before anything is looked at: a landing that would
+            // hold a merge back ([`lazy_merge`]) merges it instead when it
+            // sees this, and one that has held it back already has left it
+            // in the line for this to drain, so either order ends with the
+            // bytes in title memory before the wait below is done.
+            {
+                let mut line = line();
+                line.settles += 1;
+            }
+            drain_deferred();
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            {
+                let mut line = line();
+                line.settles -= 1;
+            }
             return;
         }
         let was_working = working(true);
@@ -4564,7 +5284,7 @@ impl Host {
                     break;
                 }
                 line.settling = true;
-                line.written.clear();
+                line.held.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -4702,9 +5422,28 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                // What an earlier landing held back ([`lazy_merge`]) is
+                // merged here, on this thread, because this is the read that
+                // must see it. Then only the flights still in the air are
+                // waited for, and only until the ones that may write what is
+                // read have landed: their copy-back's end, not the card's
+                // other work.
+                //
+                // Announced before the entries are looked at, as a settle
+                // is: a landing that would hold a merge back merges it
+                // instead while this waits, and one that has already done so
+                // has left it in the line for the drain below, so this
+                // cannot wait for bytes no one is going to merge.
+                {
+                    let mut line = line();
+                    line.settles += 1;
+                }
+                drain_deferred();
+                relay_wait(why, |line| blocked_by(line.held.joined(), runs, false).is_none());
+                {
+                    let mut line = line();
+                    line.settles -= 1;
+                }
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -4819,7 +5558,7 @@ impl Host {
             phase(PHASE_SETTLE, settling);
         }
         let carding = std::time::Instant::now();
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, *submitted);
         phase(PHASE_CARD, carding);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
@@ -7237,6 +7976,19 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            // The uploads on their own queue ([`copy_queue`]): a batch whose
+            // run had finished when the next was ready ran beside the direct
+            // queue, and that overlap is all the split buys.
+            if copy_queue() {
+                tracing::info!(
+                    "copies into the card's memory on the copy queue: {} batches, {:.1} MB a frame, \
+                     {:.0} of them finished when the next batch was ready, {:.0} still running",
+                    COPY_QUEUE_STATS[0].load(Ordering::Relaxed),
+                    COPY_QUEUE_STATS[1].load(Ordering::Relaxed) as f64 / 1e6 / frames,
+                    COPY_QUEUE_STATS[2].load(Ordering::Relaxed) as f64 / frames,
+                    COPY_QUEUE_STATS[3].load(Ordering::Relaxed) as f64 / frames
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -8359,5 +9111,46 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod copy_queue {
+    use super::{CopyOrder, copied_state};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    };
+
+    /// The rule the copy queue is built on: a batch of copies is signalled
+    /// with a value no list before it has waited for, and every list after
+    /// it that reads a copy waits for the newest one. A value waited for is
+    /// not waited for again, so a submission that reads no copy the batch
+    /// wrote waits for nothing.
+    #[test]
+    fn a_copy_batch_is_waited_for_before_a_list_reads_it() {
+        let mut order = CopyOrder::default();
+        // Nothing has been sent: the direct queue waits for nothing.
+        assert_eq!(order.wait(), None);
+        let first = order.sending();
+        assert_eq!(order.wait(), Some(first));
+        order.waited(first);
+        assert_eq!(order.wait(), None, "a batch waited for is not waited for again");
+        // A second batch is a value behind the first, and a wait of its own.
+        let second = order.sending();
+        assert!(second > first);
+        assert_eq!(order.wait(), Some(second));
+        // Waiting for an older value leaves the newer one to be waited for.
+        order.waited(first);
+        assert_eq!(order.wait(), Some(second));
+    }
+
+    /// The write of a batch reaches the direct queue only after the copy
+    /// queue's run leaves the copy: a copy read after a batch on the copy
+    /// queue is taken from `COMMON` (state decay, `copied_state`), a copy
+    /// read in the same list from `COPY_DEST`.
+    #[test]
+    fn a_copy_read_after_the_copy_queue_is_taken_from_common() {
+        assert_eq!(copied_state(true), D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(copied_state(false), D3D12_RESOURCE_STATE_COPY_DEST);
     }
 }

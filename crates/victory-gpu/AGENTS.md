@@ -18,6 +18,17 @@
 - Upload: only ranges a submission is known to read are refreshed, from
   64 KiB pages tracked by `GetWriteWatch` (`watch`); guard pages cover views
   that cannot be write-watched.
+- Those refreshed ranges reach their card copies on the direct queue, in a list
+  ahead of the submission that reads them. A COPY queue of its own
+  (`VICTORY_COPY_QUEUE=1`, off by default) buys overlap only where its wait
+  does not hold it: the batch waits for the last value signalled on the direct
+  fence (the flights already sent read those copies with the bytes from
+  before), the direct queue waits for the batch's value before its next list
+  (`host::CopyOrder`, `host::card_copies`), and the batch leaves each copy in
+  `COMMON`, a copy queue touching nothing else and decay doing the rest, which
+  `host::copied_state` hands the reader as `BeforeState`. Off because the value
+  waited for is the previous submission: what overlaps is one DMA with the
+  submitting thread, not with the card.
 - Readback: declare shader writes (`Shadow::gpu_writes`), snapshot before
   submission (`Shadow::writing`), then compare per 64 KiB piece and merge only
   differing bytes (`Shadow::copy_back_with`). Title threads write the same
@@ -30,7 +41,18 @@
   pieces of one copy in the fewest `CopyBufferRegion`s that cover them, and
   every piece still merges where it lies, so a run reaching past its pieces
   costs bytes and not correctness (`Host::card_back`,
-  `Host::relay_card_back`).
+  `Host::relay_card_fetch`).
+- A landing merges what its flights' shaders wrote in the copies in the PC's
+  memory; only with `VICTORY_LAZY_MERGE=1` (off by default, needs
+  `VICTORY_RELAY`, inert under a pinned `VICTORY_LATE_WAIT`) does it hold a
+  flight back, and only when that flight tells the title nothing (no
+  bottom-of-pipe write, no fence signal after it, no settle waiting:
+  `holds_back`, `Line::settles`). What it holds back merges at the first
+  read, present, fence or landing after it (`drain_deferred`), and its ranges
+  stay held in `Held` until then, per submission, so a range two flights
+  declared stays closed until both have merged it. The card copies' fetch is
+  always issued and merged by the landing that made it, after the copies in
+  the PC's memory: the card runs it while that thread merges its own.
 - `VICTORY_CARD_BUFFERS*` adds a card-side copy and finds writes with a
   compute hash per piece; `VICTORY_INPLACE*` places a buffer in an
   `OpenExistingHeapFromFileMapping` heap. Both are off by default.
