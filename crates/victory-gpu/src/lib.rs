@@ -28,6 +28,8 @@ pub mod dxgi;
 #[cfg(windows)]
 mod fault;
 pub mod fence;
+#[cfg(windows)]
+mod flow;
 pub mod frame;
 #[cfg(windows)]
 mod host;

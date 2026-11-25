@@ -262,7 +262,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LIBRARY_PREFETCH=0` | the host pipeline library's pages are read ahead before the host parses them; `0` lets the parse fault them in one at a time instead |
 | `VICTORY_LIBRARY_MB=<n>` | cap on the library file: past it a run stores no more pipelines, so the next start reads less. Off by default (a capped library re-makes what it did not keep) |
 
-Every build logs, after each frame line, `submission phases per frame: asking …, recording …, flush …, snapshots …, card …, send …, settle …` and the write watch's `asking the kernel N times for M pages (X ms finding their runs, Y ms in the kernel)`. When the card sits idle while frames take seconds, `asking` is where to look, and its tail says whether the time goes in finding a range's runs or in the kernel call (MEMORY.md §5.1 describes each phase).
+Every build logs, after each frame line, `submission phases per frame: asking …, recording …, flush …, snapshots …, card …, send …, settle …` and the write watch's `asking the kernel N times for M pages (X ms finding their runs, Y ms in the kernel)`, and `where the frame's bytes went`: each call site that moved title memory, its MB, its ms and its rate (a `memcpy` on the machine measured does 14.1 GB/s). When the card sits idle while frames take seconds, `asking` is where to look, and its tail says whether the time goes in finding a range's runs or in the kernel call (MEMORY.md §5.1 describes each phase).
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

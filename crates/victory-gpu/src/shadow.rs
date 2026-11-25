@@ -467,6 +467,38 @@ mod card_tests {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
     }
+
+    /// Views of one heap that lie next to one another are hashed in far fewer
+    /// passes than the ranges they came from: run 20261125-055341 sent up 246
+    /// ranges over 1,118 pieces a frame, and every pass walks 4,096 steps of a
+    /// piece however few of its pieces were sent up.
+    #[test]
+    fn views_of_one_heap_join_into_fewer_passes() {
+        let run = |first: u32, pieces: u32| CardSpan { from: first * 65536, to: (first + pieces) * 65536, first, pieces, skew: 0 };
+        // 246 views of a heap, each starting inside the one before it and
+        // ending a little past it, as the world's views of its heap do.
+        let mut runs = Vec::new();
+        let mut first = 0u32;
+        for i in 0..246u32 {
+            let pieces = 4 + (i % 7);
+            runs.push(run(first, pieces));
+            first += (pieces / 2).max(1);
+        }
+        let joined = joined_piece_runs(runs.clone());
+        assert!(joined.len() * 8 < runs.len(), "{} passes of {}", joined.len(), runs.len());
+        let pieces = |runs: &[CardSpan]| -> Vec<u32> {
+            let mut v: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(pieces(&joined), pieces(&runs));
+        // No two passes cover a piece twice.
+        assert!(joined.windows(2).all(|two| two[0].first + two[0].pieces < two[1].first));
+        // A heap nothing else touches is one pass.
+        let apart = joined_piece_runs(vec![run(0, 2), run(10, 2)]);
+        assert_eq!(apart.len(), 2);
+    }
 }
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
@@ -2653,6 +2685,7 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackParts, parts.len() as u64);
         let total = self.len as usize;
+        let snap = std::time::Instant::now();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2684,6 +2717,7 @@ impl Shadow {
                     kept.0[piece] = whole;
                 }
             }
+            crate::flow::took(crate::flow::Site::Snapshot, taken, snap);
             return;
         }
         if wide_back() {
@@ -2695,6 +2729,7 @@ impl Shadow {
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            crate::flow::took(crate::flow::Site::Snapshot, taken, snap);
             return;
         }
         for (from, to) in parts {
@@ -2706,6 +2741,7 @@ impl Shadow {
                 }
             }
         }
+        crate::flow::took(crate::flow::Site::Snapshot, taken, snap);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -2751,12 +2787,12 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
-            #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            crate::flow::took(crate::flow::Site::Compared, to - from, scanning);
             #[cfg(feature = "diagnostics")]
             let syncing = {
                 use crate::copystat::{C, add};
@@ -2770,6 +2806,7 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            let merging = std::time::Instant::now();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2828,6 +2865,7 @@ impl Shadow {
             // view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+            crate::flow::took(crate::flow::Site::PutBack, written, merging);
         }
         written
     }
@@ -3252,9 +3290,9 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        crate::flow::took(crate::flow::Site::Whole, to - from, started);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -3367,14 +3405,22 @@ impl Shadow {
         // Title memory not there: copied as it always was (the read fails
         // and the copy's own read will say so too). Read in place where it
         // can be (`read_in_place`), through the kernel otherwise.
-        if !self.read_in_place(from, room.as_mut_ptr(), n)
-            && !crate::host::read_into(from as *const u8, room)
-        {
+        let begun = std::time::Instant::now();
+        let read = self.read_in_place(from, room.as_mut_ptr(), n) || {
+            let kernel = std::time::Instant::now();
+            let read = crate::host::read_into(from as *const u8, room);
+            if read {
+                crate::flow::took(crate::flow::Site::Kernel, n, kernel);
+            }
+            read
+        };
+        if !read {
             return self.copy(from, to);
         }
         // SAFETY: inside the copy's mapping.
         let here = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
         if here == &room[..] {
+            crate::flow::took(crate::flow::Site::Kept, n, begun);
             BACK_CLASS[11].fetch_add(1, Ordering::Relaxed);
             BACK_CLASS[12].fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3410,8 +3456,10 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        let begun = std::time::Instant::now();
         if !self.read_in_place(from, at, to - from) {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
+            crate::flow::took(crate::flow::Site::Kernel, to - from, begun);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -3444,11 +3492,11 @@ impl Shadow {
         if !crate::texture::committed(from as *const u8, len) {
             return false;
         }
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: every page of the range was found mapped, and no mapping
         // of title memory changes while the guard is held.
         unsafe { std::ptr::copy_nonoverlapping(from as *const u8, at, len) };
+        crate::flow::took(crate::flow::Site::InPlace, len, started);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
