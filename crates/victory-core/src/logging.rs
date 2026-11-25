@@ -10,11 +10,13 @@
 //! from (a title that relaunches itself, a crash, a black screen), and the
 //! only copy of the diagnosis would otherwise go away with that terminal.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -163,9 +165,17 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
 /// Installs the process-wide subscriber: the stderr layer both callers
 /// share, plus the file layer when `target` names a file.
 fn install(default_level: &str, target: Option<PathBuf>) {
-    let filter = std::env::var("VICTORY_LOG")
+    let asked = std::env::var("VICTORY_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
-        .ok()
+        .ok();
+    // The header states the filter in effect; a filter that does not parse is
+    // replaced by the default, so the header states that instead.
+    if let Some(text) = asked.clone().filter(|v| EnvFilter::try_new(v).is_ok()) {
+        let _ = FILTER_TEXT.set(text);
+    } else {
+        let _ = FILTER_TEXT.set(default_level.to_owned());
+    }
+    let filter = asked
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
     let subscriber = tracing_subscriber::registry().with(CAP).with(filter).with(
@@ -176,8 +186,19 @@ fn install(default_level: &str, target: Option<PathBuf>) {
     // A file that cannot be opened is not worth failing the command over:
     // the command's own work would stop before it could report anything,
     // and its paths are usually the missing parent directory itself.
-    match target.and_then(|path| open(&path)) {
+    let opened = target.map(|path| (open(&path), path));
+    let _ = match &opened {
+        // The header names the file it is being written to; a path that failed
+        // to open is not a sink and must not be named as one.
+        Some((Some(_), path)) => LOG_PATH.set(Some(path.clone())),
+        _ => LOG_PATH.set(None),
+    };
+    match opened.and_then(|(file, _)| file) {
         Some(file) => {
+            // `emit` writes the header, the footer and the `warn_once` lines
+            // here, outside the subscriber: they must survive a filter that
+            // silences the level they would have been logged at.
+            let _ = SINK.set(Some(file.clone()));
             let _ = subscriber
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -254,6 +275,247 @@ impl<'a> MakeWriter<'a> for Shared {
         // the run: the log is most needed right after something went wrong.
         Locked(self.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
+}
+
+// ---- Records a filter cannot hide ------------------------------------------
+//
+// The run header, the run footer and a repeating warning are the three
+// records a reader needs even when `VICTORY_LOG` silences everything else:
+// one says what the run was, one says what it came to, and one says the thing
+// that went wrong 4 359 times. They bypass the level filter on purpose — a
+// filter is for volume, not for the two lines that explain the run.
+
+/// The file [`install`] opened, so [`emit`] can reach the same sink the
+/// subscriber writes. `None` when logging is on stderr alone.
+static SINK: OnceLock<Option<Shared>> = OnceLock::new();
+
+/// The log file in effect, for the run header.
+static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The filter text in effect, for the run header.
+static FILTER_TEXT: OnceLock<String> = OnceLock::new();
+
+/// The log file every record also reaches, or `None` for stderr only.
+pub fn current_log_file() -> Option<&'static Path> {
+    LOG_PATH.get().and_then(Option::as_deref)
+}
+
+/// What `VICTORY_LOG` (or `RUST_LOG`, or the caller's default) asked for.
+pub fn filter_text() -> &'static str {
+    FILTER_TEXT.get().map_or("info", String::as_str)
+}
+
+/// The most verbose level this build can log: `trace` with `diagnostics`,
+/// `info` without. A filter asking for more than this gets this.
+pub fn cap_text() -> &'static str {
+    if cfg!(feature = "diagnostics") {
+        "trace"
+    } else {
+        "info"
+    }
+}
+
+/// Writes `text` to the log sinks outside the level filter, one timestamped
+/// line each.
+///
+/// For the run header, the run footer and [`warn_once`]. A line that cannot be
+/// written is dropped: logging never fails a run.
+pub fn emit(level: &str, text: &str) {
+    let stamp = utc_text(SystemTime::now());
+    let mut rendered = String::with_capacity(text.len() + 32 * (text.lines().count() + 1));
+    for line in text.lines() {
+        rendered.push_str(&format!("{stamp} {level:>5} {line}\n"));
+    }
+    if let Some(Some(sink)) = SINK.get() {
+        // A poisoned mutex means a thread panicked mid-line; the rest of the
+        // run still gets its log.
+        let mut file = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = file.write_all(rendered.as_bytes());
+    }
+    let _ = io::stderr().write_all(rendered.as_bytes());
+}
+
+/// The same instant as [`utc_text`], in the wall clock this machine shows,
+/// `YYYY-MM-DDTHH:MM:SS`.
+///
+/// `victory-core` stays dependency-free, so the one Win32 call that reports
+/// local time is declared here rather than pulling `windows-sys` into a leaf
+/// crate for a header field. Elsewhere the two are the same and this returns
+/// the UTC text.
+pub fn local_text() -> String {
+    #[cfg(windows)]
+    {
+        // `SYSTEMTIME`: eight `WORD`s, the layout kernel32 has always had.
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetLocalTime(out: *mut SystemTime);
+        }
+        let mut now = SystemTime {
+            year: 0,
+            month: 0,
+            day_of_week: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            milliseconds: 0,
+        };
+        // SAFETY: `GetLocalTime` fills one `SYSTEMTIME` it is given and reads
+        // nothing else; the argument points at a live local.
+        unsafe { GetLocalTime(&mut now) };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            now.year, now.month, now.day, now.hour, now.minute, now.second
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        utc_text(SystemTime::now())
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`, the same shape and zone as the timestamps
+/// `tracing-subscriber` writes, so one `grep` finds both.
+pub fn utc_text(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let millis = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_millis());
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rest / 3_600,
+        rest / 60 % 60,
+        rest % 60
+    )
+}
+
+/// A condition that repeats: the first occurrence is logged, then the 10th,
+/// the 100th, the 1 000th …, and the first one after a minute of quiet.
+const QUIET: Duration = Duration::from_secs(60);
+
+/// The first count that is logged after the first occurrence.
+const ESCALATION: u64 = 10;
+
+/// How often one keyed condition has been seen, and how many of those
+/// occurrences produced no line.
+struct Watch {
+    count: u64,
+    suppressed: u64,
+    last_seen: Instant,
+}
+
+/// What [`warn_once`] decided, when it decided to log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Occurrence {
+    /// Occurrences so far, first one included.
+    pub count: u64,
+    /// Occurrences the log does not show, first one included in the count.
+    pub suppressed: u64,
+}
+
+impl Watch {
+    fn new(now: Instant) -> Self {
+        Self {
+            count: 0,
+            suppressed: 0,
+            last_seen: now,
+        }
+    }
+
+    /// Counts one occurrence and says whether this one is worth a line.
+    ///
+    /// Ten, a hundred, a thousand: a storm that stays silent hides the number
+    /// that says how bad it is, and one that prints every occurrence hides
+    /// everything else. A minute of quiet starts the escalation again, so a
+    /// condition that comes back much later is visible at once.
+    fn observe(&mut self, now: Instant) -> Option<Occurrence> {
+        let quiet = now.saturating_duration_since(self.last_seen) >= QUIET;
+        self.count += 1;
+        self.last_seen = now;
+        if self.count == 1 || quiet || milestone(self.count) {
+            return Some(Occurrence {
+                count: self.count,
+                suppressed: self.suppressed,
+            });
+        }
+        self.suppressed += 1;
+        None
+    }
+}
+
+/// Whether `n` is 10, 100, 1 000 …
+fn milestone(n: u64) -> bool {
+    if n < ESCALATION {
+        return false;
+    }
+    let mut step = ESCALATION;
+    while step < n {
+        step = step.saturating_mul(ESCALATION);
+    }
+    step == n
+}
+
+fn watches() -> &'static Mutex<HashMap<&'static str, Watch>> {
+    static WATCHES: OnceLock<Mutex<HashMap<&'static str, Watch>>> = OnceLock::new();
+    WATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Logs the first occurrence of a keyed condition and escalates from there.
+///
+/// `key` is a stable dotted name (`draw.refused`), the word an agent greps.
+/// Every line carries `count=` and `suppressed=`, so a message that prints
+/// once still says how many it stood for — the draw refusal that hid 4 359
+/// lost draws per frame for minutes did not.
+///
+/// `message` runs only when a line is written: a per-draw call costs one lock
+/// and one integer compare in the storm. Returns whether a line was written.
+pub fn warn_once(key: &'static str, message: impl FnOnce() -> String) -> bool {
+    let occurrence = {
+        let mut watches = watches().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        watches
+            .entry(key)
+            .or_insert_with(|| Watch::new(now))
+            .observe(now)
+    };
+    let Some(occurrence) = occurrence else {
+        return false;
+    };
+    emit(
+        "WARN",
+        &format!(
+            "{key} count={} suppressed={} {}",
+            occurrence.count,
+            occurrence.suppressed,
+            message()
+        ),
+    );
+    true
+}
+
+/// Every keyed condition and how many times it was seen, sorted by key, for
+/// the run footer, which states the totals the escalation left out.
+pub fn warn_once_totals() -> Vec<(String, u64)> {
+    let watches = watches().lock().unwrap_or_else(|e| e.into_inner());
+    let mut totals: Vec<(String, u64)> = watches
+        .iter()
+        .map(|(key, watch)| ((*key).to_owned(), watch.count))
+        .collect();
+    totals.sort();
+    totals
 }
 
 #[cfg(test)]
@@ -378,5 +640,102 @@ mod tests {
         assert!(dir.path().join("notes.log").exists());
         assert!(dir.path().join("run-latest.log").exists());
         assert!(dir.path().join("run-20260101-00000.log").exists());
+    }
+
+    #[test]
+    fn a_condition_escalates_at_ten_and_a_hundred() {
+        let start = Instant::now();
+        let mut watch = Watch::new(start);
+        assert_eq!(
+            watch.observe(start),
+            Some(Occurrence {
+                count: 1,
+                suppressed: 0
+            })
+        );
+        let mut logged = Vec::new();
+        for i in 1..100 {
+            let at = start + Duration::from_millis(i);
+            if let Some(occurrence) = watch.observe(at) {
+                logged.push(occurrence);
+            }
+        }
+        // Occurrences 2..=9 said nothing, 10 spoke, 11..=99 said nothing,
+        // 100 spoke. Nine silent between the first line and the tenth.
+        assert_eq!(
+            logged,
+            [
+                Occurrence {
+                    count: 10,
+                    suppressed: 8
+                },
+                Occurrence {
+                    count: 100,
+                    suppressed: 97
+                }
+            ]
+        );
+        assert_eq!(watch.count, 100);
+    }
+
+    #[test]
+    fn a_quiet_minute_starts_the_escalation_again() {
+        let start = Instant::now();
+        let mut watch = Watch::new(start);
+        assert!(watch.observe(start).is_some());
+        for i in 1..=5 {
+            assert!(watch.observe(start + Duration::from_millis(i)).is_none());
+        }
+        // 59 s after the last occurrence is not quiet, and 7 is no milestone.
+        assert!(watch.observe(start + Duration::from_secs(59)).is_none());
+        // A minute of silence is: the condition is back, and so is its line.
+        assert_eq!(
+            watch.observe(start + Duration::from_secs(120)),
+            Some(Occurrence {
+                count: 8,
+                suppressed: 6
+            })
+        );
+    }
+
+    #[test]
+    fn a_milestone_is_a_power_of_ten_from_ten() {
+        for n in [0, 1, 9, 11, 99, 101, 1_001] {
+            assert!(!milestone(n), "{n}");
+        }
+        for n in [10, 100, 1_000, 10_000, 1_000_000] {
+            assert!(milestone(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_timestamp_is_a_zulu_date_and_time() {
+        use std::time::UNIX_EPOCH;
+        assert_eq!(utc_text(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            utc_text(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20.000Z"
+        );
+        // Milliseconds, not microseconds: the same width on every line.
+        assert_eq!(
+            utc_text(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
+            "2023-11-14T22:13:20.123Z"
+        );
+    }
+
+    #[test]
+    fn a_condition_is_logged_only_as_often_as_documented() {
+        // The real entry point, on a real clock: one line, then nothing.
+        let key: &'static str = Box::leak(format!("test.{}", std::process::id()).into_boxed_str());
+        assert!(warn_once(key, || "first".to_owned()));
+        for _ in 0..8 {
+            assert!(!warn_once(key, || "silent".to_owned()));
+        }
+        assert!(warn_once(key, || "tenth".to_owned()));
+        let totals = warn_once_totals();
+        assert!(
+            totals.iter().any(|(name, count)| name == key && *count == 10),
+            "{totals:?}"
+        );
     }
 }
