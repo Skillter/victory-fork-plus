@@ -53,6 +53,12 @@ all agree on; anything else stays unfolded.
 ## Traps
 
 - `emit::lower::take_needs` is thread-local state carried between programs.
+- `resource::Tracer::patched` models only a four-dword buffer `V#`, gated on
+  `Role::Resource`; a patched image `T#` (eight dwords) or sampler `S#` is
+  refused as "a descriptor changed after loading", never read as a buffer.
+- `fspx::Reflect` reads VGPR, LDS and thread-id bounds from the code because
+  the package's `COMPUTE_PGM_RSRC2` layout is not established: a dynamic `DS`
+  address adds `LDS_DYNAMIC_MARGIN` on top of the immediate offsets.
 - `HostShader` is the output boundary; `victory-gpu`'s shader cache encodes
   its fields. Coordinate any layout change.
 - `emit::host` compiles only with the `host` feature and creates real D3D12

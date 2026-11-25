@@ -106,6 +106,8 @@ const MAX_RANGES: u32 = 64;
 /// does not describe (no program of the shipped package reads them).
 const USER_DATA_BASE: u8 = 4;
 const MAX_USER_DATA: u32 = 32;
+/// `COMPUTE_PGM_RSRC2` holds the user SGPR count in five bits.
+const MAX_USER_SGPRS: u32 = 32;
 
 const PSV_STAGE: usize = 0x1c;
 const PSV_THREADS: [usize; 3] = [0x28, 0x2c, 0x30];
@@ -116,6 +118,9 @@ const MAX_THREADS: u32 = 1024;
 const DS_MAX_BYTES: usize = 16;
 const LDS_GRANULE: usize = 512;
 const LDS_GRANULES_MAX: u32 = 0x1FF;
+/// What a program that computes LDS addresses may reach past what its
+/// immediates name: one granule, the unit the size is stated in.
+const LDS_DYNAMIC_MARGIN: usize = LDS_GRANULE;
 
 /// Whether `part` is an `FSPX` package.
 pub fn is_package(part: &[u8]) -> bool {
@@ -174,13 +179,24 @@ pub fn programs(part: &[u8], container: &Container) -> Result<Vec<NativeProgram>
     let user_sgprs = layout
         .last()
         .map_or(u32::from(USER_DATA_BASE), |p| u32::from(p.user_data) + p.sgprs);
+    // `USER_SGPR` holds five bits, so 32 dwords of user data would spill into
+    // `TRAP_PRESENT` and `TGID_XYZ_EN` (bits 6 to 9) and the group ids would
+    // land outside the SGPRs a 32-thread group initialises.
+    if user_sgprs >= MAX_USER_SGPRS {
+        return Err(Unsupported {
+            offset: 0,
+            what: "an ACCC program whose root signature takes 32 or more user SGPRs",
+        });
+    }
     let mut rsrc2 = user_sgprs << 1;
     // The group ids are the SGPRs after the user data, all three of them: the
     // shipped programs read s14 to s16 of a group of one thread each way,
     // which only a dispatch's own dimensions can be.
     rsrc2 |= 0b111 << 7;
-    // Thread ids: one VGPR per dimension of the thread group.
-    let dimensions = threads.iter().filter(|t| **t > 1).count().max(1);
+    // Thread ids: `TIDIG_COMP_CNT` is the highest component the group enables,
+    // not how many dimensions are above one, so a group of [1, 64, 1] still
+    // gets v0 and v1.
+    let dimensions = threads.iter().rposition(|t| *t > 1).map_or(1, |h| h + 1);
     rsrc2 |= ((dimensions - 1) as u32) << 11;
     rsrc2 |= (lds.div_ceil(LDS_GRANULE as u32)).min(LDS_GRANULES_MAX) << 15;
     Ok(vec![NativeProgram {
@@ -352,9 +368,19 @@ fn signature(data: &[u8]) -> Result<Vec<RootParam>, ShaderError> {
 }
 
 /// The VGPR past the highest the code names, and the LDS bytes it reaches.
+///
+/// What is still unknown: the LDS size the program itself states. The package
+/// has a `kind 0` header per program that would hold its
+/// `COMPUTE_PGM_RSRC2`, but its layout is not established (nothing of the
+/// shipped package has been decoded from it), so the reach is taken from the
+/// code: the immediates of every `ds_*` access, scaled as the instruction
+/// scales them, plus one granule when the code addresses LDS by an address it
+/// computes, which no immediate bounds.
 fn extents(code: &[u8], wave64: bool) -> Result<(u16, u32), ShaderError> {
     let mut vgprs = 0u16;
     let mut lds = 0usize;
+    // Whether an access adds an address the code computes to its immediates.
+    let mut dynamic = false;
     for inst in crate::gfx10::decode(code)? {
         let fields = inst.fields(wave64);
         let mut see = |o: &Operand| {
@@ -378,15 +404,23 @@ fn extents(code: &[u8], wave64: bool) -> Result<(u16, u32), ShaderError> {
             Fields::Vintrp { dst, src, attr } => [dst, src, attr].iter().for_each(|o| see(o)),
             Fields::Ds {
                 dst,
+                addr,
                 data,
                 offset0,
                 offset1,
                 gds,
-                ..
             } => {
-                dst.iter().chain(data).for_each(&mut see);
+                dst.iter().chain(data).chain(addr.as_ref()).for_each(&mut see);
                 if !gds {
-                    lds = lds.max(usize::from(*offset0).max(usize::from(*offset1)) + DS_MAX_BYTES);
+                    let name = inst.name().unwrap_or_default();
+                    for bytes in ds_offsets(name, *offset0, *offset1) {
+                        lds = lds.max(bytes + DS_MAX_BYTES);
+                    }
+                    // A swizzle or a permute names a lane, not a place in the
+                    // allocation.
+                    let lane_file =
+                        name.starts_with("ds_swizzle") || name.starts_with("ds_bpermute");
+                    dynamic |= addr.is_some() && !lane_file;
                 }
             }
             Fields::Buffer {
@@ -429,7 +463,31 @@ fn extents(code: &[u8], wave64: bool) -> Result<(u16, u32), ShaderError> {
             }
         }
     }
+    if dynamic && lds > 0 {
+        lds += LDS_DYNAMIC_MARGIN;
+    }
     Ok((vgprs.max(1), lds as u32))
+}
+
+/// The byte offsets a `ds_*` instruction's immediates add to its address. The
+/// pair forms (`ds_read2_b32`, `ds_write2st64_b64`) count in elements of their
+/// width, `_st64` in 64 of those; every other form names bytes, and only
+/// `offset0` is an offset (see `emit::lower`'s `ds`).
+fn ds_offsets(name: &str, offset0: u8, offset1: u8) -> Vec<usize> {
+    let pair = ["read2", "write2", "wrxchg2"]
+        .iter()
+        .any(|p| name.contains(p));
+    if !pair {
+        return vec![usize::from(offset0).max(usize::from(offset1))];
+    }
+    let width = match name.rsplit('_').next() {
+        Some("b64") => 2,
+        Some("b96") => 3,
+        Some("b128") => 4,
+        _ => 1,
+    };
+    let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
+    vec![usize::from(offset0) * scale, usize::from(offset1) * scale]
 }
 
 #[cfg(test)]
@@ -685,8 +743,79 @@ mod tests {
         let StageIo::Cs(cs) = p.io else {
             panic!("a compute program");
         };
-        // 0x100 + a 16-byte access is one 512-byte granule.
-        assert_eq!(cs.lds_bytes(), LDS_GRANULE as u32);
+        // 0x100 + a 16-byte access is one granule, and the address v0 is
+        // computed: a second one is the margin such an access gets.
+        assert_eq!(cs.lds_bytes(), 2 * LDS_GRANULE as u32);
+    }
+
+    /// The address of a `ds_*` access counts towards the VGPR total as much
+    /// as its data does.
+    #[test]
+    fn a_vgpr_used_only_as_an_lds_address_is_counted() {
+        let ds = opcode(Encoding::Ds, "ds_write_b32");
+        let mut code = Vec::new();
+        // `ds_write_b32 v5, v0`, then `s_endpgm`.
+        code.extend_from_slice(&(0xD800_0000 | ((ds as u32) << 18)).to_le_bytes());
+        code.extend_from_slice(&5u32.to_le_bytes());
+        code.extend_from_slice(&ENDPGM.to_le_bytes());
+        let records = [record(3, 3, 0, 0, 4, 4, 0)];
+        let bytes = container([64, 1, 1], 1, 0, &records, &code, false);
+        // v5 is the address and v0 the data: the program names v0 to v5.
+        assert_eq!(program(&bytes).vgprs, 6);
+    }
+
+    /// `ds_read2_b32` counts its two offsets in dwords, not in bytes.
+    #[test]
+    fn a_pair_access_scales_its_offsets() {
+        let ds = opcode(Encoding::Ds, "ds_read2_b32");
+        let mut code = Vec::new();
+        // `ds_read2_b32 v[0:1], v2 offset0:0x40 offset1:0x80`, then `s_endpgm`.
+        code.extend_from_slice(&(0xD800_0000 | ((ds as u32) << 18) | 0x8040).to_le_bytes());
+        code.extend_from_slice(&(2u32 << 8).to_le_bytes());
+        code.extend_from_slice(&ENDPGM.to_le_bytes());
+        let records = [record(3, 3, 0, 0, 4, 4, 0)];
+        let bytes = container([64, 1, 1], 1, 0, &records, &code, false);
+        let StageIo::Cs(cs) = program(&bytes).io else {
+            panic!("a compute program");
+        };
+        // The offsets count dwords: 0x80 of them reach 0x200 bytes, and a
+        // four-byte access follows it. Read as bytes they would reach 0x80
+        // (one granule); with the margin a computed address gets, 0x210 and
+        // one granule are three.
+        assert_eq!(cs.lds_bytes(), 3 * LDS_GRANULE as u32);
+    }
+
+    #[test]
+    fn a_group_of_one_thread_two_ways_still_gets_two_thread_ids() {
+        // `TIDIG_COMP_CNT` names the highest component the group enables, so a
+        // group that is one thread in X and many in Y enables both.
+        let records = [record(3, 3, 0, 0, 4, 4, 0)];
+        for (threads, ids) in [([1, 64, 1], 2), ([1, 1, 64], 3), ([1, 32, 4], 3)] {
+            let bytes = container(threads, 1, 0, &records, &ENDPGM.to_le_bytes(), false);
+            let StageIo::Cs(cs) = program(&bytes).io else {
+                panic!("a compute program");
+            };
+            assert_eq!(cs.thread_id_vgprs(), ids, "{threads:?}");
+        }
+    }
+
+    /// 32 dwords of user data do not fit the five-bit field the register
+    /// holds them in.
+    #[test]
+    fn a_root_signature_of_32_user_sgprs_is_refused() {
+        let records = [record(3, 3, 0, 0, 4, 4, 0)];
+        let bytes = container([64, 1, 1], 28, 0, &records, &ENDPGM.to_le_bytes(), false);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(
+            matches!(
+                programs(c.part(FourCC::ACCC).unwrap().data, &c).unwrap_err(),
+                Unsupported {
+                    what: "an ACCC program whose root signature takes 32 or more user SGPRs",
+                    ..
+                }
+            ),
+            "a 32-dword root signature"
+        );
     }
 
     #[test]
