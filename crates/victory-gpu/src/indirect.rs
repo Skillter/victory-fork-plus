@@ -21,14 +21,22 @@
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, PCSTR, s};
 
+use crate::draw::{Command, emitted, spared_command};
 use crate::host::{HostList, host, transition};
 
+/// The clamp, compiled twice: as it reads a count buffer, and (`NOCOUNT`)
+/// without one. A root view is a command of its own on the host list, and a
+/// clamp with no count buffer is one of three rather than four.
 const SOURCE: &str = r#"
+#ifdef NOCOUNT
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#endif
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -41,7 +49,9 @@ cbuffer Record : register(b0) {
     uint count_offset;
 };
 ByteAddressBuffer src_args : register(t0);
+#ifndef NOCOUNT
 ByteAddressBuffer count_buf : register(t1);
+#endif
 RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -54,9 +64,11 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+#ifndef NOCOUNT
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+#endif
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
@@ -133,9 +145,78 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Clamp {
+/// One compiled clamp: the root signature its shader carries, and its
+/// pipeline.
+struct Bound {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+}
+
+struct Clamp {
+    /// Reads a count buffer as well.
+    counted: Bound,
+    /// Reads no count buffer: one root view less to set per clamp. `None`
+    /// when that shader did not compile; `counted` serves then, with
+    /// `has_count` 0 and a count view the shader never reads.
+    plain: Option<Bound>,
+}
+
+impl Clamp {
+    /// The clamp for a run, and whether it binds the count's root view.
+    fn for_count(&self, count: bool) -> (&Bound, bool) {
+        match (count, &self.plain) {
+            (true, _) | (false, None) => (&self.counted, true),
+            (false, Some(plain)) => (plain, false),
+        }
+    }
+}
+
+/// What the host list already holds of the clamp's own state
+/// ([`crate::draw::State`] hands its own and takes back what the clamp set):
+/// a clamp right after another leaves out the signature and pipeline the
+/// list has. Both by object address; 0 is none.
+///
+/// A command list's reset drops both, so a caller keeps this beside its own
+/// cache of them and clears it where it clears that (`draw::State::reset`,
+/// `draw::State::replay`): kept across a reset it would spare a signature
+/// the list no longer holds.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Held {
+    pub(crate) pipeline: usize,
+    pub(crate) root: usize,
+}
+
+/// The state calls a clamp makes: the root signature and the pipeline only
+/// when the list holds others, and the root views it sets (src, the count
+/// when it reads one, the scratch and the budget).
+#[derive(Debug, PartialEq, Eq)]
+struct Plan {
+    signature: bool,
+    pipeline: bool,
+    views: u32,
+}
+
+fn plan(count_view: bool, pipeline: usize, root: usize, held: &Held) -> Plan {
+    Plan {
+        signature: held.root != root,
+        pipeline: held.pipeline != pipeline,
+        views: 3 + u32::from(count_view),
+    }
+}
+
+/// The commands a clamp records: a UAV barrier and a state change on each
+/// side of it, its constants, its root views, its dispatch, and the state
+/// calls [`plan`] keeps. Pinned by test against what [`record_clamp_as`]
+/// emits, so the printed line cannot part from the calls.
+#[cfg(test)]
+fn commands(plan: &Plan) -> u32 {
+    const WAITS: u32 = 4;
+    WAITS
+        + 1
+        + plan.views
+        + 1
+        + u32::from(plan.signature)
+        + u32::from(plan.pipeline)
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -161,16 +242,55 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// The `NOCOUNT` define, as `D3DCompile` takes it: one macro, then the
+/// terminator (a null name).
+fn no_count() -> [D3D_SHADER_MACRO; 2] {
+    [
+        D3D_SHADER_MACRO {
+            Name: s!("NOCOUNT"),
+            Definition: s!("1"),
+        },
+        // The last macro names nothing (a null name, not an empty one): the
+        // compiler stops there, and reads nothing past it.
+        D3D_SHADER_MACRO {
+            Name: PCSTR::null(),
+            Definition: PCSTR::null(),
+        },
+    ]
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let counted = compile_bound(device, s!("clamp"), None)?;
+    // One root view less to set per clamp without a count buffer. A second
+    // source the system's compiler refuses keeps every clamp as it was.
+    let plain = match compile_bound(device, s!("clamp"), Some(&no_count())) {
+        Ok(plain) => Some(plain),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "no argument clamp without a count buffer: every clamp binds its count view"
+            );
+            None
+        }
+    };
+    Ok(Clamp { counted, plain })
+}
+
+fn compile_bound(
+    device: &ID3D12Device,
+    name: windows::core::PCSTR,
+    defines: Option<&[D3D_SHADER_MACRO]>,
+) -> windows::core::Result<Bound> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    // SAFETY: the source, names and defines live through the call; out
+    // pointers ours.
     let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
-            s!("clamp"),
-            None,
+            name,
+            defines.map(<[D3D_SHADER_MACRO]>::as_ptr),
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -207,7 +327,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(Bound { root, pso })
     }
 }
 
@@ -242,17 +362,19 @@ fn validate_layout(
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
-/// Replaces the list's compute root signature and pipeline (callers bind
-/// theirs after). `None` if the clamp or alignment is not available.
+/// Replaces the list's compute root signature and pipeline, and records what
+/// it left in `held` (callers bind theirs after). `None` if the clamp or
+/// alignment is not available.
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    held: &mut Held,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    record_clamp(c, &list.list, &dst, budget, src, count, spec, held).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -269,12 +391,14 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
+    held: &mut Held,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, held).then_some(dst)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -283,8 +407,9 @@ fn record_clamp(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    held: &mut Held,
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, held)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -299,6 +424,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    held: &mut Held,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -344,6 +470,9 @@ fn record_clamp_as(
         None => (src_gpu, 0u32, 0u32),
     };
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let (bound, count_view) = c.for_count(count.is_some());
+    let (root, pipeline) = (bound.root.as_raw() as usize, bound.pso.as_raw() as usize);
+    let plan = plan(count_view, pipeline, root, held);
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -376,18 +505,39 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
+        emitted(Command::Barrier, (first.len() - skip) as u64);
         if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
+            if plan.signature {
+                l.SetComputeRootSignature(&bound.root);
+                held.root = root;
+                emitted(Command::Signature, 1);
+            } else {
+                spared_command(Command::Signature);
+            }
+            if plan.pipeline {
+                l.SetPipelineState(&bound.pso);
+                held.pipeline = pipeline;
+                emitted(Command::Pipeline, 1);
+            } else {
+                spared_command(Command::Pipeline);
+            }
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            emitted(Command::Root32, 1);
             l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
+            // Without the count view the shader declares the other two at 2
+            // and 3 (`NOCOUNT`).
+            let (dst_param, budget_param) = if count_view { (3, 4) } else { (2, 3) };
+            if count_view {
+                l.SetComputeRootShaderResourceView(2, count_gpu);
+            }
+            l.SetComputeRootUnorderedAccessView(dst_param, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(budget_param, budget);
+            emitted(Command::RootView, u64::from(plan.views));
             l.Dispatch(records.div_ceil(64), 1, 1);
-            crate::draw::emitted(crate::draw::Command::Clamp, 1);
+            emitted(Command::Clamp, 1);
         }
         l.ResourceBarrier(&second[skip..]);
+        emitted(Command::Barrier, (second.len() - skip) as u64);
     }
     true
 }
@@ -407,6 +557,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+    emitted(Command::Barrier, 1);
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -451,7 +602,7 @@ void main() {
         submitted: u64,
         event: HANDLE,
         clamp: Clamp,
-        worker: Clamp,
+        worker: Bound,
     }
 
     impl WarpHarness {
@@ -617,7 +768,7 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Bound> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
         unsafe {
@@ -648,7 +799,7 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Bound { root, pso })
         }
     }
 
@@ -752,6 +903,68 @@ void main() {
         assert_eq!(validate_layout((1, 20, u32::MAX), 0, None), None);
     }
 
+    /// The clamp's accounting, command by command: what it records when the
+    /// list holds another signature and pipeline, what one root view less
+    /// saves when it reads no count buffer, and what a clamp right after
+    /// another leaves out because the list already holds its own state.
+    ///
+    /// This is the line the frame prints (`draw::commands_line`), so the
+    /// figure the printed `commands per draw` carries must be the calls the
+    /// clamp makes: two waits on each side, its constants, its views, its
+    /// dispatch, and the signature and pipeline `plan` keeps.
+    #[test]
+    fn the_clamp_counts_the_commands_it_records() {
+        let none = Held::default();
+        // A clamp of a single record, as the title's own call makes it.
+        let counted = plan(true, 0x5130, 0x5131, &none);
+        assert_eq!(counted, Plan { signature: true, pipeline: true, views: 4 });
+        assert_eq!(commands(&counted), 12);
+        // A window of records (no count buffer): one root view less.
+        let plain = plan(false, 0x5130, 0x5131, &none);
+        assert_eq!(plain, Plan { signature: true, pipeline: true, views: 3 });
+        assert_eq!(commands(&plain), 11);
+        // A clamp right after one of the same signature and pipeline.
+        let after = plan(false, 0x5130, 0x5131, &Held { pipeline: 0x5130, root: 0x5131 });
+        assert_eq!(after, Plan { signature: false, pipeline: false, views: 3 });
+        assert_eq!(commands(&after), 9);
+        // A clamp after a title dispatch: the list holds the title's own
+        // signature, so the clamp sets its own again.
+        let title = plan(true, 0x5130, 0x5131, &Held { pipeline: 0x7000, root: 0x7001 });
+        assert_eq!(title, Plan { signature: true, pipeline: true, views: 4 });
+    }
+
+    /// A clamp with no count buffer binds three root views, and one that reads
+    /// a count binds four; the fallback keeps every clamp on the counting
+    /// shader when the second one did not compile.
+    #[test]
+    fn a_clamp_without_a_count_buffer_binds_one_root_view_less() {
+        let _warp = crate::inplace::WARP.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(warp) = WarpHarness::new() else {
+            return; // no WARP here
+        };
+        let (counted, reads_count) = warp.clamp.for_count(true);
+        assert!(reads_count);
+        match warp.clamp.for_count(false) {
+            (plain, false) => {
+                assert_ne!(
+                    plain.pso.as_raw(),
+                    counted.pso.as_raw(),
+                    "the shader without a count buffer is another pipeline"
+                );
+                assert_ne!(
+                    plain.root.as_raw(),
+                    counted.root.as_raw(),
+                    "and carries its own root signature, without SRV(t1)"
+                );
+            }
+            (bound, true) => assert_eq!(
+                bound.pso.as_raw(),
+                counted.pso.as_raw(),
+                "without the second shader every clamp binds its count view"
+            ),
+        }
+    }
+
     /// WARP D3D12 execution test proving:
     /// (a) `countBuffer` with a small count (`3`) and `4,093` garbage tail slots
     ///     (`max = 4096`) does NOT blow `BUDGET` or zero valid dispatches in
@@ -844,6 +1057,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            &mut Held::default(),
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -889,6 +1103,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            &mut Held::default(),
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1008,6 +1223,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                &mut Held::default(),
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1101,6 +1317,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
+            &mut Held::default(),
         ));
         done_on(&warp.list, &dst_buf);
 
@@ -1179,11 +1396,16 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
+        // One clamp after another on the same list: what the first left is
+        // what the second finds, as in `draw::State::hold_clamp`.
+        let mut held = Held::default();
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), &mut held)
+            .unwrap();
         done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), &mut held)
+            .unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -1193,7 +1415,8 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), &mut held)
+            .unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -1204,10 +1427,14 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+        // A reset list holds neither the clamp's signature nor its pipeline
+        // (`draw::State::reset` drops what it cached, for the same reason).
+        held = Held::default();
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), &mut held)
+            .unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),

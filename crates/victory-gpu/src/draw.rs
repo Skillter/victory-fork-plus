@@ -332,6 +332,17 @@ struct Window {
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
+/// Whether the pipeline the list runs next can store to buffer memory
+/// (`pipeline::Translated::stores`, true when that is not known), so it may
+/// write the indirect arguments a [`Window`] holds clamped.
+fn pipeline_stores(pipeline: usize) -> bool {
+    crate::pipeline::host_pipeline(pipeline as This).is_none_or(|p| {
+        p.stages
+            .iter()
+            .any(|stage| stage.translated().stores)
+    })
+}
+
 /// The window a draw asking for `offset` of a copy takes, given the last one
 /// (its `base` offset, its `records`, their `step`) when the title still walks
 /// the same buffer: the step it walks by and how many records to clamp ahead
@@ -383,9 +394,12 @@ fn ahead(
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours, until one of these: a compute
-/// dispatch, a direct draw, an indirect call with a count buffer or more
-/// than one record, a draw whose shaders can store to buffers, a record
-/// outside the window, another host list.
+/// dispatch or a draw whose shaders can store to buffers, an indirect call
+/// with a count buffer or more than one record, a record outside the
+/// window, another host list. Which of them an ended window reached is
+/// counted, and printed beside the commands line (`Windowed`,
+/// `windowed_line`): a window that the title's own state alone ends is
+/// worth a narrower condition, a window that a real write ends is not.
 ///
 /// Its ordering: the window's bytes reach the host copy at the list's
 /// submission, never when the window is made (`Shadow::refresh` defers), so
@@ -743,11 +757,14 @@ pub(crate) enum Command {
     Dispatch,
     /// `ExecuteIndirect`, from the title's own calls.
     Execute,
-    /// The clamp dispatch of ours behind each run of indirect records
-    /// (`crate::indirect::bound`).
+    /// The clamp dispatch of ours behind an indirect run
+    /// (`crate::indirect::bound`); the root signature, pipeline, constants,
+    /// root views and waits it also records are counted as theirs.
     Clamp,
-    /// `ResourceBarrier`, from a draw's targets and depth buffer
-    /// (`crate::list::ensure_state`): recorded only when a texture moves.
+    /// `ResourceBarrier`: from a draw's targets and depth buffer
+    /// (`crate::list::ensure_state`), and the clamp's two waits (a UAV
+    /// barrier and a state change each) around its dispatch. Recorded only
+    /// when a texture moves or a clamp runs.
     Barrier,
 }
 
@@ -842,10 +859,85 @@ impl Counts {
 /// 5 s, beside the frame's lines and in every build (`crate::queue::present`).
 pub(crate) fn commands_line(draws: u64, presented: u64) {
     tracing::info!("{}", Counts::take().text(draws, presented));
+    if let Some(line) = windowed_line() {
+        tracing::info!("{line}");
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     if let Some(line) = crate::list::census::line(draws) {
         tracing::info!("{line}");
     }
+}
+
+/// Why a run of indirect records did or did not read a window of records
+/// clamped ahead of it ([`windows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Windowed {
+    /// A run read a window an earlier run clamped: no clamp of its own.
+    Hit,
+    /// A run clamped the records of a new window.
+    Clamp,
+    /// A direct draw or dispatch whose pipeline can store to buffer memory
+    /// (the other three close it the same way, each its own count).
+    Stores,
+    /// An indirect run with a count buffer, or more than one record: it
+    /// clamps what it reads, so nothing is held ahead for it.
+    Count,
+    /// A record the window does not cover: another buffer, kind or stride,
+    /// or a step off the window's.
+    Bounds,
+    /// A run whose window is stale: another host list, or this one after a
+    /// cut, whose scratch buffer is another or holds the old bytes.
+    List,
+    /// A run that cannot be windowed: its shaders store, so what it would
+    /// hold is not sound; or no window at all (`VICTORY_INDIRECT_WINDOW=0`).
+    Off,
+}
+
+impl Windowed {
+    const ALL: [Windowed; 7] = [
+        Windowed::Hit,
+        Windowed::Clamp,
+        Windowed::Stores,
+        Windowed::Count,
+        Windowed::Bounds,
+        Windowed::List,
+        Windowed::Off,
+    ];
+
+    const LABEL: &'static str = "hits, clamps, ended by stores, count, bounds, list, off";
+}
+
+/// Runs that read a window, clamped a new one, or ended one, by [`Windowed`].
+static WINDOWED: [AtomicU64; Windowed::ALL.len()] =
+    [const { AtomicU64::new(0) }; Windowed::ALL.len()];
+
+fn windowed_note(what: Windowed) {
+    let index = Windowed::ALL
+        .iter()
+        .position(|&w| w == what)
+        .unwrap_or_default();
+    WINDOWED[index].fetch_add(1, Ordering::Relaxed);
+}
+
+/// What the run of indirect records did with its window since the last line,
+/// when any touched one: the figure that says whether a window is worth
+/// keeping, and which of its ends this title reaches.
+fn windowed_line() -> Option<String> {
+    let counts: [u64; Windowed::ALL.len()] =
+        WINDOWED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    let any = counts.iter().sum::<u64>();
+    if any == 0 {
+        return None;
+    }
+    let listed = counts
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "indirect windows: {listed} ({}), {any} runs",
+        Windowed::LABEL
+    ))
 }
 
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
@@ -1869,18 +1961,39 @@ impl State {
         self.root_values.clear();
     }
 
-    /// The clamp recorded for an indirect run of `records` records replaced
-    /// what the list held of the pipeline and the compute root signature:
-    /// `crate::indirect` sets its compute pipeline through `SetPipelineState`
-    /// (which a dispatch reads) and a root signature of its own, so `bind`
-    /// sets both again. A clamp of no record records no command at all, and a
-    /// record whose window another run already clamped (`Window`) records no
-    /// clamp, so in both cases the list keeps what it has and `bind` spares
-    /// the pipeline it would otherwise set again.
-    fn forget_clamped(&mut self, records: u32) {
-        if records > 0 {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+    /// The clamp `crate::indirect` recorded for an indirect run of `records`
+    /// records replaced what the list held of the pipeline and the compute
+    /// root signature: it sets its compute pipeline through
+    /// `SetPipelineState` (which a dispatch reads) and a root signature of
+    /// its own, so `bind` sets both again. `held` is what it left (its own
+    /// pipeline and signature, or the ones the list already held when it
+    /// spared them), and a root signature it changed makes every compute
+    /// root argument undefined. A clamp of no record records no command at
+    /// all, and a record whose window another run already clamped
+    /// (`Window`) records no clamp, so in both cases the list keeps what it
+    /// has and `bind` spares the pipeline it would otherwise set again.
+    fn hold_clamp(&mut self, records: u32, held: &crate::indirect::Held) {
+        if records == 0 {
+            return;
+        }
+        if self.host_roots[1] != held.root {
+            self.host_roots[1] = held.root;
+            self.forget_roots();
+        }
+        self.host_pipeline = held.pipeline;
+    }
+
+    /// Ends the window of records clamped ahead (`windows`), which the command
+    /// about to run can write: [`pipeline_stores`] says its shaders may store
+    /// to buffer memory, so the run that reads those records must clamp them
+    /// itself. A pipeline that cannot store leaves the window standing: nothing
+    /// on the list writes those bytes in between, since a title buffer copy is
+    /// deferred to the list's submission (`host::copy_run`) and another
+    /// indirect run works its own records.
+    fn close_window(&mut self) {
+        if self.window.is_some() && pipeline_stores(self.pipeline) {
+            self.window = None;
+            windowed_note(Windowed::Stores);
         }
     }
 
@@ -2787,8 +2900,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
+        // Its shaders may write the arguments a window holds clamped.
+        self.close_window();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2925,7 +3038,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.close_window();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3277,7 +3390,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.close_window();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3382,7 +3495,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.close_window();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3527,15 +3640,20 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
-        // Another host list (a new one after a cut, or this one after its
-        // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let windowed = windows() && max == 1 && count.is_none() && !stores;
+        if !windowed {
+            if self.window.is_some() {
+                windowed_note(if windows() && !stores { Windowed::Count } else { Windowed::Off });
+                self.window = None;
+            }
+        } else if list.first_use(WINDOW_USE) {
+            // Another host list (a new one after a cut, or this one after its
+            // reset) has another scratch buffer, or this one's with old bytes.
+            if self.window.is_some() {
+                windowed_note(Windowed::List);
+                self.window = None;
+            }
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
@@ -3544,8 +3662,14 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        if hit.is_none() && windowed && self.window.is_some() {
+            windowed_note(Windowed::Bounds);
+        }
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some(hit) => {
+                windowed_note(Windowed::Hit);
+                hit
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -3563,14 +3687,31 @@ impl State {
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // buffer at offset 0. `held` is what the list holds of that
+                // state, so a clamp right after another clamps it with the
+                // signature and pipeline the list already has.
+                let mut held = crate::indirect::Held {
+                    pipeline: self.host_pipeline,
+                    root: self.host_roots[1],
+                };
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                        &mut held,
+                    )
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                        &mut held,
+                    )
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3581,9 +3722,13 @@ impl State {
                     return false;
                 };
                 // The clamp set its own compute pipeline and root signature;
-                // `bind` sets both again. A run whose record a window already
-                // holds records no clamp, and takes nothing from the list.
-                self.forget_clamped(records);
+                // `bind` sets both again unless the list already held them. A
+                // run whose record a window already holds records no clamp,
+                // and takes nothing from the list.
+                self.hold_clamp(records, &held);
+                if records > 0 {
+                    windowed_note(Windowed::Clamp);
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -4584,22 +4729,45 @@ mod tests {
 
     /// A run whose record a window already holds records no clamp, so the
     /// pipeline the list holds stands: the next draw spares it instead of
-    /// setting it again. A clamp of records does replace it.
+    /// setting it again. A clamp of records leaves the list holding the
+    /// clamp's own pipeline and compute root signature.
     #[test]
     fn a_record_a_window_holds_leaves_the_lists_pipeline_set() {
         let mut state = State::default();
         state.host_pipeline = 0x5150;
         state.host_roots = [0x51, 0x52];
-        // A clamp of no record records no command: nothing to forget.
-        state.forget_clamped(0);
+        let held = crate::indirect::Held {
+            pipeline: 0x9130,
+            root: 0x9131,
+        };
+        // A clamp of no record records no command: nothing to take.
+        state.hold_clamp(0, &held);
         assert_eq!(state.host_pipeline, 0x5150, "the pipeline the list holds stands");
         assert_eq!(state.host_roots, [0x51, 0x52], "no root signature was replaced either");
         // A clamp of records set its compute pipeline and compute root
         // signature of its own; the graphics root signature is untouched (a
         // pipeline change does not clear one).
-        state.forget_clamped(16);
-        assert_eq!(state.host_pipeline, 0);
-        assert_eq!(state.host_roots, [0x51, 0]);
+        state.hold_clamp(16, &held);
+        assert_eq!(state.host_pipeline, 0x9130);
+        assert_eq!(state.host_roots, [0x51, 0x9131]);
+    }
+
+    /// A clamp whose root signature the list already holds leaves the compute
+    /// root arguments the list was given: the next dispatch that asks for the
+    /// same constants spares them. A clamp of another signature leaves none.
+    #[test]
+    fn a_clamp_keeps_the_root_arguments_it_did_not_undefine() {
+        let mut state = State::default();
+        state.host_roots = [0x51, 0x52];
+        assert!(state.root_values.again(0x52, true, 0, &[1, 2, 3, 4]));
+        // A clamp right after another of its own signature: spared.
+        state.hold_clamp(16, &crate::indirect::Held { pipeline: 0x9130, root: 0x52 });
+        assert_eq!(state.host_roots, [0x51, 0x52], "the signature the list holds stands");
+        assert!(!state.root_values.again(0x52, true, 0, &[1, 2, 3, 4]), "the constants stand");
+        // Another clamp signature leaves every compute root argument undefined.
+        state.hold_clamp(16, &crate::indirect::Held { pipeline: 0x9130, root: 0x9131 });
+        assert_eq!(state.host_roots, [0x51, 0x9131]);
+        assert!(state.root_values.again(0x52, true, 0, &[1, 2, 3, 4]));
     }
 
     /// The draw-buffer views a list holds are compared field by field: the
