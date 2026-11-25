@@ -182,7 +182,7 @@ fn cut(e: &SigElement, keep: u8) -> Option<SigElement> {
     // with a gap keeps the whole element: the pair then declares more than
     // the pixel reads (the old behaviour) instead of promising a link that
     // the emitted signature cannot make.
-    if keep.trailing_ones() != u32::from(keep.count_ones()) {
+    if keep.trailing_ones() != keep.count_ones() {
         return Some(e.clone());
     }
     Some(SigElement {

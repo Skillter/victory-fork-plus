@@ -44,6 +44,14 @@ riskier widening retry; `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` let
 runs this" scan (`all_lane_blocks`), which `emit::lower` re-exports; `lower.rs`
 is near its 512 KiB policy limit, so new analysis belongs in its own module.
 
+A device whose waves are 32 lanes at most (NVIDIA reports
+`WaveLaneCountMin=Max=32` from `D3D12_FEATURE_D3D12_OPTIONS1`) refuses every
+module that declares `WaveSize(64)` — `PSV0`'s wave pair and `!dx.waveSize` —
+with `E_INVALIDARG` at pipeline creation, however valid the DXIL is
+(`dxc.exe -dumpbin` accepts it): those are exactly the programs
+`VICTORY_WAVE_WHY` still calls 64, and `victory_gpu`'s compute refusal prints
+both wave sizes. Nothing else of a 64-lane program's bytes is at fault.
+
 ## Mesh output counts
 
 - `SetMeshOutputCounts` is one call per program, before every output store:

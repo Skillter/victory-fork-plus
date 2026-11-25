@@ -555,6 +555,9 @@ const PSV_MESH: u8 = 13;
 struct Psv0 {
     stage: u8,
     threads: [u32; 3],
+    /// The wave size the code requires, as `(min, max)`; `(0, u32::MAX)` (and
+    /// the `(0, 0)` of a part that never set it) is no requirement.
+    waves: (u32, u32),
     /// Mesh: the counts the program declares (`max_vertices`,
     /// `max_primitives`), which `emit::lower`'s `mesh_prologue` sets every
     /// group's counts to.
@@ -609,10 +612,16 @@ fn psv0(data: &[u8]) -> Result<Psv0, String> {
     if !(48..=1024).contains(&info) {
         return Err(format!("its PSV0 declares {info} bytes of runtime info"));
     }
-    // Runtime info version 2: the stage at 24, the thread group at 36.
+    // Runtime info version 2: the stage at 24, the thread group at 36, and the
+    // wave size the code requires as a minimum and a maximum at 16 and 20
+    // (`!dx.waveSize` says the same; `emit::container::psv` writes both).
     let stage = *data
         .get(4 + 24)
         .ok_or("its PSV0 runtime info is truncated")?;
+    let waves = match (word(data, 4 + 16), word(data, 4 + 20)) {
+        (Some(min), Some(max)) => (min, max),
+        _ => return Err("its PSV0 runtime info is truncated".to_owned()),
+    };
     let mut threads = [0u32; 3];
     for (k, at) in [36, 40, 44].into_iter().enumerate() {
         threads[k] = word(data, 4 + at).ok_or("its PSV0 runtime info is truncated")?;
@@ -654,6 +663,7 @@ fn psv0(data: &[u8]) -> Result<Psv0, String> {
     Ok(Psv0 {
         stage,
         threads,
+        waves,
         declared,
         bindings,
     })
@@ -668,6 +678,13 @@ fn binding_kind(kind: u32) -> String {
         7 => "uav".to_owned(),
         n => format!("kind {n}"),
     }
+}
+
+/// The wave size a `PSV0` requires, `(min, max)`, or `None` when it requires
+/// none: the emitter writes `(0, u32::MAX)` for code that runs in waves of
+/// either size and `(n, n)` for code that needs waves of `n` lanes.
+fn wave_requirement(waves: (u32, u32)) -> Option<(u32, u32)> {
+    (waves.1 != 0 && waves.1 != u32::MAX).then_some(waves)
 }
 
 /// A root parameter as the log prints it, and the bindings it holds in the
@@ -745,6 +762,8 @@ struct StageFacts {
     causes: Vec<String>,
     /// The resources `PSV0` names, when its binding records could be read.
     bindings: Option<Vec<(u32, u32, u32)>>,
+    /// The wave size the code requires, when `PSV0` declared one.
+    waves: Option<(u32, u32)>,
 }
 
 /// Reads a stage's DXIL container: the part table, the `DXIL` part's own two
@@ -757,6 +776,7 @@ fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
         text: String::new(),
         causes: Vec::new(),
         bindings: None,
+        waves: None,
     };
     let container = match victory_shader::Container::parse(code) {
         Ok(c) => c,
@@ -852,6 +872,15 @@ fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
                     " psv0=stage={} threads={}x{}x{} bindings=[{}]",
                     psv.stage, psv.threads[0], psv.threads[1], psv.threads[2], names.join(",")
                 ));
+                // Only a part that declares a wave size prints one; the
+                // emitter writes (0, u32::MAX) when the code runs in waves of
+                // either size.
+                if let Some(waves) = wave_requirement(psv.waves) {
+                    facts
+                        .text
+                        .push_str(&format!(" waves={}..{}", waves.0, waves.1));
+                    facts.waves = Some(waves);
+                }
                 if psv.stage != stage {
                     facts.causes.push(format!(
                         "its PSV0 declares stage {} where the pipeline is stage {stage}",
@@ -881,10 +910,12 @@ fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
 /// console's own state forces, and every parameter is made from a binding
 /// the same translation declared, so there is nothing to drop or to add.
 const CLOSES: &str = "nothing in the description or in the bytes of its shaders is invalid, so the \
-     driver's compile of the code is what is left, and only a diagnostics build's debug layer, \
-     VICTORY_D3D12_DRED, or VICTORY_SHADER_SAVE=<dir> with dxc.exe -dumpbin on the saved .dxil \
-     names it; nothing is retried, since every field is one the console's own state forces and \
-     every parameter is made from a binding this code declares";
+     driver's compile of the code is what is left; what such a compile can still refuse and no byte \
+     shows is the host GPU's own limits, its wave size above all, which this line names when the \
+     code declares one above what the device runs (D3D12_FEATURE_D3D12_OPTIONS1), and \
+     dxc.exe -dumpbin on VICTORY_SHADER_SAVE=<dir>'s .dxil validates the code without seeing them; \
+     nothing is retried, since every field is one the console's own state forces and every \
+     parameter is made from a binding this code declares";
 
 /// The causes as one line of log text: what is provably invalid, or `no cause
 /// known` and what closes it.
@@ -894,6 +925,33 @@ fn cause_text(causes: &[String]) -> String {
     } else {
         causes.join("; ")
     }
+}
+
+/// The cause for a wave size the host GPU cannot run, when the code declares
+/// one wider than the device's own waves.
+///
+/// This is the refusal that no CPU-side re-check of the description used to
+/// name, and it is not a fault of the emission or of the description: the
+/// module's DXIL is valid (`dxc.exe -dumpbin` accepts it, and says only which
+/// features it uses) and every field of the description is legal, but the
+/// device has no wave that wide, so its own compile of code it cannot
+/// schedule is what returns `E_INVALIDARG`. Seven programs were refused this
+/// way in one run of a title whose host GPU runs 32-lane waves while their
+/// console code needs 64, and the translation kept 64 because the 32-lane
+/// split could not place barriers around their shared LDS
+/// (`VICTORY_WAVE_WHY=1` names the reason per program).
+fn wave_cause(waves: Option<(u32, u32)>, host_waves: Option<(u32, u32)>) -> Option<String> {
+    let ((min, max), (host_min, host_max)) = (waves?, host_waves?);
+    (max > host_max).then(|| {
+        format!(
+            "its code requires waves of {min}..{max} lanes (its PSV0's wave size, the same \
+             `!dx.waveSize`) and the host GPU runs waves of {host_min}..{host_max} \
+             (D3D12_FEATURE_D3D12_OPTIONS1), so the device cannot run it: the DXIL is valid and \
+             the description is legal, and what would be accepted is a translation that fits \
+             {host_max}-lane waves (VICTORY_WAVE_WHY=1 names why each program that keeps 64 could \
+             not be split)"
+        )
+    })
 }
 
 /// As [`log_graphics_refusal`], for a mesh pipeline: the same fields, from
@@ -918,6 +976,7 @@ fn log_mesh_refusal(
         &g.targets,
     );
     causes.extend(facts.causes);
+    causes.extend(wave_cause(facts.waves, crate::host::wave_lanes()));
     tracing::warn!(
         ?shaders,
         ms = ?stage_len(&ms),
@@ -959,10 +1018,12 @@ fn compute_refusal(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: usize,
     shader: Option<&HostShader>,
+    host_waves: Option<(u32, u32)>,
 ) -> String {
     let code = code_bytes(&desc.CS);
     let facts = stage_facts(&code, PSV_COMPUTE, true);
     let mut causes = Vec::new();
+    causes.extend(wave_cause(facts.waves, host_waves));
     let (root_bytes, root_hash) = match root {
         Some(bytes) if !bytes.is_empty() => (
             bytes.len().to_string(),
@@ -1052,7 +1113,7 @@ fn log_compute_refusal(
     shader: Option<&HostShader>,
     shaders: &[Arc<Shader>],
 ) {
-    let report = compute_refusal(desc, root, params, samplers, shader);
+    let report = compute_refusal(desc, root, params, samplers, shader, crate::host::wave_lanes());
     tracing::warn!(?shaders, "host compute pipeline refused: {report}");
 }
 
@@ -2153,7 +2214,20 @@ mod tests {
     /// 24, the thread group at 36), then the bindings as a count, a stride
     /// and one record each.
     fn psv0_bytes(stage: u8, threads: [u32; 3], bindings: &[(u32, u32, u32)]) -> Vec<u8> {
+        psv0_waves(stage, threads, (0, u32::MAX), bindings)
+    }
+
+    /// As [`psv0_bytes`], with the wave size the code requires at 16 (min) and
+    /// 20 (max) of the runtime info.
+    fn psv0_waves(
+        stage: u8,
+        threads: [u32; 3],
+        waves: (u32, u32),
+        bindings: &[(u32, u32, u32)],
+    ) -> Vec<u8> {
         let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&waves.0.to_le_bytes());
+        info[20..24].copy_from_slice(&waves.1.to_le_bytes());
         info[24] = stage;
         for (k, n) in threads.into_iter().enumerate() {
             info[36 + 4 * k..40 + 4 * k].copy_from_slice(&n.to_le_bytes());
@@ -2307,7 +2381,7 @@ mod tests {
         let params = [constants_param(0, 0, 16), uav_param(1, 7)];
         let shader = compute_shader(16, &[7]);
         let root: &[u8] = &[0xc0, 0x0f];
-        let line = compute_refusal(&desc, Some(root), &params, 0, Some(&shader));
+        let line = compute_refusal(&desc, Some(root), &params, 0, Some(&shader), None);
         assert!(line.contains("cause=no cause known ("), "{line}");
         assert!(line.contains(&format!("cs={}", container.len())), "{line}");
         assert!(
@@ -2353,12 +2427,69 @@ mod tests {
             CS: code(&container),
             ..Default::default()
         };
-        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[constants_param(0, 0, 16)], 0, None);
+        let line = compute_refusal(
+            &desc,
+            Some(&[0; 4][..]),
+            &[constants_param(0, 0, 16)],
+            0,
+            None,
+            None,
+        );
         assert!(
             line.contains("its PSV0 declares uav space 1 register 7 and no root parameter names it"),
             "{line}"
         );
         assert!(!line.contains("no cause known"), "{line}");
+    }
+
+    /// A compute program whose code requires waves wider than the host GPU
+    /// runs is refused by the device whatever its description says, and the
+    /// refusal names both wave sizes instead of `no cause known`. Seven
+    /// programs were refused this way in one run (waves of 64 lanes on a GPU
+    /// whose `WaveLaneCountMax` is 32), and dxc.exe -dumpbin accepts every one
+    /// of their modules, so the wave size is the whole of what the driver's
+    /// compile objects to.
+    #[test]
+    fn a_compute_refusal_names_a_wave_size_the_host_gpu_cannot_run() {
+        let psv = psv0_waves(5, [8, 8, 1], (64, 64), &[(2, 0, 0)]);
+        let container = container_bytes(vec![
+            (b"SFI0", vec![0u8; 8]),
+            (b"PSV0", psv),
+            (b"DXIL", dxil_part(&BITCODE)),
+        ]);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&container),
+            ..Default::default()
+        };
+        let params = [constants_param(0, 0, 16)];
+        // A GPU whose waves are 32 lanes at most (NVIDIA's) cannot run it.
+        let line = compute_refusal(
+            &desc,
+            Some(&[0xc0, 0x0f]),
+            &params,
+            0,
+            None,
+            Some((32, 32)),
+        );
+        assert!(line.contains("psv0=stage=5 threads=8x8x1"), "{line}");
+        assert!(line.contains("waves=64..64"), "{line}");
+        assert!(
+            line.contains("its code requires waves of 64..64 lanes"),
+            "{line}"
+        );
+        assert!(line.contains("the host GPU runs waves of 32..32"), "{line}");
+        assert!(!line.contains("no cause known"), "{line}");
+        // A GPU that runs waves of 64 accepts the same program, so the
+        // description is not what the refusal was about.
+        assert!(
+            compute_refusal(&desc, Some(&[0xc0, 0x0f]), &params, 0, None, Some((64, 64)))
+                .contains("cause=no cause known ("),
+        );
+        // A device that reported no wave lanes leaves the size unjudged.
+        assert!(
+            compute_refusal(&desc, Some(&[0xc0, 0x0f]), &params, 0, None, None)
+                .contains("cause=no cause known ("),
+        );
     }
 
     /// A zero thread group, a `PSV0` built for another stage, a missing part
@@ -2372,7 +2503,14 @@ mod tests {
             CS: code(&container),
             ..Default::default()
         };
-        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[constants_param(0, 0, 4)], 0, None);
+        let line = compute_refusal(
+            &desc,
+            Some(&[0; 4][..]),
+            &[constants_param(0, 0, 4)],
+            0,
+            None,
+            None,
+        );
         assert!(
             line.contains("its PSV0 declares stage 1 where the pipeline is stage 5"),
             "{line}"
@@ -2390,7 +2528,7 @@ mod tests {
             CS: code(&container),
             ..Default::default()
         };
-        let line = compute_refusal(&desc, None, &[], 0, None);
+        let line = compute_refusal(&desc, None, &[], 0, None, None);
         assert!(
             line.contains(
                 "cause=no root signature; its DXIL part declares 100 bytes of bitcode and holds 8"
@@ -2402,7 +2540,7 @@ mod tests {
             CS: code(&[0u8; 64]),
             ..Default::default()
         };
-        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[], 0, None);
+        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[], 0, None, None);
         assert!(
             line.contains("its container is not readable: not a DXBC container"),
             "{line}"

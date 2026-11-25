@@ -245,6 +245,21 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// The host GPU's wave lanes, `WaveLaneCountMin` and `WaveLaneCountMax` of
+/// `D3D12_FEATURE_D3D12_OPTIONS1`, once the device reported them. A shader
+/// that declares its own wave size (`!dx.waveSize`, and the same pair in its
+/// `PSV0`) has to fit in it, and a device whose waves are 32 at most refuses
+/// a module that requires 64 with E_INVALIDARG whatever the description says
+/// ([`crate::pipeline::host`]'s compute refusal names it).
+static WAVE_LANES: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+
+/// The host GPU's wave lanes `(min, max)`, or `None` when the device did not
+/// report them (and nothing of a shader's wave size can be said).
+pub(crate) fn wave_lanes() -> Option<(u32, u32)> {
+    let [min, max] = WAVE_LANES.each_ref().map(|n| n.load(Ordering::Relaxed));
+    (max != 0).then_some((min, max))
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1084,6 +1099,8 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            WAVE_LANES[0].store(o1.WaveLaneCountMin, Ordering::Relaxed);
+            WAVE_LANES[1].store(o1.WaveLaneCountMax, Ordering::Relaxed);
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
         let messages = debug
