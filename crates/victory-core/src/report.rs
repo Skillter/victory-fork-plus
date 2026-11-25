@@ -12,6 +12,7 @@
 //! even when the terminal wrapped it and `grep '^STOP '` is the whole footer.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -200,22 +201,53 @@ impl RunFooter {
 /// Whether this process has already written its [`STOP`] block.
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
+/// Renders a whole [`STOP`] block from a reason and a duration.
+pub type FooterHook = Box<dyn Fn(&str, Duration) -> String + Send>;
+
+/// The binary's footer writer: it knows the directories the cache sizes are
+/// measured in, which this crate does not.
+static HOOK: Mutex<Option<FooterHook>> = Mutex::new(None);
+
+/// Installs the renderer [`stop_block`] uses, replacing any earlier one.
+///
+/// `victory run` installs one that adds the cache left on disk, so the block
+/// [`crate::report::stop_block`] renders is the same one whether the run
+/// returns from `run` or is terminated from inside the HLE. The writer is
+/// taken by the one render, so a second path cannot make a second footer.
+pub fn set_footer_hook(hook: FooterHook) {
+    *HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+}
+
+/// The block, drawing on the installed [`FooterHook`] when there is one and on
+/// the counters alone when there is not.
+fn render_stop(reason: &str, duration: Duration) -> String {
+    let hook = HOOK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    render_stop_with(hook, reason, duration)
+}
+
+fn render_stop_with(hook: Option<FooterHook>, reason: &str, duration: Duration) -> String {
+    match hook {
+        Some(hook) => hook(reason, duration),
+        None => RunFooter::from_counters(reason, duration).render(),
+    }
+}
+
 /// The [`STOP`] block of a run that ends by leaving the process, and `None`
 /// once one has been written.
 ///
 /// Several paths reach the end of a run - the title asking to exit, the
 /// suspend routines returning, the deadline that stops waiting for them - and
 /// the process is terminated rather than returned from, so no caller can be
-/// asked which came first. The first caller renders the block
-/// ([`RunFooter::from_counters`]); every caller after it is told there is
-/// nothing left to say, so a log holds one `STOP` block and it names the path
-/// that ended the run.
+/// asked which came first. The first caller renders the block ([`RunFooter`],
+/// or the [`FooterHook`] `victory run` installed) and the paths that only
+/// return from `run` write it through this same guard, so a log holds one
+/// `STOP` block and it names the path that ended the run.
 pub fn stop_block(reason: &str, duration: Duration) -> Option<String> {
     let wrote = STOPPED.swap(true, Ordering::SeqCst);
     if wrote {
         return None;
     }
-    Some(RunFooter::from_counters(reason, duration).render())
+    Some(render_stop(reason, duration))
 }
 
 /// One line of free text inside `key=value`: quoted, with the characters that
@@ -407,6 +439,27 @@ mod tests {
             stop_block("title did not finish suspending in time", Duration::ZERO).is_none(),
             "the second path is told the run already has its footer"
         );
+    }
+
+    /// The binary's writer renders the whole block when one is installed: it is
+    /// the only renderer, so the run summary and the `STOP cache` lines are in
+    /// the block whether the process returns from `run` or is terminated.
+    #[test]
+    fn a_footer_hook_renders_the_block_when_installed() {
+        let hook: FooterHook = Box::new(|reason, duration| {
+            format!(
+                "STOP end reason={reason} duration_s={}\nSTOP cache images_mb=229\n",
+                duration.as_secs()
+            )
+        });
+        assert_eq!(
+            render_stop_with(Some(hook), "title suspended", Duration::from_secs(3)),
+            "STOP end reason=title suspended duration_s=3\nSTOP cache images_mb=229\n"
+        );
+        // No hook (a binary that installed none) still renders from counters.
+        let bare = render_stop_with(None, "title suspended", Duration::ZERO);
+        assert!(bare.starts_with("STOP end reason=\"title suspended\""), "{bare}");
+        assert!(!bare.contains("STOP cache "), "{bare}");
     }
 
     /// The counters a path that leaves the process still has: the meter and
