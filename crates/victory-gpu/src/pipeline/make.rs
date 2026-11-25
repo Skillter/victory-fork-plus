@@ -41,6 +41,51 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// Pipelines the run leaves out: 16-digit shader hashes, as the log prints
+/// them (`first bind`), or 32-digit pipeline keys (`VICTORY_SKIP_PIPELINES`).
+///
+/// A pipeline that matches is never made, so a driver compiler that crashed
+/// on it is not asked again; its draws and dispatches are dropped as an
+/// untranslated pipeline's are. Counted in every build: the switch is the
+/// first thing a release run needs when one pipeline ends it (the AMD
+/// compiler crash, upstream `jmal423/victory-amd`).
+fn skip_list() -> &'static [String] {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| parse_skip(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()))
+}
+
+/// The hashes and keys in `value` (comma-separated, either case); a token
+/// that is neither 16 nor 32 hexadecimal digits is dropped with a warning.
+fn parse_skip(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| {
+            if matches!(token.len(), 16 | 32) && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Some(token.to_ascii_lowercase())
+            } else {
+                tracing::warn!(
+                    token,
+                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes or 32-digit pipeline keys"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether pipeline `key` or one of its shaders' `hashes` is in `list`.
+fn listed<'a>(list: &[String], key: &str, hashes: impl Iterator<Item = &'a str>) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    if list.iter().any(|entry| entry == key) {
+        return true;
+    }
+    hashes.into_iter().any(|hash| list.iter().any(|entry| entry == hash))
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -49,12 +94,19 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let made = OnceLock::new();
+        if listed(skip_list(), &key, shaders.iter().map(|s| s.hash.as_str())) {
+            let names: Vec<String> = shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+            tracing::warn!(key, shaders = ?names, "pipeline left out: VICTORY_SKIP_PIPELINES");
+            let _ = made.set(None);
+        }
         Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
-            made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            made,
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -265,6 +317,10 @@ static AVAILABLE: Condvar = Condvar::new();
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
+    if p.made.get().is_some() {
+        // Made already, or left out of this run (see [`skip_list`]).
+        return;
+    }
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -274,6 +330,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    let lost = super::library::LOST.swap(0, Ordering::Relaxed);
+    for _ in 0..lost {
+        if let Err(e) = spawn_worker("victory-pipelines-repl".to_owned()) {
+            tracing::warn!(error = %e, "no replacement pipeline worker");
+        }
+    }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
@@ -281,6 +343,30 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         AVAILABLE.notify_one();
     }
+}
+
+/// Starts one compiling worker: below the title's own threads (loading,
+/// recording), taking queued pipelines until it is parked
+/// ([`super::library::LOST`], a driver compiler that faulted).
+fn spawn_worker(name: String) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(|| {
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                next().make();
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        })
+        .map(|_| ())
 }
 
 fn next() -> Arc<Pending> {
@@ -300,24 +386,7 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+            let spawned = spawn_worker(format!("victory-pipelines-{i}"));
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
@@ -349,6 +418,43 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both what the log prints (a shader hash) and what a pipeline is
+    /// called across runs (its key) are taken; anything else is dropped.
+    #[test]
+    fn the_skip_list_takes_hashes_and_keys() {
+        assert_eq!(parse_skip(""), Vec::<String>::new());
+        assert_eq!(parse_skip(" , "), Vec::<String>::new());
+        assert_eq!(
+            parse_skip(" 0123456789ABCDEF, 00112233445566778899aabbccddeeff, xyz, 0011223344556677,"),
+            vec![
+                "0123456789abcdef".to_owned(),
+                "00112233445566778899aabbccddeeff".to_owned(),
+                "0011223344556677".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listed_pipeline_matches_by_key_or_by_shader() {
+        let list = parse_skip("0123456789abcdef,00112233445566778899aabbccddeeff");
+        assert!(listed(&list, "00112233445566778899aabbccddeeff", [].into_iter()));
+        assert!(listed(&list, "ffffffffffffffffffffffffffffffff", ["0123456789abcdef"].into_iter()));
+        assert!(!listed(&list, "ffffffffffffffffffffffffffffffff", ["fedcba9876543210"].into_iter()));
+        assert!(!listed(&[], "00112233445566778899aabbccddeeff", [].into_iter()));
+    }
+
+    /// A pipeline left out is answered without queueing a worker for it, so
+    /// the driver's compiler is never asked (this is what keeps a crasher
+    /// out of a release run; the first use of anything else queues).
+    #[test]
+    fn a_pipeline_left_out_is_not_queued() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        assert!(p.made.set(None).is_ok());
+        assert!(ready(&p).is_none());
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(!now(&p));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

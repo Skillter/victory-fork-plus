@@ -909,6 +909,121 @@ fn report_census(library: u64) {
     );
 }
 
+/// Pipelines a driver's compiler crashed on, by name, one per line, beside
+/// the library (the run's own directory).
+///
+/// A driver compiler that faults takes the whole process with it; with this
+/// the fault is logged, the compiling worker is parked, and the name is left
+/// out from the next run on, so one bad pipeline costs one worker instead of
+/// the run. Upstream `jmal423/victory-amd` (the AMD crasher in
+/// `amdxc64.dll`); the picture of a run in which no compile faults is
+/// unchanged.
+const CRASHED_FILE: &str = "crashed.txt";
+
+/// The names in `text` (the file's content), one per line.
+fn parse_crashed(text: &str) -> HashSet<String> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect()
+}
+
+/// The names left out for the rest of this run and in every later one;
+/// `None` until the library's directory is known, so a run that never opens
+/// a library reads no file.
+fn crashed_set() -> Option<&'static Mutex<HashSet<String>>> {
+    let dir = DIR.get()?;
+    static NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    Some(NAMES.get_or_init(|| {
+        let read = std::fs::read_to_string(dir.join(CRASHED_FILE)).ok();
+        Mutex::new(read.as_deref().map(parse_crashed).unwrap_or_default())
+    }))
+}
+
+/// The pipeline named `name` is left out for the rest of this run
+/// ([`crashed_set`]) and from the next run on ([`CRASHED_FILE`]).
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    if let Some(set) = crashed_set() {
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned());
+    }
+    let Some(dir) = DIR.get() else { return };
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE)) {
+        let _ = writeln!(file, "{name}");
+    }
+}
+
+/// Whether a driver's compiler crashed making the pipeline named `name`.
+fn crashed(name: &str) -> bool {
+    crashed_set().is_some_and(|set| set.lock().unwrap_or_else(|e| e.into_inner()).contains(name))
+}
+
+thread_local! {
+    /// The pipeline this thread's driver call is making ([`Making`]).
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Guards one driver pipeline compile so that a fault inside it is logged to
+/// [`CRASHED_FILE`] and the thread it faulted on is parked, instead of the
+/// fault ending the process.
+///
+/// `create` runs outside every lock the pool takes (`call`, `same_name`,
+/// `one_call`, and the library's read/write guards), so a parked thread
+/// leaves the other workers able to go on.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Making {
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that reads the record it is given and nothing
+        // else, and lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Making
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+/// Compiling threads parked after a fault; `make` starts that many again.
+pub(crate) static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The handler of [`Making`]: a fault that is not the driver's compiler
+/// dereferencing a near-null pointer goes on to end the process as before.
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    // SAFETY: the system passes a live record of the exception being
+    // dispatched.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default()).unwrap_or_default();
+    // A fault at an address in the driver's own code is not one we can go on
+    // from a parked thread either, but a near-null read is: those are what an
+    // RDNA compiler does on this title's programs.
+    if record.ExceptionCode != 0xc000_0005_u32 as i32
+        || name.is_empty()
+        || record.NumberParameters < 2
+        || record.ExceptionInformation[1] >= 0x10000
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    tracing::error!(
+        name,
+        at = format_args!("{:#x}", record.ExceptionInformation[1]),
+        "the driver's compiler crashed making a pipeline: it is left out from now on"
+    );
+    note_crashed(&name);
+    LOST.fetch_add(1, Ordering::Relaxed);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -917,6 +1032,13 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    if crashed(name) {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
+    let create = || {
+        let _making = Making::new(name);
+        create()
+    };
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -1187,6 +1309,18 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crash file is one name per line, and a partly written or blank
+    /// line neither hides nor invents a name.
+    #[test]
+    fn the_crash_file_reads_names_one_per_line() {
+        let names = parse_crashed("aaa\nbb b\n\n  ccc  \r\n");
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("aaa"));
+        assert!(names.contains("bb b"));
+        assert!(names.contains("ccc"));
+        assert!(parse_crashed("").is_empty());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
