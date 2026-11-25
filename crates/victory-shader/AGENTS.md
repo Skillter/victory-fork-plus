@@ -39,7 +39,26 @@ Largest crate. Change it with the pipeline order in mind (`emit::translate`):
 halves (`v_mbcnt`, lane exchange, masks used as data, shared LDS without
 guards). Otherwise they become 32-lane. `VICTORY_WAVE_WIDE=1` opts into the
 riskier widening retry; `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` let
-`victory translate` emulate a smaller host.
+`victory translate` emulate a smaller host. `emit::lanes` holds that analysis
+(`wave_local`, `lane_uniform`, `lds_meetings`) and the per-block "every lane
+runs this" scan (`all_lane_blocks`), which `emit::lower` re-exports; `lower.rs`
+is near its 512 KiB policy limit, so new analysis belongs in its own module.
+
+## Mesh output counts
+
+- `SetMeshOutputCounts` is one call per program, before every output store:
+  `emit::counts::output_counts` follows the console's request
+  (`s_sendmsg GS_ALLOC_REQ`, `m0 = vertices | primitives << 12`) back to the
+  two `v_readfirstlane_b32` values that pack it, and the call lands at the end
+  of their block. A request it cannot follow (two of them, counts in different
+  blocks, behind a guard, not run by every lane, or not dominating every
+  store) promises the declared maxima, as the prologue always did.
+- `VICTORY_MESH_COUNTS=max|zero` restores the maxima, or promises nothing.
+  Both change a translation: keep them in `victory-gpu::shader_cache`'s
+  switch list.
+- The prologue's cull `emitIndices` writes stay, guarded now by the promised
+  primitive count: a promised slot holds its cull value until the title stores
+  over it.
 
 ## Optimiser
 
