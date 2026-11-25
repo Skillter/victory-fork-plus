@@ -1,4 +1,5 @@
-//! The frame rate, drawn into the top left corner of every frame shown.
+//! The frame rate, drawn into the top left corner of every frame shown (of the
+//! picture in the window, not of the black bars beside it).
 //!
 //! The window's caption has the frame rate, but a capture of the window's
 //! picture (a stream) does not carry the caption. Here the number is part
@@ -149,10 +150,18 @@ unsafe impl Send for Made {}
 static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
 
 /// Copies the frame rate's box onto `back`, a back buffer of `width` by
-/// `height` pixels of `format` that `list` holds as a copy's destination.
-/// Nothing if the counter is off, no rate was measured yet, the format is
-/// not one of ours or the frame is too small for the box.
-pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
+/// `height` pixels of `format` that `list` holds as a copy's destination, at
+/// `at`: the corner of the picture shown in it, which is the whole buffer for
+/// a copy and the frame's fitted rectangle when the pass drew it. Nothing if
+/// the counter is off, no rate was measured yet, the format is not one of ours
+/// or the frame is too small for the box.
+pub(crate) fn draw(
+    host: &crate::host::Host,
+    list: &ID3D12GraphicsCommandList,
+    back: &ID3D12Resource,
+    (width, height, format): (u32, u32, DXGI_FORMAT),
+    (at_x, at_y): (u32, u32),
+) {
     if !on() {
         return;
     }
@@ -191,7 +200,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         return;
     };
     let margin = 4 * scale;
-    if m.width + 2 * margin > width || m.height + 2 * margin > height {
+    if at_x + m.width + 2 * margin > width || at_y + m.height + 2 * margin > height {
         return;
     }
     // SAFETY: an open list; the back buffer is a copy's destination in it
@@ -213,7 +222,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
-        list.CopyTextureRegion(&to, margin, margin, 0, &from, None);
+        list.CopyTextureRegion(&to, at_x + margin, at_y + margin, 0, &from, None);
     }
 }
 

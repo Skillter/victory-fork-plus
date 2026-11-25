@@ -1201,6 +1201,29 @@ mod tests {
         assert!((fps * ms - 1_000.0).abs() < 1e-9, "{fps} fps, {ms} ms");
     }
 
+    /// Every present but the run's first has a frame time, and the meter's
+    /// one-second rate windows do not take any of them away: `frame_ms` must
+    /// sum to the run's length and count its frames. (The 2026-11-25 19:24 run
+    /// recorded 7,297 of 7,997 frame times summing to 704,567 ms in 903 s,
+    /// because each rate window's first present was skipped.)
+    #[test]
+    fn a_rate_window_does_not_swallow_a_frame_time() {
+        use std::time::{Duration, Instant};
+
+        use super::FrameClock;
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(t0);
+        assert_eq!(clock.gap(t0), None, "the run's first present holds start-up");
+        assert_eq!(clock.gap(t0 + Duration::from_millis(10)), Some(Duration::from_millis(10)));
+        // A one-second rate window ends here; the present after it is still a
+        // frame time, so the count keeps up with the frames presented.
+        assert_eq!(
+            clock.gap(t0 + Duration::from_millis(370)),
+            Some(Duration::from_millis(360)),
+            "the gap that ended a rate window is a frame time like any other"
+        );
+    }
+
     /// The shading rate switch names five states, case aside, and refuses
     /// anything else to `off`; a device whose query failed or that knows only
     /// tier 1 keeps 1x1, and `off` is 1x1 even on a tier-2 device.
@@ -8826,6 +8849,36 @@ enum Show {
     Drawn(Fit),
 }
 
+/// The state the way the frame is shown leaves the back buffer in: a copy
+/// leaves a copy's destination, the present pass a render target.
+///
+/// The frame rate's box ([`crate::fpsbox::draw`]) is a `CopyTextureRegion`
+/// into that same back buffer, and a copy's destination must be in
+/// `COPY_DEST`, so the pass's render target is moved there first. (It was
+/// copied into a render target until this was written: the 2026-11-25 19:24
+/// run shows every frame through the pass.)
+fn shown_state(show: Show) -> D3D12_RESOURCE_STATES {
+    match show {
+        Show::Copy => D3D12_RESOURCE_STATE_COPY_DEST,
+        Show::Drawn(_) => D3D12_RESOURCE_STATE_RENDER_TARGET,
+    }
+}
+
+/// The corner of what is shown in the back buffer: the whole of it for a copy,
+/// the frame's fitted rectangle for the pass.
+///
+/// The frame rate's box is placed from it, so on a window of another shape it
+/// sits inside the picture rather than over the letterbox's bar: a 2,474 by
+/// 1,355 window showing a 3,840 by 2,160 frame leaves 33 px of bar at each
+/// side, and a box at the buffer's own 12 px margin put its first columns on
+/// that bar (2026-11-25 19:24).
+fn shown_origin(show: Show) -> (u32, u32) {
+    match show {
+        Show::Copy => (0, 0),
+        Show::Drawn(rect) => (rect.x, rect.y),
+    }
+}
+
 /// Whether a present of picture `format` into a chain of `swap` may copy it
 /// ([`Show::Copy`]): a copy takes the format as it is, so only the chain's
 /// own, or a typeless picture that a format of its family stands in for
@@ -8902,15 +8955,41 @@ struct Presenter {
     meter: Meter,
 }
 
+/// The frame times a run records: one gap per present, the run's first present
+/// only setting the mark (it holds the whole of start-up).
+///
+/// Kept out of [`Meter`]'s rate windows on purpose: those reset once a second,
+/// and the gap that ended one was dropped with the reset, so `frame_ms` summed
+/// to less than the run lasted - the 2026-11-25 19:24 run recorded 704,567 ms
+/// of frame times over 7,297 of its 7,997 frames in 903 s, and the mean of
+/// those samples (96.6 ms) read as 10.4 fps beside the run's own 8.9.
+struct FrameClock {
+    last: std::time::Instant,
+    seen: bool,
+}
+
+impl FrameClock {
+    fn new(now: std::time::Instant) -> Self {
+        Self { last: now, seen: false }
+    }
+
+    /// The frame time of a present at `now`, or `None` for the run's first.
+    fn gap(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let gap = now.saturating_duration_since(self.last);
+        self.last = now;
+        std::mem::replace(&mut self.seen, true).then_some(gap)
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds. The counters the logged block shows are taken once, in
 /// that block, so each of them is summed over every second since the last
 /// block; [`Meter::reported`] and [`Meter::reported_drawn`] are the frames
 /// and the draws of those seconds, which is what they are divided by.
 struct Meter {
-    /// When the last frame was counted: the frame time of this one is the gap
-    /// since, which is what `frame_ms` records.
-    last: std::time::Instant,
+    /// Every present's frame time, kept apart from the rate windows: those
+    /// reset once a second, and a gap that ended one is still a frame time.
+    frame_clock: FrameClock,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -8929,7 +9008,7 @@ impl Meter {
         let now = std::time::Instant::now();
         let drawn = crate::draw::drawn();
         Meter {
-            last: now,
+            frame_clock: FrameClock::new(now),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -8956,12 +9035,10 @@ impl Meter {
         // The frame time, for the footer's `fps_worst` and the history row: the
         // gap since the last present, which is the rate the title was given.
         // The first frame has no gap - it holds the whole of start-up - so it
-        // only sets the mark.
-        if self.frames > 0 {
-            victory_core::meter::meter()
-                .time("frame_ms", now.saturating_duration_since(self.last));
+        // only sets the mark ([`FrameClock`]).
+        if let Some(gap) = self.frame_clock.gap(now) {
+            victory_core::meter::meter().time("frame_ms", gap);
         }
-        self.last = now;
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -9589,13 +9666,11 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(picture_state as i32);
         // A draw reads the frame as a pixel shader resource; a copy wants it as
         // a copy source.
-        let (source, target) = match show {
-            Show::Copy => (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            Show::Drawn(_) => (
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-            ),
+        let source = match show {
+            Show::Copy => D3D12_RESOURCE_STATE_COPY_SOURCE,
+            Show::Drawn(_) => D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         };
+        let target = shown_state(show);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -9645,16 +9720,11 @@ impl Host {
                 _ => list.CopyResource(&back, picture),
             }
             // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back). The box is
-            // copied in, so the back buffer must be a copy destination while it
-            // is drawn — a drawn frame leaves it a render target.
-            if target != D3D12_RESOURCE_STATE_COPY_DEST {
-                list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_DEST)]);
-            }
-            crate::fpsbox::draw(self, list, &back, (chain.0, chain.1, format));
-            if target != D3D12_RESOURCE_STATE_COPY_DEST {
-                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target)]);
-            }
+            // title's own frame, which the lines below read back). It is a
+            // copy, so the back buffer has to be a copy's destination first:
+            // the pass above left it a render target (`shown_state`).
+            move_to(list, &back, target, D3D12_RESOURCE_STATE_COPY_DEST);
+            crate::fpsbox::draw(self, list, &back, (chain.0, chain.1, format), shown_origin(show));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
@@ -9688,7 +9758,11 @@ impl Host {
             // Put back above: nothing left for the way out to do.
             restore.done();
             // SAFETY: a live back buffer of the swap chain.
-            list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -9898,6 +9972,44 @@ mod present_tests {
         DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
         DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
     };
+
+    /// The frame rate's box is a copy into the back buffer, and a copy's
+    /// destination must be in `COPY_DEST`: the state the present pass leaves
+    /// the back buffer in is not one. (Every frame of the 2026-11-25 19:24 run
+    /// went through the pass, and the box was copied into a render target.)
+    #[test]
+    fn the_frame_rates_box_is_a_copy_into_a_copy_destination() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        };
+
+        use super::{Show, shown_state};
+        let drawn = shown_state(Show::Drawn(Fit { x: 0, y: 0, width: 1, height: 1 }));
+        assert_eq!(drawn, D3D12_RESOURCE_STATE_RENDER_TARGET, "the pass draws into it");
+        assert_ne!(
+            drawn, D3D12_RESOURCE_STATE_COPY_DEST,
+            "the box is a copy, and a copy cannot land in a render target"
+        );
+        assert_eq!(shown_state(Show::Copy), D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+
+    /// The box goes in the picture's corner, not the buffer's: on a window of
+    /// another shape the difference is the letterbox's bar, and a box at the
+    /// buffer's corner hangs over it. (2,474 by 1,355 in this run's log
+    /// against its 3,840 by 2,160 frame: a 2,408 px wide picture and 33 px of
+    /// bar each side, the box's margin 12.)
+    #[test]
+    fn the_frame_rates_box_starts_at_the_pictures_corner() {
+        use super::{Show, shown_origin};
+        assert_eq!(shown_origin(Show::Copy), (0, 0), "a copy shows the whole buffer");
+        let fitted = fit((3_840, 2_160), (2_474, 1_355)).expect("a client area");
+        assert_eq!((fitted.x, fitted.width), (33, 2_408), "{fitted:?}");
+        assert_eq!(
+            shown_origin(Show::Drawn(fitted)),
+            (33, 0),
+            "the pass shows the fitted rectangle, and the box starts with it"
+        );
+    }
 
     /// A view of the frame names a format the frame's own resource allows. The
     /// swap chain's is one only for a typeless frame; a typed frame is read with

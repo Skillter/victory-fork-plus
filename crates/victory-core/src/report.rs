@@ -205,7 +205,7 @@ impl RunFooter {
     pub fn from_counters(reason: &str, duration: Duration) -> Self {
         let meter = crate::meter::meter().totals();
         let metric = |name: &str| meter.metrics.iter().find(|m| m.name == name);
-        RunFooter {
+        let footer = RunFooter {
             reason: reason.to_owned(),
             duration,
             frames: metric("frames_n").map_or(0, |m| m.count),
@@ -213,9 +213,28 @@ impl RunFooter {
             meter,
             cache: Vec::new(),
             warns: crate::logging::warn_once_totals(),
-        }
+        };
+        // What this block is about to state about the run, for a summary line
+        // written beside it: a reader of the two must not find two runs.
+        *STATED.lock().unwrap_or_else(|e| e.into_inner()) = Some((duration, footer.frames));
+        footer
     }
 }
+
+/// The run length and frame count the last [`RunFooter::from_counters`] stated.
+///
+/// For the summary line `victory run` writes after the [`STOP`] block: the
+/// block's cache sizes are a walk of the run's cache (1.7 s on the 2026-11-25
+/// 19:24 run), and a summary that read the counters again after that walk
+/// disagreed with the block it follows - 8.8 fps over 8,003 frames beside the
+/// block's 8.9 over 7,997, off one frame count and 1.7 s. `None` before any
+/// footer was rendered, which a caller answers from what it still has.
+pub fn stated_run() -> Option<(Duration, u64)> {
+    *STATED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// See [`stated_run`].
+static STATED: Mutex<Option<(Duration, u64)>> = Mutex::new(None);
 
 /// Whether this process has already written its [`STOP`] block.
 static STOPPED: AtomicBool = AtomicBool::new(false);
@@ -641,18 +660,60 @@ mod tests {
     /// the warning watches, never a directory.
     #[test]
     fn a_footer_from_counters_states_the_frames_it_was_given() {
-        crate::meter::meter().count("frames_n", 7);
+        // `frames_n` is a process static and counts accumulate, so a run that
+        // another test has already counted into is part of the figure: it is
+        // read before the seven are added, and the two tests that render a
+        // footer take turns.
+        let _turn = STATED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let meter = crate::meter::meter();
+        let had = meter
+            .totals()
+            .metrics
+            .iter()
+            .find(|m| m.name == "frames_n")
+            .map_or(0, |m| m.count);
+        meter.count("frames_n", 7);
+        let frames = had + 7;
         let text = RunFooter::from_counters("title exited with 0", Duration::from_secs(2)).render();
+        let fps = frames as f64 / 2.0;
         assert!(
-            text.contains("duration_s=2 frames=7 fps_mean=3.5"),
+            text.contains(&format!("duration_s=2 frames={frames} fps_mean={fps:.1}")),
             "{text}"
         );
         assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
         assert!(!text.contains("STOP cache "), "a directory is not walked: {text}");
     }
 
-    fn record() -> RunRecord {
-        RunRecord {
+    /// The summary `victory run` writes after the block quotes the run this
+    /// states ([`stated_run`]), so it must be the block's figures as rendered,
+    /// fixed when the block was built. The 2026-11-25 19:24 run read them back
+    /// after the 1.7 s cache walk and stated 8,003 frames beside the block's
+    /// 7,997.
+    #[test]
+    fn the_stated_run_is_what_the_block_says() {
+        // `frames_n` is a process static, and so is what this states, so the
+        // two tests that render a footer from counters take turns: no count of
+        // its own, and no footer built between the render and the read.
+        let _turn = STATED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let text = RunFooter::from_counters("title exited with 0", Duration::from_secs(2)).render();
+        let stated = stated_run().expect("a block was just rendered");
+        assert!(
+            text.starts_with(&format!(
+                "STOP end reason=\"title exited with 0\" duration_s={} frames={}",
+                stated.0.as_secs(),
+                stated.1
+            )),
+            "the line states what the block states: {text}"
+        );
+        // A frame that lands after the block was built does not move it.
+        crate::meter::meter().count("frames_n", 90);
+        assert_eq!(stated_run(), Some(stated), "the line under the block followed the meter");
+    }
+
+    /// See [`the_stated_run_is_what_the_block_says`].
+    static STATED_TESTS: Mutex<()> = Mutex::new(());
+
+    fn record() -> RunRecord {        RunRecord {
             started_utc: "2026-11-25T06:12:50.123Z".to_owned(),
             ended_utc: "2026-11-25T06:13:02.456Z".to_owned(),
             commit: "504b1c6d9e2f4a7c1b3d5e6f7a8b9c0d1e2f3a4b".to_owned(),

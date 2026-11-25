@@ -1620,11 +1620,20 @@ impl NoRoom {
                 "VICTORY_TEXTURE_BUDGET_MB allows {} MB of them and {filled} MB are alive; {card}",
                 limit >> 20
             ),
-            Rule::Budget => format!(
-                "the card is at {}% of its budget ({filled} MB of them alive, past the {} MB floor); {card}",
-                room_percent(),
-                FLOOR >> 20
-            ),
+            Rule::Budget => {
+                // The card's use as measured, not the rule's threshold: the
+                // line said "the card is at 90% of its budget" on a run whose
+                // card was at 91% (2026-11-25 19:24, 9,584 MB of 10,519 MB),
+                // because the threshold was the only figure it had.
+                let at = self
+                    .card
+                    .map_or(0, |[budget, used, ..]| used.saturating_mul(100) / budget.max(1));
+                format!(
+                    "the card is at {at}% of its budget, past the {}% it may reach ({filled} MB of them alive, past the {} MB floor); {card}",
+                    room_percent(),
+                    FLOOR >> 20
+                )
+            }
             Rule::Unsaid => format!(
                 "{filled} MB of them alive, past the {} MB floor, and {} MB is all they may hold without a budget from the card: {card}",
                 FLOOR >> 20,
@@ -4132,7 +4141,9 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(text.contains("12288 MB budget, 11264 MB in use, 1024 MB available"), "{text}");
         let budget = NoRoom { filled: 9 << 30, card: Some(card), rule: Rule::Budget };
         let text = budget.why();
-        assert!(text.contains("90% of its budget"), "{text}");
+        // 11 of the card's 12 GiB in use: the measured use, not the
+        // threshold the rule refuses past.
+        assert!(text.contains("at 91% of its budget, past the 90% it may reach"), "{text}");
         assert!(text.contains("past the 2048 MB floor"), "{text}");
         let unsaid = NoRoom { filled: 5 << 30, card: None, rule: Rule::Unsaid };
         let text = unsaid.why();
