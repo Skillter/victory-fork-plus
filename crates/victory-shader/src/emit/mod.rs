@@ -1082,6 +1082,136 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res).unwrap();
     }
 
+    /// Two elements the console packed into one register — a two-wide one
+    /// at column 0 and another behind it at column 2 — read with two
+    /// interpolation modes: `v_interp_p1/p2_f32` of `attr1.z` with linear
+    /// center barycentrics reads the element at column 2 linearly, and the
+    /// one in front of it is never read, so the emitter's per-element modes
+    /// (a read's, or the kind's default of 2) disagreed inside the row.
+    /// D3D interpolates a row one way: `dxil.dll` rejected such a signature
+    /// ("has interpolation mode that differs from another element packed
+    /// into the same row"), which is the largest class of invalid DXIL the
+    /// title's programs hit (245 of them). The second program reads both
+    /// elements, one perspective and one linear, which no single row can
+    /// declare: the read that does not own the row keeps its mode in a
+    /// register of its own.
+    #[test]
+    fn a_packed_row_declares_one_interpolation_mode() {
+        let el = |index, col| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(1),
+            col,
+            cols: 2,
+            usage: 0,
+            half: false,
+        };
+        let input = |mask, attr| crate::native::PsInput {
+            usage: crate::native::Usage::Generic,
+            row: 1,
+            mask,
+            attr,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 1,
+        };
+        // TEXCOORD0 covers channels 0 and 1 of register 1, TEXCOORD7 the
+        // two behind them (the packed layout the console's own signature
+        // declares). Returns the emitted program and its `PSV0`.
+        let emit_with =
+            |inputs: Vec<crate::native::PsInput>, input_addr: u32, words: &[u32]| {
+                let native = super::NativeProgram {
+                    stage: super::HwStage::Ps,
+                    wave64: false,
+                    vgprs: 6,
+                    layout: vec![],
+                    used: vec![],
+                    io: crate::native::StageIo::Ps {
+                        inputs,
+                        input_addr,
+                        db_shader_control: 0,
+                        patches: vec![],
+                    },
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let isg1 =
+                    super::container::signature(&[el(0, 0), el(7, 2)], true);
+                let osg1 = super::container::signature(
+                    &[SigElement {
+                        name: "SV_Target".into(),
+                        index: 0,
+                        kind: 16,
+                        comp: 9,
+                        interp: 0,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        usage: 0,
+                        half: false,
+                    }],
+                    false,
+                );
+                let bytes = crate::dxbc::build(&[
+                    (super::FourCC::ISG1, &isg1),
+                    (super::FourCC::OSG1, &osg1),
+                ]);
+                let c = super::Container::parse(&bytes).unwrap();
+                let p =
+                    crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+                let st = crate::structure::structure(&p).unwrap();
+                let res =
+                    crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+                // The oracle: before the row's modes were shared, dxil.dll
+                // refused both of these programs with the message above.
+                #[cfg(windows)]
+                if let Ok(mut v) = super::validator::Validator::load(
+                    super::validator::Validator::default_path().as_deref(),
+                ) {
+                    v.validate(&mut out.dxil.clone()).unwrap();
+                }
+                let host = super::Container::parse(&out.dxil).unwrap();
+                host.part(super::FourCC::PSV0).unwrap().data.to_vec()
+            };
+        // One read (linear) behind an element nothing reads (its kind's
+        // default is perspective): the row takes the read's mode and the
+        // unread element copies it, so no register is spent.
+        let psv = emit_with(
+            vec![input(0b0100, 1)],
+            1 << 5, // linear center: v0 is i, v1 is j
+            &[
+                0xC808_0600u32, // v_interp_p1_f32 v2, v0, attr1.z
+                0xC809_0601,    // v_interp_p2_f32 v2, v1, attr1.z
+                0xF800_180F,
+                0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                0xBF81_0000,
+            ],
+        );
+        assert_eq!(psv[4 + 31], 2, "both elements stay in register 1");
+        // Two reads that disagree: `attr0.x` perspective (v0, v1) and
+        // `attr1.z` linear (v2, v3). Neither loses its mode, so the second
+        // moves to a register of its own.
+        let psv = emit_with(
+            vec![input(0b0001, 0), input(0b0100, 1)],
+            (1 << 1) | (1 << 5),
+            &[
+                0xC810_0000u32, // v_interp_p1_f32 v4, v0, attr0.x
+                0xC811_0001,    // v_interp_p2_f32 v4, v1, attr0.x
+                0xC814_0602,    // v_interp_p1_f32 v5, v2, attr1.z
+                0xC815_0603,    // v_interp_p2_f32 v5, v3, attr1.z
+                0xF800_180F,
+                0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                0xBF81_0000,
+            ],
+        );
+        assert_eq!(psv[4 + 31], 3, "the second read got a register of its own");
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
