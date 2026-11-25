@@ -608,6 +608,12 @@ fn create_device(
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
+        // A newer D3D12 core first: the debug layer and device-removed data
+        // below are the core's own settings, and before `ApplyToGlobalState`
+        // `D3D12GetDebugInterface` hands out the system core's, which the
+        // device from the new core never reads (a run with
+        // `VICTORY_D3D12_DRED=1` had "no breadcrumbs (0x887A0004)").
+        let factory = d3d12_factory();
         // The debug layer only in builds with diagnostics.
         let debug =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
@@ -647,9 +653,6 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
-        // A newer D3D12 core, before anything creates a device: Windows 10's
-        // own tops out below what the title's pipelines expect.
-        let factory = d3d12_factory();
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
