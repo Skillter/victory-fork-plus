@@ -43,6 +43,12 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        // A mesh program that declares more outputs than D3D12's cap allows
+        // is only translatable cut to what its pixel program reads, and this
+        // is where the two are known together. The cut containers are their
+        // own shaders (kept by content hash), so the key below and everything
+        // `make` does use the narrowed pair.
+        let shaders = super::fit::fit(&shaders).unwrap_or(shaders);
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());

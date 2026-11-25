@@ -85,6 +85,7 @@ mod container;
 mod counts;
 #[cfg(all(test, windows))]
 mod diff_tests;
+pub mod fit;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]

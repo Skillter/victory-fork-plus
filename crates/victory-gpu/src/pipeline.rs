@@ -895,6 +895,8 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod fit;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;

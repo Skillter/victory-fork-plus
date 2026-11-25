@@ -510,6 +510,27 @@ only as data` 5 (all five `shadowmask:CS_TraceShadowRays_*`), `a lane mask
 holding lanes elsewhere read as data` 2, `a wave sum of 16-bit floats where not
 every lane runs` 2, and 1 each of two others.
 
+The validator charges 4 bytes a component whatever its type (`DxilValidation`:
+`TotalOutputScalars += Rows * Cols * ALIGN32(maxVertexCount)`, then `* 4 >
+32768`; pinned by `crates/victory-shader/src/emit/mesh_tests.rs`), so at the
+title's 128 output vertices a mesh may declare 64 components. 71 of this
+archive's mesh programs declared 66 to 71. `crates/victory-shader/src/emit/fit.rs::over_cap`
+applies the cap before translation and `fit::pair` cuts the mesh's declared
+`OSG1` to the components its paired pixel shader reads — system values keep
+their declared mask, a kept element is re-packed to column 0 without moving its
+row — and cuts the pixel `ISG1` to the same components.
+`crates/victory-gpu/src/pipeline/fit.rs::fit` does this in `Pending::new`, the
+one place the pair is known; the interned containers give the cut pair its own
+hash, translation, shader-cache entry and library key. There is no switch: the
+untrimmed variant cannot translate at all. `victory translate` has no
+pipelines, so it pairs a deferred mesh with the pixel programs of the record
+name's interface suffix (`MS_VS_..._6f3bc7d5_Wrapped` beside `PS_..._6f3bc7d5_Wrapped`)
+and only falls back to every covering pixel input. Re-measured 2026-11-25 in
+the `meshpair` worktree over `shaders.rpf`: the 71 `vertex plus primitive output
+size is greater than 32768` refusals are gone and none replaced (336 refusals
+remain, from 407), mesh validates 8,745 of 8,765 against 8,674, and the
+vertex/pixel (14,132) and compute (2,676) counts are byte-identical.
+
 ## 5.3 Light in shadow — black interiors
 
 Not a bug: the fork's ray-traced bounce light and RT lamp/sun shadows are not
