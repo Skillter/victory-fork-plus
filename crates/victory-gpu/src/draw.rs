@@ -378,6 +378,30 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Slots due at which a pass with a backlog triples its bytes and span
+/// ([`pass_budget`]).
+const CATCHUP_SLOTS: usize = 1024;
+
+/// Bytes and span a pass of [`State::heap_textures`] gets: three times the
+/// plain budget when a backlog is due (`catchup`) **and** the card has room
+/// (`room`). A full card never triples: with no room the pass only spends
+/// the longer span in the refusing loop, three times as long per pass
+/// (250 to 750 ms), while the same head of the queue stays due and nothing
+/// is uploaded.
+fn pass_budget(
+    catchup: bool,
+    room: bool,
+    due: usize,
+    per_frame: u64,
+    span: std::time::Duration,
+) -> (u64, std::time::Duration) {
+    if catchup && room && due >= CATCHUP_SLOTS {
+        (per_frame * 3, span * 3)
+    } else {
+        (per_frame, span)
+    }
+}
+
 /// What a look at a texture it uploaded whole leaves `heap_textures` to do
 /// ([`RECHECK_FRAMES`]): `looks` looks have been made, `print` is the
 /// fingerprint the upload recorded and `seen` the one the memory gives now.
@@ -1624,6 +1648,8 @@ impl State {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
         }
         let mut refused = 0u64;
+        let mut reclaimed = 0u64;
+        let mut reclaimed_bytes = 0u64;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1701,7 +1727,7 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = pass_budget(catchup, no_room.is_none(), due.len(), per_frame, span);
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -1807,9 +1833,29 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
+            // From here on a host texture is made: not without room. Before
+            // the slot is left due, a host copy only this slot's idle
+            // descriptor holds is reclaimed: its slot is marked gone, as
+            // when its memory was streamed out (`texture_slot_gone` above),
+            // and the slot waits to be looked at again, so the head of the
+            // queue moves instead of the same slots being refused every
+            // pass. `placed_made` never makes a resource; `slot_only_idle`
+            // asks before anything is unmade.
             if no_room.is_some() {
+                if let Some(View::Placed(false, d14, v16)) = heap.handle(index).and_then(crate::descriptor::view)
+                    && let Some(at) = crate::resource::placed_made(
+                        u64::from(v16[10]) | u64::from(v16[11]) << 32,
+                        &d14,
+                    )
+                    && crate::resource::slot_only_idle(at)
+                    && host.texture_slot_gone(index)
+                    && let Some(bytes) = crate::resource::let_go_for_room(at)
+                {
+                    reclaimed += 1;
+                    reclaimed_bytes += bytes;
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -1905,7 +1951,12 @@ impl State {
         if let Some(why) = no_room {
             static LAST: AtomicU64 = AtomicU64::new(0);
             static REFUSED: AtomicU64 = AtomicU64::new(0);
+            static RECLAIMED: AtomicU64 = AtomicU64::new(0);
+            static RECLAIMED_BYTES: AtomicU64 = AtomicU64::new(0);
             let refused = REFUSED.fetch_add(refused, Ordering::Relaxed) + refused;
+            let reclaimed = RECLAIMED.fetch_add(reclaimed, Ordering::Relaxed) + reclaimed;
+            let reclaimed_bytes =
+                RECLAIMED_BYTES.fetch_add(reclaimed_bytes, Ordering::Relaxed) + reclaimed_bytes;
             let now = crate::host::now_ms();
             let last = LAST.load(Ordering::Relaxed);
             if now >= last + 5_000
@@ -1914,11 +1965,38 @@ impl State {
                 REFUSED.store(0, Ordering::Relaxed);
                 tracing::info!(
                     "textures picked by index: no room for more in the last {} s: {refused} slots refused since the last line, \
-                     {} still due; {}",
+                     {reclaimed} reclaimed ({} KiB), {} still due; {}",
                     now.saturating_sub(last).max(1) / 1000,
+                    reclaimed_bytes >> 10,
                     HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
                     why.why()
                 );
+            }
+        }
+        // Protected and probation host copies, once a window: frequency
+        // admission either keeps the world set (protected) or leaves
+        // streaming pages evictable (probation), and the bytes say which
+        // the card is full of.
+        {
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            let last = LAST.load(Ordering::Relaxed);
+            if now >= last + 5_000
+                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let [protected, protected_bytes, probation, probation_bytes] =
+                    crate::resource::admission();
+                if protected + probation > 0 {
+                    tracing::info!(
+                        "textures picked by index: {protected} protected from the sweep ({} MB, sampled again and \
+                         again), {probation} on probation ({} MB, sampled once); {} slots due, {} waiting for \
+                         their memory",
+                        protected_bytes >> 20,
+                        probation_bytes >> 20,
+                        HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
+                        HEAP_TEXTURES_QUEUE[2].load(Ordering::Relaxed),
+                    );
+                }
             }
         }
     }
@@ -2897,6 +2975,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            // Sampled: counts the hit that admits a texture seen again and
+            // again to the protected set (`crate::resource::note_sampled`).
+            crate::resource::note_sampled(*resource as This);
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -3075,5 +3156,92 @@ mod tests {
         }
         // The first look is the first wait of the schedule.
         assert_eq!(RECHECK_FRAMES[0], 4);
+    }
+
+    /// Catch-up tripled a pass's bytes and span whenever a backlog was due,
+    /// even with the card full: the pass then spent three times as long
+    /// (250 to 750 ms) refusing the same slots and uploaded nothing. A full
+    /// card never triples.
+    #[test]
+    fn catch_up_cannot_run_while_the_card_refuses() {
+        use std::time::Duration;
+        let (bytes, span) = (4 << 20, Duration::from_millis(50));
+        assert_eq!(
+            pass_budget(true, true, CATCHUP_SLOTS, bytes, span),
+            (bytes * 3, span * 3),
+            "a backlog with room"
+        );
+        assert_eq!(
+            pass_budget(true, false, CATCHUP_SLOTS, bytes, span),
+            (bytes, span),
+            "no room: the catch-up would only refuse for longer"
+        );
+        assert_eq!(
+            pass_budget(true, true, CATCHUP_SLOTS - 1, bytes, span),
+            (bytes, span),
+            "no backlog"
+        );
+        assert_eq!(
+            pass_budget(false, true, CATCHUP_SLOTS * 8, bytes, span),
+            (bytes, span),
+            "catch-up off"
+        );
+    }
+
+    /// A synthetic slot-due trace: a small persistent set sampled every
+    /// frame and many one-touch streaming pages. Replayed through frequency
+    /// admission ([`crate::resource::admit_step`]) and the sweep's veto
+    /// ([`crate::resource::sweepable`]). The old pass restarted from the
+    /// same head every time (a refused slot left due), so the head never
+    /// moved; the reclaim reschedules the slot it took a copy from
+    /// (`texture_slot_later`), so the head advances through every slot. The
+    /// persistent set is protected after two samples and the sweep leaves it
+    /// alone, while a page sampled once stays evictable.
+    #[test]
+    fn the_head_advances_and_the_persistent_set_survives() {
+        /// Slots one pass looks at: the cap the refusing pass stopped at.
+        const CAP: usize = 256;
+        /// One-touch streaming pages, more than the head saw in a pass.
+        const PAGES: usize = 700;
+        /// The world set, sampled every frame.
+        const PERSISTENT: usize = 16;
+        let slots = PERSISTENT + PAGES;
+        let mut hits = vec![0u8; slots];
+        let mut first = vec![0u64; slots];
+        let mut last = vec![0u64; slots];
+        let mut admit = vec![0u8; slots];
+        // The old pass: the same first CAP slots, refused, every pass.
+        let mut old_head = std::collections::BTreeSet::new();
+        // The new pass: each pass looks further along the queue.
+        let mut new_head = std::collections::BTreeSet::new();
+        let mut head = 0usize;
+        for frame in 0..8u64 {
+            for i in 0..slots {
+                if i < PERSISTENT || frame == 0 {
+                    let (h, f, a) = crate::resource::admit_step(hits[i], first[i], last[i], frame);
+                    (hits[i], first[i], last[i], admit[i]) = (h, f, frame, a);
+                }
+            }
+            // Refused slots left due: the same head every pass.
+            old_head.extend(0..CAP);
+            // Reclaimed slots rescheduled: the head moves on.
+            let end = (head + CAP).min(slots);
+            new_head.extend(head..end);
+            head = end;
+        }
+        assert_eq!(old_head.len(), CAP, "the old head never moved");
+        assert_eq!(new_head.len(), slots, "the rescheduled head reached every slot");
+        for j in 0..PERSISTENT {
+            assert_eq!(admit[j], 2, "persistent {j} protected");
+            assert!(
+                !crate::resource::sweepable(true, 1, 1, admit[j] == 2),
+                "the sweep leaves the world set alone"
+            );
+        }
+        assert_eq!(admit[PERSISTENT], 1, "a one-touch page is on probation");
+        assert!(
+            crate::resource::sweepable(true, 1, 1, admit[PERSISTENT] == 2),
+            "a one-touch page is evictable"
+        );
     }
 }

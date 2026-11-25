@@ -413,6 +413,40 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// The most staging buffers may hold in system RAM (`VICTORY_STAGING_MB`,
+/// default 6 GiB): past it the coldest no list holds are let go even if
+/// recently used, so a re-admit still copies from RAM (a 0.5 MB DMA) rather
+/// than decoding and detiling title memory again (measured ~87-120 MB/s).
+/// Generous by default: the point is a ceiling, not a small cache.
+fn staging_ceiling() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6144)
+    }) << 20
+}
+
+/// The entries to let go to bring `total` bytes under `ceiling` (each
+/// `(used, bytes, held)`): coldest first, never one a list holds (`held`),
+/// stopping when the rest fit. Pure, so the ceiling is tested without a
+/// device.
+fn to_ceiling(entries: &[(u64, u64, bool)], total: u64, ceiling: u64) -> Vec<usize> {
+    if total <= ceiling {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..entries.len()).filter(|&i| !entries[i].2).collect();
+    order.sort_unstable_by_key(|&i| entries[i].0);
+    let mut drop = Vec::new();
+    let mut left = total;
+    for i in order {
+        if left <= ceiling {
+            break;
+        }
+        left = left.saturating_sub(entries[i].1);
+        drop.push(i);
+    }
+    drop
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -446,8 +480,33 @@ pub(crate) fn let_go_idle() {
         }
         keep
     });
+    // A ceiling on what staging holds in system RAM: past it the coldest
+    // buffers no list holds go, even if recently used, so a re-admit still
+    // copies from RAM rather than detiling title memory again.
+    let ceiling = staging_ceiling();
+    let total = STAGED[1].load(Relaxed);
+    if total > ceiling {
+        let entries: Vec<(u64, u64, bool, usize)> = map
+            .iter()
+            .map(|(&key, s)| (s.used.load(Relaxed), s.bytes, Arc::strong_count(s) > 1, key))
+            .collect();
+        let flat: Vec<(u64, u64, bool)> = entries.iter().map(|&(u, b, h, _)| (u, b, h)).collect();
+        for i in to_ceiling(&flat, total, ceiling) {
+            if let Some(s) = map.remove(&entries[i].3) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+            }
+        }
+    }
     if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went} staging buffers of textures let go ({} KiB), idle or past the staging ceiling, held by no list",
+                bytes >> 10
+            )
+        });
     }
 }
 
@@ -1265,5 +1324,26 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_ceiling_tests {
+    use super::to_ceiling;
+
+    /// Past the ceiling the coldest buffers no list holds go, coldest
+    /// first, until the rest fit; a buffer a list holds is never taken,
+    /// however cold, and nothing is taken under the ceiling.
+    #[test]
+    fn the_ceiling_takes_the_coldest_not_held() {
+        // `(used, bytes, held)`: the second is the coldest, but a list holds
+        // it, so it is passed over.
+        let entries = [(10, 100, false), (1, 100, true), (5, 100, false), (7, 100, false)];
+        // 400 bytes against a 250 ceiling: the coldest not held (5) and the
+        // next (7) leave 200, under the ceiling.
+        assert_eq!(to_ceiling(&entries, 400, 250), vec![2, 3]);
+        assert!(to_ceiling(&entries, 400, 400).is_empty(), "under the ceiling");
+        // A list holds the only buffer: it goes regardless of the ceiling.
+        assert!(to_ceiling(&[(1, 400, true)], 400, 0).is_empty(), "held");
     }
 }
