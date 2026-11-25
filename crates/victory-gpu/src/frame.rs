@@ -174,12 +174,8 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
-    #[cfg(windows)]
-    {
-        let us = wait.min(limit).as_micros() as u64;
-        crate::framelog::add(crate::framelog::T::PaceUs, us);
-        crate::framelog::here(crate::framelog::H::PaceUs, us);
-    }
+    PACING[0].fetch_add(1, Ordering::Relaxed);
+    PACING[1].fetch_add(wait.min(limit).as_micros() as u64, Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

@@ -330,7 +330,7 @@ fn free_mb() -> u64 {
 }
 
 /// Values read when a frame ends, all running totals but the last.
-const S: usize = 11;
+const S: usize = 9;
 const S_THREAD_USER: usize = 0;
 const S_THREAD_KERNEL: usize = 1;
 const S_PROCESS_USER: usize = 2;
@@ -339,10 +339,8 @@ const S_PAGE_FAULTS: usize = 4;
 const S_DRAWS: usize = 5;
 const S_PIPELINES_MADE: usize = 6;
 const S_PIPELINES_LOADED: usize = 7;
-const S_STAGING_REUSED: usize = 8;
-const S_STAGING_MADE: usize = 9;
 /// Not a total: the free memory then.
-const S_FREE_MB: usize = 10;
+const S_FREE_MB: usize = 8;
 
 fn sample() -> [u64; S] {
     let (tu, tk) = thread_times();
@@ -356,8 +354,6 @@ fn sample() -> [u64; S] {
         crate::draw::drawn(),
         crate::pipeline::frame_log_counts().0,
         crate::pipeline::frame_log_counts().1,
-        crate::texture::SPARE_STATS[0].load(Relaxed),
-        crate::texture::SPARE_STATS[1].load(Relaxed),
         free_mb(),
     ]
 }
@@ -411,7 +407,7 @@ fn text(f: &Frame) -> String {
          ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
-         still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
+         still), {:.0} uploads | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
@@ -449,8 +445,6 @@ fn text(f: &Frame) -> String {
         ms(T::RefreshUs),
         ms(T::RefreshStillUs),
         t(T::Uploads),
-        s(S_STAGING_MADE),
-        s(S_STAGING_REUSED),
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),

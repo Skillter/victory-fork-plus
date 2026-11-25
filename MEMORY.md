@@ -219,17 +219,17 @@ failed to create with `0x80070057`. `VICTORY_DISPLAY_MODE=1920x1080` and
 `resolutionFullscreen` 1920x1080 in `settings.xml` change nothing on series-x:
 the title sizes its targets from the console model, not from either.
 
-*(re-measured, `run-20261125-165547.log`)* the package is read by default now
-(`VICTORY_FSPX=0` refuses it). Read, the title takes its upscale chain and the
-frame it presents is `written=true cleared=false` in the prison world at
-3,840x2160: **3.1 fps / 321.6 ms** (preparing 119.2, on the GPU 152.5,
-copy-back 254.7 ms / 65.5 MB). Refused (`VICTORY_FSPX=0`,
-`run-20261125-163149.log`), the same scene runs 1.9 fps / 521.7 ms and the
-window is **white**: nothing writes the presented frame, so it holds whatever
-the last clear left. Earlier (`run-20261125-132005.log`) the chain stopped at
-four refusing programs and the frame was cleared and never drawn, which was
-black; those four are lowered now (below), and the two remaining failures are
-the ray-trace lane-mask idioms that never run on this path.
+*(re-measured, `run-20261125-135405.log`)* reading the FidelityFX package's
+programs (`61bb4d6`, `ACCC`/`FSPX` parts) makes the title take its upscale
+chain. Four of its compute programs still refuse (`a lane mask exchanged where
+not every lane runs`, `a lane mask holding lanes elsewhere read as data`, `a
+descriptor's address or format read as data`, `a 16-bit image atomic`), so the
+title **clears the frame it presents and never draws into it**: `present.
+fallback.cleared` 302 times in `run-20261125-132005.log`, and the window shows
+its overlays over black. Refusing the package again (`VICTORY_FSPX` off by
+default, `run-20261125-135405.log`) restores the path the title took before:
+`the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
+loading screen.
 
 *(re-measured, `victory translate` with `VICTORY_FSPX=1`, 25 Nov)* three of the
 package's refusals were instructions with no arm at all, and they are gone:

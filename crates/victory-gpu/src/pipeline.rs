@@ -66,6 +66,7 @@ pub(crate) struct Shader {
     /// Whether its code walks the ray-tracing structures, once looked at
     /// ([`Shader::walks`]).
     #[cfg(windows)]
+    #[allow(dead_code)]
     walks: OnceLock<bool>,
 }
 
@@ -274,6 +275,7 @@ impl Shader {
     /// Whether the program walks the ray-tracing structures: its code has
     /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
     /// at once, when a dispatch first asks.
+    #[allow(dead_code)]
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
     }
@@ -282,6 +284,7 @@ impl Shader {
 /// Whether a console container's code tests rays against the nodes of a
 /// ray-tracing structure.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn container_walks(container: &[u8]) -> bool {
     use victory_shader::{Container, FourCC};
     let Ok(c) = Container::parse(container) else {
@@ -294,12 +297,14 @@ fn container_walks(container: &[u8]) -> bool {
 
 /// Whether native code has a ray-tracing node test.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn code_walks(code: &[u8]) -> bool {
     victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// Dispatches held back by [`walk_held`] since the last frame line.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a dispatch with the title's pipeline `this` is held back
@@ -325,6 +330,7 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// whole. What the passes would have written stays as the title left it
 /// (their targets are not cleared by us): the picture has to be looked at.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn walk_held(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {

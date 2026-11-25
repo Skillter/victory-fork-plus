@@ -1,7 +1,9 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the translator
-//! that translated it (its source fingerprint and settings, see `build`), so
-//! a changed translator never serves an old translation. Entries go through
+//! that translated it (`VICTORY_TRANSLATOR_HASH`, made by `build.rs` from
+//! the translator's source, this file, `Cargo.lock` and the toolchain), so
+//! a changed translator never serves an old translation and a rebuild that
+//! leaves it alone keeps the cache. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //! Opening the cache first prunes it (a month idle, then a 2 GiB cap).
@@ -50,58 +52,68 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies the translation, besides the container: the shader
-/// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
-/// this file's encoding of the result. Not the whole executable any more: a
-/// rebuild that leaves the translator alone keeps its translations (each new
-/// build used to translate the title's thousands of shaders again, which kept
-/// the first minutes of every test run short of pipelines).
-/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
-/// Worked out per lookup, so a translation made before the device said its
-/// wave size is never filed under the later key.
-fn build() -> [u8; 32] {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
-    }
-    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
-    let exe = EXE.get_or_init(|| {
-        if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
-                    None
-                }
-            }
-        } else {
-            None
+/// What identifies the translation: the translator's fingerprint (made at
+/// build time, see `build.rs`), whether this is a diagnostics build (which
+/// turns on the translator's own diagnostics feature), and the translation
+/// settings it runs with (the loop limit, which a diagnostics build can
+/// change at run time).
+fn build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut bytes = [
+            env!("VICTORY_TRANSLATOR_HASH").as_bytes(),
+            &[u8::from(cfg!(feature = "diagnostics")), u8::from(cfg!(debug_assertions))],
+        ]
+        .concat();
+        let limit = victory_shader::emit::loop_limit();
+        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            );
         }
-    });
-    let mut h = blake3::Hasher::new();
-    h.update(b"victory shader cache key 2\0");
-    if let Some(exe) = exe {
-        h.update(exe);
-    }
-    h.update(&victory_shader::emit::translation_fingerprint());
-    h.update(include_bytes!("shader_cache.rs"));
-    *h.finalize().as_bytes()
-}
-
-/// The offline warm-up (`victory translate --warm`): `container` is
-/// translated into the cache unless it is there already. `Ok(true)`: it
-/// was translated now. Needs [`use_shader_cache`] and the same host facts
-/// the run will have (`victory_shader::emit::translation_fingerprint`).
-pub fn warm(container: &[u8]) -> Result<bool, String> {
-    let cache = CACHE.get().ok_or("no shader cache")?;
-    let ran = AtomicBool::new(false);
-    let translate = |c: &[u8]| {
-        ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
-    };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // So is the view heap's null slot (it differs by host GPU):
+        // a translation cached without the clamp must not be served.
+        crate::descriptor::host::probe_view_limit();
+        bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(victory_shader::emit::group_sync());
+        // So is every string switch that changes what the translator
+        // emits (the numeric ones — `shader_opt`, `loop_limit`,
+        // `group_sync` — are keyed above by their value): without them
+        // here a run with `VICTORY_WAVE_WIDE=0` was served the
+        // translations an earlier run of the same executable had cached
+        // with the switch unset. A switch that changes a translation is
+        // added here in the same change, sorted, one per line; the ones
+        // that only print (`VICTORY_WAVE_WHY`, `VICTORY_DESC_WHY`,
+        // `VICTORY_SHADER_CENSUS`) are left out.
+        for name in [
+            "VICTORY_F16_NEAREST",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_FIRST_HALF",
+            "VICTORY_MESH_COUNTS",
+            "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_WIDE",
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(value.as_encoded_bytes());
+            }
+            bytes.push(0);
+        }
+        // And which clean-up passes ran over the translated code.
+        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        rekey(
+            *blake3::hash(&bytes).as_bytes(),
+            std::env::var_os("VICTORY_SHADER_CACHE_KEY").as_deref(),
+        )
+    })
 }
 
 /// `VICTORY_SHADER_CACHE_KEY=<text>` rejoins the key with that text, so a
@@ -122,12 +134,26 @@ fn rekey(key: [u8; 32], spec: Option<&std::ffi::OsStr>) -> [u8; 32] {
     }
 }
 
+/// The offline warm-up (`victory translate --warm`): `container` is
+/// translated into the cache unless it is there already. `Ok(true)`: it
+/// was translated now. Needs [`use_shader_cache`] and the same host facts
+/// the run will have (the fingerprint `build.rs` made at build time).
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+    };
+    cached(cache, build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
 }
