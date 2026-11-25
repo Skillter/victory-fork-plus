@@ -244,20 +244,27 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// R9G9B9E5_SHAREDEXP (67) is a render target and unordered access target on
+/// the console (the title's exposure chain) and on no PC: `CheckFeatureSupport`
+/// reports neither RENDER_TARGET nor TYPED_UNORDERED_ACCESS_VIEW for it, and
+/// `CreateCommittedResource` refuses either flag (0x80070057) while a render
+/// target *view* of that format is one the device removes itself for. Half
+/// float stands in, which holds every value the shared exponent does and
+/// more.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 11)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -511,6 +518,7 @@ fn twin_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+        crate::host::note_removal(&e);
     }
     let Some(texture) = texture else {
         TWINS[1].fetch_add(1, Relaxed);
@@ -574,6 +582,7 @@ fn twin_texture(
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+            crate::host::note_removal(&e);
         }
         texture.map(|texture| {
             crate::host::name(&texture, || {
@@ -2099,6 +2108,61 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// The host format's support bits (`D3D12_FORMAT_SUPPORT1`), asked once per
+/// format: which uses of a format a resource may be created with.
+#[cfg(windows)]
+fn format_support(format: u32) -> u32 {
+    static CACHE: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    {
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, bits)) = cache.iter().find(|&&(f, _)| f == format) {
+            return bits;
+        }
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(host) = crate::host::host() else {
+        return u32::MAX;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let bits = if asked.is_err() { u32::MAX } else { support.Support1.0 as u32 };
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((format, bits));
+    bits
+}
+
+/// Says once what create flags a format lost: the console takes a render
+/// target or an unordered access view of formats the host has neither for,
+/// and a create that asks is refused whole (`0x80070057`) while its views
+/// are ones the device removes itself for.
+#[cfg(windows)]
+fn cut_flags(format: u32, asked: u32, kept: u32) {
+    static SAID: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.contains(&format) {
+        return;
+    }
+    said.push(format);
+    tracing::warn!(
+        format,
+        asked = format_args!("{asked:#x}"),
+        kept = format_args!("{kept:#x}"),
+        "the host has no such use of this format: the flags are dropped"
+    );
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2145,6 +2209,29 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A flag the format has no use of is a create the host refuses whole
+    // (0x80070057), and a render target view of it is one the device removes
+    // itself for: keep what the format supports.
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        let support = format_support(d.format);
+        let asked = d.flags;
+        for (flag, bit) in [
+            (TARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0),
+            (UNORDERED, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0),
+            (DEPTH, D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0),
+        ] {
+            if d.flags & flag != 0 && support & bit as u32 == 0 {
+                d.flags &= !flag;
+            }
+        }
+        if d.flags != asked {
+            cut_flags(d.format, asked, d.flags);
+        }
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2178,6 +2265,7 @@ fn host_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        crate::host::note_removal(&e);
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
