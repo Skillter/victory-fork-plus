@@ -40,7 +40,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GUITHREADINFO, GetClassNameW, GetClientRect,
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW, GetWindowThreadProcessId, IsChild,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 
@@ -480,45 +480,64 @@ pub fn activate(hwnd: isize) -> Result<isize, String> {
     // SAFETY: plain window calls on a handle the enumeration answered.
     unsafe {
         let was = GetForegroundWindow();
-        if keys_go_to(target) {
+        let mut why = String::new();
+        if keys_go_to(target, &mut why) {
             return Ok(was.0 as isize);
         }
         if IsIconic(target).as_bool() {
             let _ = ShowWindow(target, SW_RESTORE);
         }
         let _ = SetForegroundWindow(target);
-        if keys_go_to(target) {
+        if keys_go_to(target, &mut why) {
             return Ok(was.0 as isize);
         }
         if !dance(target) {
-            return Err(format!("window {hwnd:#x} did not take the keys"));
+            return Err(format!("window {hwnd:#x} did not take the keys: {why}"));
         }
         std::thread::sleep(Duration::from_millis(SETTLE_MS));
         Ok(was.0 as isize)
     }
 }
 
-/// Whether the keyboard's keys go to `hwnd`: it is the foreground window, and
-/// it — or a window of its own, an edit control — is the focused window of its
-/// thread. A window in front whose thread's focus is elsewhere takes nothing.
-fn keys_go_to(hwnd: HWND) -> bool {
+/// Whether the keyboard's keys go to `hwnd`.
+///
+/// `SendInput` puts the keystrokes into the input queue of the *foreground*
+/// window's thread, so the foreground window being the target is the whole
+/// test. The focused window of that thread may be a child, or none at all,
+/// and the title still receives the key: the first version of this function
+/// also demanded that `GetGUIThreadInfo` named the target as active or
+/// focused, and refused every press this title would have taken (measured on
+/// `run-20261125-215517.log`: `the window did not take the keys` twelve
+/// times while the same sequence from outside pressed it first try).
+///
+/// The thread's own figures are kept for the warning only, so a log says what
+/// was in front and what had the focus when a press was refused.
+fn keys_go_to(hwnd: HWND, why: &mut String) -> bool {
     // SAFETY: plain queries of this thread's windows and of another's state.
     unsafe {
-        if hwnd.0.is_null() || GetForegroundWindow() != hwnd {
+        if hwnd.0.is_null() {
+            *why = "no window".to_string();
+            return false;
+        }
+        let front = GetForegroundWindow();
+        if front != hwnd {
+            *why = format!("the front window is {:#x}, not this one", front.0 as isize);
             return false;
         }
         let thread = GetWindowThreadProcessId(hwnd, None);
-        if thread == 0 {
-            return false;
-        }
         let mut info = GUITHREADINFO {
             cbSize: size_of::<GUITHREADINFO>() as u32,
             ..GUITHREADINFO::default()
         };
-        if GetGUIThreadInfo(thread, &mut info).is_err() {
-            return false;
+        if thread != 0 && GetGUIThreadInfo(thread, &mut info).is_ok() {
+            *why = format!(
+                "in front; focus {:#x}, active {:#x}",
+                info.hwndFocus.0 as isize, info.hwndActive.0 as isize
+            );
+        } else {
+            *why = "in front".to_string();
         }
-        info.hwndActive == hwnd || info.hwndFocus == hwnd || IsChild(hwnd, info.hwndFocus).as_bool()
+        true
     }
 }
 
@@ -544,7 +563,8 @@ fn dance(target: HWND) -> bool {
         if attached {
             let _ = AttachThreadInput(me, owner, false);
         }
-        keys_go_to(target)
+        let mut why = String::new();
+        keys_go_to(target, &mut why)
     }
 }
 
