@@ -342,6 +342,12 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time the texture refresh thread spent waiting for title memory to hold
+/// still, in microseconds, since the last frame-rate line. Wall-clock time of
+/// the run that the preparation split cannot show: it is spent on another
+/// thread, while the title's remapping is in flight.
+static REFRESH_STILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -659,6 +665,72 @@ fn create_device(
     }
 }
 
+/// What `VICTORY_BACKGROUND_PROCESSING` asks of the runtime's background work
+/// (`create`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Background {
+    /// The driver's background compilation and measurements are off.
+    Off,
+    /// The runtime's own default: background work as it sees fit.
+    Normal,
+    /// Intrusive measurements, committed when the mode returns.
+    Measure,
+}
+
+impl Background {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "normal" | "on" | "1" => Some(Self::Normal),
+            "measure" => Some(Self::Measure),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Normal => "normal",
+            Self::Measure => "measure",
+        }
+    }
+
+    /// The mode, and what the runtime does with the measurements it takes.
+    fn mode(self) -> (D3D12_BACKGROUND_PROCESSING_MODE, D3D12_MEASUREMENTS_ACTION) {
+        match self {
+            Self::Off => (
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
+            ),
+            Self::Normal => (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
+            ),
+            Self::Measure => (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS,
+                D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+            ),
+        }
+    }
+}
+
+/// `VICTORY_BACKGROUND_PROCESSING`, default `off`: nothing named is `off`,
+/// and text that names no mode is refused to `off` rather than obeyed.
+fn background_processing(named: Option<&str>) -> Background {
+    match named.and_then(Background::parse) {
+        Some(asked) => asked,
+        None => {
+            if let Some(text) = named {
+                tracing::warn!(
+                    value = %text,
+                    "VICTORY_BACKGROUND_PROCESSING: off, normal or measure; off is used"
+                );
+            }
+            Background::Off
+        }
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -742,24 +814,41 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
-        // driver compiling shaders again on the "D3D Background Thread"s,
-        // for minutes after pipelines were made or loaded) is switched off.
-        // An experiment: while those threads ran, the same shot took
-        // 1,000-1,200 ms a frame, and 830-950 ms from the moment they
-        // stopped (run 54, 08:32:01 to 08:32:06). Left as it is by default:
-        // whether the card is slower with the shaders it then keeps is not
-        // known.
-        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0")
-            && let Ok(device6) = device.cast::<ID3D12Device6>()
-        {
-            let set = device6.SetBackgroundProcessingMode(
-                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
-                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
-                None,
-                None,
+        // `VICTORY_BACKGROUND_PROCESSING=off|normal|measure`: what the runtime
+        // may do behind the title's back. The driver compiles shaders again on
+        // its "D3D Background Thread"s for minutes after pipelines were made
+        // or loaded, and while those threads run the same shot took
+        // 1,000-1,200 ms a frame against 830-950 ms from the moment they
+        // stopped (run 54, 08:32:01 to 08:32:06). `off` is the default.
+        //
+        // The runtime answers a mode it does not have, so the feature query
+        // decides whether the switch was really there; without
+        // `BackgroundProcessingSupported` the call is a benign no-op.
+        if let Ok(device6) = device.cast::<ID3D12Device6>() {
+            // `VICTORY_D3D12_BACKGROUND=0`, the older spelling, asks for
+            // what is now the default and needs no reading of its own.
+            let named = std::env::var("VICTORY_BACKGROUND_PROCESSING").ok();
+            let asked = background_processing(named.as_deref());
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+            let supported = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS6,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.BackgroundProcessingSupported.as_bool();
+            let (mode, measurements) = asked.mode();
+            let accepted = supported
+                && device6
+                    .SetBackgroundProcessingMode(mode, measurements, None, None)
+                    .is_ok();
+            tracing::info!(
+                asked = asked.name(),
+                accepted,
+                BackgroundProcessingSupported = supported,
+                "background processing mode (measure is for a menu or a loading screen, not a scene)"
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
@@ -841,6 +930,46 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The switch has three spellings, unknown text is refused to `off`
+    /// rather than obeyed, nothing named is `off`, and only `measure` lets
+    /// the runtime commit its measurements.
+    #[test]
+    fn background_processing_names_one_of_three_modes() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        use super::{Background, background_processing};
+        assert_eq!(Background::parse("off"), Some(Background::Off));
+        assert_eq!(Background::parse(" Normal "), Some(Background::Normal));
+        assert_eq!(Background::parse("MEASURE"), Some(Background::Measure));
+        assert_eq!(Background::parse("0"), Some(Background::Off));
+        assert_eq!(Background::parse("sometimes"), None);
+        assert_eq!(background_processing(None), Background::Off);
+        assert_eq!(background_processing(Some("measure")), Background::Measure);
+        assert_eq!(background_processing(Some("normal")), Background::Normal);
+        assert_eq!(background_processing(Some("typo")), Background::Off);
+        assert_eq!(
+            Background::Off.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL
+            )
+        );
+        assert_eq!(
+            Background::Normal.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL
+            )
+        );
+        assert_eq!(
+            Background::Measure.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS,
+                D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS
+            )
+        );
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -5954,18 +6083,330 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// The largest rectangle of `client` with the shape of `frame`: the frame
+/// scaled by the smaller of the two ratios, centred, with bars on the sides or
+/// the top and bottom (letterboxed).
+///
+/// `None` when either size has a zero side: a minimised window has no client
+/// area, and a swap chain of a size of zero is not one DXGI makes.
+fn fit(frame: (u32, u32), client: (u32, u32)) -> Option<Fit> {
+    let ((frame_width, frame_height), (client_width, client_height)) = (frame, client);
+    if frame_width == 0 || frame_height == 0 || client_width == 0 || client_height == 0 {
+        return None;
+    }
+    // The smaller ratio decides: whichever of the frame's own sides would leave
+    // the other sticking out of the client area.
+    let (width, height) = if u64::from(frame_width) * u64::from(client_height)
+        <= u64::from(client_width) * u64::from(frame_height)
+    {
+        let width = u64::from(frame_width) * u64::from(client_height) / u64::from(frame_height);
+        (width.min(u64::from(client_width)) as u32, client_height)
+    } else {
+        let height = u64::from(frame_height) * u64::from(client_width) / u64::from(frame_width);
+        (client_width, height.min(u64::from(client_height)) as u32)
+    };
+    Some(Fit {
+        x: (client_width - width) / 2,
+        y: (client_height - height) / 2,
+        width: width.max(1),
+        height: height.max(1),
+    })
+}
+
+/// Where a frame's picture goes in a window's client area: [`fit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fit {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Whether shaders may read a texture's texels: the flag that denies it is also
+/// the one that denies the read states (`legal_for`).
+fn readable(desc: &D3D12_RESOURCE_DESC) -> bool {
+    const DENY_SHADER_RESOURCE: u32 = 0x8;
+    desc.Flags.0 as u32 & DENY_SHADER_RESOURCE == 0
+}
+
+/// The pass that draws a frame into a back buffer the client area's size: one
+/// triangle over the rectangle [`fit`] gives, its pixel shader reading the frame
+/// through a bilinear sampler.
+///
+/// The aspect ratio cannot come from the swap chain: DXGI scales a flip chain's
+/// back buffer over the whole client area, and `DXGI_SCALING_ASPECT_RATIO_STRETCH`
+/// is documented as behaving like `DXGI_SCALING_STRETCH` for a Win32 flip chain
+/// (a plain stretch). The rectangle the viewport and the scissor name is what
+/// letterboxes the picture. A D3D12 copy cannot scale, so a draw is how the
+/// frame reaches a back buffer larger or smaller than itself.
+const PRESENT_CORNERS: &str = r#"
+struct corner_out {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+corner_out corner(uint i : SV_VertexID) {
+    // One triangle twice the viewport's size: (0,0), (2,0), (0,2) in units of
+    // the viewport, which the rasteriser and the scissor clip to it.
+    float2 t = float2((i << 1) & 2, i & 2);
+    corner_out looked;
+    looked.position = float4(t.x * 2.0 - 1.0, 1.0 - t.y * 2.0, 0.0, 1.0);
+    looked.uv = t;
+    return looked;
+}
+"#;
+
+const PRESENT_FRAME: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D frame : register(t0);
+SamplerState view : register(s0);
+
+[RootSignature(RS)]
+float4 present(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return float4(frame.SampleLevel(view, uv, 0).rgb, 1.0);
+}
+"#;
+
+/// Views of frames the pass reads, in a heap of ours used as a ring.
+/// shortcut: a view must last until its list has run, and presents sent ahead
+/// ([`late_free_present`]) hold the last few; a ring this long is well past
+/// them.
+const PRESENT_VIEWS: u32 = 8;
+
+/// What the pass draws with: the heap of its views of frames, and, per back
+/// buffer format, the root signature and pipeline, made when first needed
+/// (`None`: the host refused).
+struct PresentPass {
+    views: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    next: AtomicU32,
+    made: Mutex<Vec<(i32, Option<PresentPipeline>)>>,
+}
+
+/// The pass's root signature and pipeline for one back buffer format.
+type PresentPipeline = (ID3D12RootSignature, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for PresentPass {}
+// SAFETY: as above.
+unsafe impl Sync for PresentPass {}
+
+fn present_pass() -> Option<&'static PresentPass> {
+    static PASS: OnceLock<Option<PresentPass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain heap creation and queries.
+        unsafe {
+            let views: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: PRESENT_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            Some(PresentPass {
+                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
+                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
+                step: host.device.GetDescriptorHandleIncrementSize(kind),
+                views,
+                next: AtomicU32::new(0),
+                made: Mutex::default(),
+            })
+        }
+    })
+    .as_ref()
+}
+
+impl PresentPass {
+    fn pipeline(&self, format: DXGI_FORMAT) -> Option<PresentPipeline> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, pipeline)) = made.iter().find(|m| m.0 == format.0) {
+            return pipeline.clone();
+        }
+        let pipeline = match Self::make(format) {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    format = format.0,
+                    "no pipeline to draw the frame into the window: DXGI stretches it instead"
+                );
+                None
+            }
+        };
+        made.push((format.0, pipeline.clone()));
+        pipeline
+    }
+
+    fn make(format: DXGI_FORMAT) -> windows::core::Result<PresentPipeline> {
+        use windows::core::s;
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let vs = compile(PRESENT_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let ps = compile(PRESENT_FRAME, s!("present"), s!("ps_5_1"))?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        // SAFETY: the root signature is inside the pixel shader; the
+        // description points at live data and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let mut targets = [DXGI_FORMAT_UNKNOWN; 8];
+            targets[0] = format;
+            let (blend, rasterizer) = present_states();
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: rasterizer,
+                NumRenderTargets: 1,
+                RTVFormats: targets,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    }
+}
+
+/// The states the present pass draws with: no blend, every colour channel
+/// written, no culling, depth off.
+///
+/// The write mask is the one that matters: a `Default` blend description
+/// writes nothing at all, so the pass would clear the back buffer to black and
+/// then draw its triangle into a mask that discards every channel — a black
+/// window with no error anywhere. `present_states` is tested for that.
+fn present_states() -> (D3D12_BLEND_DESC, D3D12_RASTERIZER_DESC) {
+    let mut blend = D3D12_BLEND_DESC::default();
+    for target in &mut blend.RenderTarget {
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    }
+    let raster = D3D12_RASTERIZER_DESC {
+        FillMode: D3D12_FILL_MODE_SOLID,
+        CullMode: D3D12_CULL_MODE_NONE,
+        DepthClipEnable: true.into(),
+        ..Default::default()
+    };
+    (blend, raster)
+}
+
+/// What the pass shows, and where.
+struct PresentDraw<'a> {
+    /// The frame, in a state pixel shaders may read.
+    frame: &'a ID3D12Resource,
+    /// The back buffer, in the render target state, of `format` and of the size
+    /// the client area names.
+    back: &'a ID3D12Resource,
+    format: DXGI_FORMAT,
+    /// The rectangle of `back` the frame goes in ([`fit`]).
+    rect: Fit,
+}
+
+/// Records into `list` the pass that shows `draw`: the back buffer cleared to
+/// black and the frame drawn into the rectangle of it. It puts none of the
+/// list's state back: it is for a list that records nothing of the title's after
+/// it.
+fn record_present_pass(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    pass: &PresentPass,
+    pipeline: &PresentPipeline,
+    draw: PresentDraw<'_>,
+) {
+    let PresentDraw {
+        frame,
+        back,
+        format,
+        rect,
+    } = draw;
+    let (root, pipeline) = pipeline;
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PRESENT_VIEWS;
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + (slot * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(slot * pass.step),
+    };
+    let target = host.rtv(Some(back), None);
+    // SAFETY: an open list; a slot of our heap; live resources and objects (the
+    // pass's own live as long as the process).
+    unsafe {
+        host.device.CreateShaderResourceView(frame, Some(&view), cpu);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        // The bars: nothing is drawn outside the rectangle, so they are cleared.
+        list.ClearRenderTargetView(target, &[0.0, 0.0, 0.0, 1.0], None);
+        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.SetGraphicsRootSignature(root);
+        list.SetPipelineState(pipeline);
+        list.SetGraphicsRootDescriptorTable(0, gpu);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: rect.x as f32,
+            TopLeftY: rect.y as f32,
+            Width: rect.width as f32,
+            Height: rect.height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: rect.x as i32,
+            top: rect.y as i32,
+            right: (rect.x + rect.width) as i32,
+            bottom: (rect.y + rect.height) as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+}
+
 const BUFFERS: u32 = 2;
+
+/// How a frame reaches the window's back buffer.
+#[derive(Clone, Copy, Debug)]
+enum Show {
+    /// `CopyResource`: the frame and the back buffer are one size.
+    Copy,
+    /// The present pass, drawing the frame into `rect` of the back buffer.
+    Drawn(Fit),
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
-    width: u32,
-    height: u32,
+    /// The size of the swap chain's buffers: the window's client area when the
+    /// frame is drawn into them ([`fit`]), else the frame's own size.
+    size: (u32, u32),
     format: DXGI_FORMAT,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// The pass that draws the frame into buffers the client area's size;
+    /// without it the buffers are the frame's size and DXGI stretches them.
+    pass: Option<&'static PresentPass>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -6047,8 +6488,13 @@ impl Meter {
             }
         }
         {
+            let waited = [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed));
+            // Kept for the 5 s line: the wait is wall-clock time the frame
+            // spent, but it happens on the refreshing thread, so it is
+            // reported beside the breakdown rather than inside it.
+            REFRESH_STILL.fetch_add(waited[3], Ordering::Relaxed);
             let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+                waited.map(|us| us as f64 / 1000.0 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -6099,6 +6545,8 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
+            // Wall-clock time of the run that the split above cannot show.
+            let still_ms = REFRESH_STILL.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
             // Why those were dropped, split by reason: counted in every build,
             // and taken over the same window as the count above.
             #[cfg(not(feature = "diagnostics"))]
@@ -6176,11 +6624,12 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {still_ms:.1} waiting for title \
+                 memory to hold still, on the refreshing thread), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access so far: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -6190,12 +6639,17 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{} so far; {}",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
-                    crate::resource::TWINS[0].load(Ordering::Relaxed),
-                    crate::resource::TWINS[1].load(Ordering::Relaxed),
-                    crate::resource::PLANES[1].load(Ordering::Relaxed),
-                    crate::resource::PLANES[2].load(Ordering::Relaxed)
+                    crate::resource::twin_line(
+                        crate::resource::TWINS[0].load(Ordering::Relaxed),
+                        crate::resource::TWINS[1].load(Ordering::Relaxed),
+                        twin_to_depth,
+                        twin_to_colour,
+                        planes,
+                        crate::resource::PLANES[1].load(Ordering::Relaxed),
+                        crate::resource::PLANES[2].load(Ordering::Relaxed)
+                    )
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
@@ -6272,10 +6726,10 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let size = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(size, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -6284,23 +6738,79 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
+        // The window's client area is the one source of truth for the size: the
+        // swap chain's buffers are its size and follow it when the window is
+        // resized. A minimised (or closed) window has none, and a swap chain of
+        // a size of zero is not one DXGI makes, so nothing is presented while it
+        // has none.
+        let client = client_size(p.hwnd)?;
+        // What the run shows: the frame drawn into the largest part of the client
+        // area with its own shape, bars round it ([`fit`]); one `CopyResource`
+        // when the frame and the client area are one size; and, without the pass
+        // or for a frame whose texture refuses shader reads, DXGI's plain stretch
+        // of the frame's own size.
+        let drawn = p
+            .pass
+            .filter(|_| readable(&desc))
+            .and_then(|pass| pass.pipeline(format).map(|pipeline| (pass, pipeline)));
+        let (chain, show) = match drawn {
+            Some(_) if client != size => (client, Show::Drawn(fit(size, client)?)),
+            _ => (size, Show::Copy),
+        };
+        // What the run shows, for the log: the letters, or the stretch.
+        let shown = match show {
+            Show::Drawn(_) => {
+                "the frame is drawn into the largest part of the client area with its own shape: bars at the \
+                 sides or the top and bottom"
+            }
+            Show::Copy if chain == client => "the frame and the client area are one size: the present copies it",
+            Show::Copy => {
+                "DXGI stretches the frame's own size over the client area: a window of another shape distorts it"
+            }
+        };
+        if (p.size, p.format) != (chain, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, chain.0, chain.1, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.size, p.format) = (chain, format);
+                    tracing::info!(
+                        client_width = client.0,
+                        client_height = client.1,
+                        swap_chain_width = chain.0,
+                        swap_chain_height = chain.1,
+                        frame_width = size.0,
+                        frame_height = size.1,
+                        shown,
+                        "the swap chain sized to the window's client area, and what the present shows"
+                    );
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(
+                        error = %e,
+                        client_width = client.0,
+                        client_height = client.1,
+                        "swap chain not resized"
+                    );
                     return None;
                 }
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        // A draw reads the frame as a pixel shader resource; a copy wants it as
+        // a copy source.
+        let (source, target) = match show {
+            Show::Copy => (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            Show::Drawn(_) => (
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ),
+        };
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -6331,31 +6841,50 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+            move_to(list, texture, state, source);
+            list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)]);
+            match (show, drawn) {
+                (Show::Drawn(rect), Some((pass, pipeline))) => record_present_pass(
+                    self,
+                    list,
+                    pass,
+                    &pipeline,
+                    PresentDraw {
+                        frame: texture,
+                        back: &back,
+                        format,
+                        rect,
+                    },
                 ),
-            ]);
-            list.CopyResource(&back, texture);
+                // SAFETY: a source texture and a back buffer of one size.
+                _ => list.CopyResource(&back, texture),
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    // A copy wants the frame as a copy source; the pass reads it
+                    // as a pixel shader resource.
+                    move_to(list, texture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    let read = crate::capture::read_back(&self.device, list, texture);
+                    move_to(list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
+                    read
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() {
+                None
+            } else {
+                // As the capture: a copy wants the frame as a copy source.
+                move_to(list, texture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                let probe = crate::capture::probe(&self.device, list, texture);
+                move_to(list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
+                probe
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            move_to(list, texture, source, state);
+            // SAFETY: a live back buffer of the swap chain.
+            list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -6379,30 +6908,31 @@ impl Host {
 
     fn presenter(
         &self,
-        width: u32,
-        height: u32,
+        frame: (u32, u32),
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(frame.0, frame.1)?,
         };
-        // The swap chain's buffers are the size of the frame the title hands
-        // us, whatever the window is: one `CopyResource` puts it in a back
-        // buffer, and D3D12 copies at one size only — there is no scaled
-        // copy. So the scale into the window is the host GPU's, at present.
-        // A console title sizes its window to its render target (4K), and
-        // that window is fitted to the screen when it does not fit, so the
-        // two sizes differ on most screens.
-        // shortcut: a swap chain of the window's size would cut the present's
-        // copy to a quarter (4K into a 2K window) and let a shader of ours
-        // filter the scale; it needs a fullscreen pipeline this path has none
-        // of, so DXGI stretches each present into the window. A window of
-        // another shape therefore distorts the picture until that pass exists:
-        // for a Win32 flip chain the aspect-ratio scaling mode is documented as
-        // behaving like a plain stretch, so asking for it would not letterbox.
-        let client = client_size(hwnd);
-        let same = client.is_some_and(|c| same_shape(c, (width, height)));
+        // The window's client area is the one source of truth for the size the
+        // console presents at: the swap chain's buffers are its size. DXGI scales
+        // a flip chain's back buffer over the whole client area, and its
+        // aspect-ratio scaling mode is documented as behaving like a plain
+        // stretch for a Win32 flip chain, so a back buffer of the frame's own
+        // size (a console title renders its own resolution setting, not the
+        // window) would distort the picture in a window of another shape. The
+        // frame is drawn into the client area's buffers instead, letterboxed
+        // ([`fit`]); a D3D12 copy cannot scale, so that takes the present pass.
+        //
+        // shortcut: when the host will not make the pass (no shader compiler, a
+        // frame whose texture refuses shader reads), the back buffers are the
+        // frame's size and DXGI stretches each present into the window: the
+        // picture is distorted in a window of another shape, as it was before the
+        // pass existed.
+        let client = client_size(hwnd).unwrap_or(frame);
+        let pass = present_pass().filter(|pass| pass.pipeline(format).is_some());
+        let (width, height) = if pass.is_some() { client } else { frame };
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6430,31 +6960,29 @@ impl Host {
             let swap_chain = made.cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
-            if let Some((window_width, window_height)) = client
-                .filter(|&(w, h)| (w, h) != (width, height))
-            {
-                tracing::info!(
-                    width,
-                    height,
-                    window_width,
-                    window_height,
-                    scaled = if same {
-                        "the window has the frame's shape"
-                    } else {
-                        "the window has another shape: distorted until a scale pass of our own exists"
-                    },
-                    "the window is another size than the frame: the host GPU stretches each present into it (the title \
-                     renders its own resolution setting, not the window, and ignores the display mode we report)"
-                );
-            }
+            tracing::info!(
+                client_width = client.0,
+                client_height = client.1,
+                swap_chain_width = width,
+                swap_chain_height = height,
+                frame_width = frame.0,
+                frame_height = frame.1,
+                format = format.0,
+                shown = if pass.is_some() {
+                    "the frame is drawn into the largest part of that area with its own shape: bars at the sides or \
+                     the top and bottom (the title renders its own resolution setting, not the window)"
+                } else {
+                    "DXGI stretches the frame's own size over that area: a window of another shape distorts it"
+                },
+                "presenting to the window's client area, the size of the swap chain"
+            );
             Ok(Presenter {
                 swap_chain,
-                width,
-                height,
+                size: (width, height),
                 format,
                 copy,
                 ahead: Vec::new(),
+                pass,
                 hwnd,
                 meter: Meter::new(),
             })
@@ -6462,8 +6990,8 @@ impl Host {
     }
 }
 
-/// A window's client area: the outside of the swap chain's buffers is the
-/// window, and what DXGI scales them into.
+/// A window's client area: the size the swap chain's buffers are, and what DXGI
+/// scales them into.
 fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
     let mut rect = RECT::default();
     // SAFETY: a window handle, and a rectangle that receives its client area.
@@ -6472,31 +7000,133 @@ fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
     (w > 0 && h > 0).then_some((w as u32, h as u32))
 }
 
-/// Whether two sizes have the same shape near enough that scaling between them
-/// neither distorts the picture nor bars it: within a half percent, which is
-/// less than a pixel of bar at any window size that matters.
-fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
-    let (left, right) = (
-        u64::from(a.0) * u64::from(b.1),
-        u64::from(a.1) * u64::from(b.0),
-    );
-    left.abs_diff(right) * 200 <= left.max(right)
+/// Records `texture`'s move from `before` to `after` in `list`, unless it is
+/// already there: a barrier that changes nothing is a debug-layer message and
+/// no more.
+fn move_to(
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    if before.0 == after.0 {
+        return;
+    }
+    // SAFETY: an open list and a live resource.
+    unsafe { list.ResourceBarrier(&[transition(texture, before, after)]) };
 }
 
 #[cfg(test)]
 mod present_tests {
-    use super::same_shape;
+    use super::{Fit, fit};
 
-    /// One shape, whichever way round the sizes are given; a window of another
-    /// shape is not.
+    /// The pass must write every colour channel: a `Default` blend description
+    /// writes none, which turns the window black with no error to read.
     #[test]
-    fn shapes_match_within_half_a_percent() {
-        assert!(same_shape((3840, 2160), (3840, 2160)));
-        assert!(same_shape((1994, 1122), (3840, 2160)));
-        assert!(same_shape((2560, 1600), (1920, 1200)));
-        assert!(!same_shape((1024, 768), (3840, 2160)));
-        assert!(!same_shape((3440, 1440), (3840, 2160)));
-        assert!(!same_shape((1995, 1080), (3840, 2160)));
+    fn the_present_pass_writes_every_colour_channel() {
+        let (blend, _) = super::present_states();
+        for (target, described) in blend.RenderTarget.iter().enumerate() {
+            assert_eq!(
+                described.RenderTargetWriteMask,
+                super::D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                "render target {target} writes no colour"
+            );
+        }
+    }
+
+    /// The frame keeps its shape in the client area, scaled by the smaller of
+    /// the two ratios and centred: bars at the sides, or at the top and bottom.
+    #[test]
+    fn the_frame_keeps_its_shape_in_the_client_area() {
+        // 4K into a 16:9 client area: the whole of it, no bars.
+        assert_eq!(
+            fit((3840, 2160), (1920, 1080)),
+            Some(Fit {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            })
+        );
+        // 4K into a larger 16:9 one: still the whole of it.
+        assert_eq!(
+            fit((3840, 2160), (3840, 2160)),
+            Some(Fit {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160
+            })
+        );
+        // A 21:9 window (3440x1440): bars at the sides, 440 pixels each, and the
+        // frame's height fills the window's.
+        assert_eq!(
+            fit((3840, 2160), (3440, 1440)),
+            Some(Fit {
+                x: 440,
+                y: 0,
+                width: 2560,
+                height: 1440
+            })
+        );
+        // A window taller than it is wide (1080x1920): bars at the top and
+        // bottom, 656 pixels each, and the frame's width fills the window's.
+        assert_eq!(
+            fit((3840, 2160), (1080, 1920)),
+            Some(Fit {
+                x: 0,
+                y: 656,
+                width: 1080,
+                height: 607
+            })
+        );
+        // The measured run: a 3840x2160 frame in the 1978x1083 client area the
+        // title's own window was fitted to, 26 pixels of bar each side.
+        assert_eq!(
+            fit((3840, 2160), (1978, 1083)),
+            Some(Fit {
+                x: 26,
+                y: 0,
+                width: 1925,
+                height: 1083
+            })
+        );
+    }
+
+    /// A window with no client area (minimised) has nowhere to put the frame, and
+    /// a frame with no size is nothing to put: no rectangle, so no swap chain of
+    /// a size of zero.
+    #[test]
+    fn a_size_of_zero_has_no_place() {
+        assert_eq!(fit((3840, 2160), (0, 0)), None);
+        assert_eq!(fit((3840, 2160), (0, 1080)), None);
+        assert_eq!(fit((3840, 2160), (1920, 0)), None);
+        assert_eq!(fit((0, 0), (1920, 1080)), None);
+        assert_eq!(fit((3840, 0), (1920, 1080)), None);
+    }
+
+    /// Whatever the two sizes, the rectangle stays inside the client area and
+    /// keeps the frame's shape to within a pixel of rounding.
+    #[test]
+    fn the_rectangle_fits_the_client_area_at_the_frames_shape() {
+        for client in [(640, 480), (1366, 768), (2560, 1080), (800, 1280), (7, 900)] {
+            let Some(rect) = fit((3840, 2160), client) else {
+                panic!("no place for the frame in {client:?}");
+            };
+            assert!(rect.width >= 1 && rect.height >= 1, "{client:?}: {rect:?}");
+            assert!(rect.x + rect.width <= client.0, "{client:?}: {rect:?}");
+            assert!(rect.y + rect.height <= client.1, "{client:?}: {rect:?}");
+            // The picture's shape: the two cross products differ by less than a
+            // pixel's worth of the longer side.
+            let (left, right) = (
+                u64::from(rect.width) * 2160,
+                u64::from(rect.height) * 3840,
+            );
+            assert!(
+                left.abs_diff(right) <= 3840,
+                "{client:?}: {rect:?} is not 16:9"
+            );
+        }
     }
 }
 

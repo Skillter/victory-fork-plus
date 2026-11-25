@@ -371,6 +371,26 @@ const PIPELINE_STATE_IID: Iid = guid(
 /// Bytes the dump shows behind each argument.
 const DUMP_BYTES: usize = 256;
 
+/// Words of the description the probe reads: 256 bytes, twice the 128 the
+/// first dumps covered, because the 16,384th `0x1c8` call keeps words 13 to
+/// 15 nonzero where the others have zeros, and no record yet says where the
+/// description ends.
+const PROBE_WORDS: usize = 32;
+
+/// Bytes shown of each block a description's pointer word names: a
+/// container's magic and its first header.
+const PROBE_BYTES: usize = 64;
+
+/// Pointer words followed per call, so a description of 32 pointers costs
+/// six blocks instead of thirty-two.
+const PROBE_TARGETS: usize = 6;
+
+/// Above this a word is not an address of this process: the title's own
+/// memory (`0x19d…`), its heap (`0xd04…`) and the image (`0x7ff6…`) lie
+/// below it, and the tagged words a description also holds (`0x8004…`,
+/// `0x9001…`) above it.
+const POINTER_TOP: u64 = 0x0000_8000_0000_0000;
+
 /// Where [`dump_call`]'s text goes: `VICTORY_PIPELINE_DUMP=<file>` in any
 /// build (appended, so both slots and later runs stay in one file), the log
 /// in a `diagnostics` build, nowhere in a release one.
@@ -460,43 +480,174 @@ fn dump_argument(
     text
 }
 
-/// Where the two description sizes appear in the first 128 bytes at `at`: a
-/// word equal to 0x2b0 says the console's graphics description sits where the
-/// PC one keeps its size, 0x60 the compute one.
-fn layout_hint(at: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> String {
-    let mut bytes = [0u8; 128];
-    let mut whole = true;
-    for (line, chunk) in bytes.chunks_mut(16).enumerate() {
-        whole &= read(at + line * 16, chunk);
-    }
-    let words = |size: u64| -> Vec<usize> {
-        bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| u64::from_le_bytes(*c))
-            .enumerate()
-            .filter(|&(_, word)| word == size)
-            .map(|(word, _)| word)
-            .collect()
-    };
-    let graphics = words(GRAPHICS_DESCRIPTION);
-    let compute = words(COMPUTE_DESCRIPTION);
-    format!(
-        "      sizes: 0x2b0 graphics at {graphics:x?}, 0x60 compute at {compute:x?}{}\n",
-        if whole { "" } else { " (partial read)" }
-    )
+/// The 64-bit little-endian words of `bytes`, a remainder dropped.
+fn words_of(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect()
 }
 
-/// Every argument of one call, [`DUMP_BYTES`] behind each, and where the two
-/// documented description sizes appear. The first call of each slot dumps
-/// once, so 18,432 calls cost two dumps.
+/// Whether `word` can be an address of this process: above every size a
+/// description holds ([`SMALL`]) and below [`POINTER_TOP`].
+fn address(word: u64) -> bool {
+    word > SMALL && word < POINTER_TOP
+}
+
+/// The indexes of the words of `bytes` equal to `size`: a description that
+/// keeps its own size keeps it in one of them.
+fn size_words(bytes: &[u8], size: u64) -> Vec<usize> {
+    words_of(bytes)
+        .iter()
+        .enumerate()
+        .filter(|&(_, word)| *word == size)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// `bytes` as text: printable bytes as they are, every other byte a `.`,
+/// stopped after `max` characters and marked `~` where it stopped.
+fn ascii(bytes: &[u8], max: usize) -> String {
+    let mut text: String = bytes
+        .iter()
+        .take(max)
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                char::from(b)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    if bytes.len() > max {
+        text.push('~');
+    }
+    text
+}
+
+/// What the first bytes of a block are, where a magic says it and text
+/// otherwise. The log line [`probe`] writes for each followed pointer says
+/// whether the pair it sits in is a shader container, a root signature, a
+/// console description, or none of these.
+fn classify(bytes: &[u8]) -> &'static str {
+    const MAGIC: [(&[u8], &str); 4] = [
+        (b"DXBC", "a DXBC container"),
+        (b"DXIL", "DXIL"),
+        (b"RTS0", "a serialised root signature"),
+        (b"\x1b[", "this process's own log text"),
+    ];
+    if let Some((_, what)) = MAGIC.iter().find(|(magic, _)| bytes.starts_with(magic)) {
+        return what;
+    }
+    let head = &bytes[..bytes.len().min(32)];
+    if head.is_empty() {
+        return "nothing";
+    }
+    let printable = head.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+    if printable * 4 >= head.len() * 3 {
+        "text"
+    } else {
+        "words"
+    }
+}
+
+/// Everything one description says, for the log: its 256 bytes as hex and
+/// text, the words that read as a size, where the two known description
+/// sizes appear, and each block its pointer words name with what that
+/// block's first bytes are.
 ///
-/// The mismatch the dump decides: `desc[0]` points at text (a capture decoded
-/// the block as `"2026-11-25 01:17:05Z"`), which no description starts with,
-/// so either the arguments are in another order than `(this, desc, iid, out)`
-/// or the description starts at a later word; the `iid` text and the size
-/// words say which.
+/// The last is what the earlier dump got backwards: it followed the words
+/// that read as a size (`0x1c`, `0x14`) as if they were addresses, which no
+/// size ever is, so `pointed` was always empty and the bytes behind the
+/// description's real pointers were never seen.
+fn probe(at: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> String {
+    let mut text = format!(
+        "      description: {} words ({} bytes) at {at:#018x}\n",
+        PROBE_WORDS,
+        PROBE_WORDS * 8
+    );
+    let mut bytes = [0u8; PROBE_WORDS * 8];
+    let mut unreadable = 0;
+    for (line, chunk) in bytes.chunks_mut(16).enumerate() {
+        if read(at + line * 16, chunk) {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(
+                "      +{:#05x} | {} | {}\n",
+                line * 16,
+                hex.join(" "),
+                ascii(chunk, 16)
+            );
+        } else {
+            unreadable += 1;
+            text += &format!("      +{:#05x} | ?? | unreadable\n", line * 16);
+        }
+    }
+    let words = words_of(&bytes);
+    let sizes: Vec<(usize, u64)> = words
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, word)| word != 0 && word <= SMALL)
+        .collect();
+    text += &format!(
+        "      sizes: 0x2b0 graphics at {:x?}, 0x60 compute at {:x?}\n",
+        size_words(&bytes, GRAPHICS_DESCRIPTION),
+        size_words(&bytes, COMPUTE_DESCRIPTION)
+    );
+    text += &format!("      words that read as a size: {sizes:x?}\n");
+    let mut followed: Vec<u64> = Vec::new();
+    for (index, &word) in words.iter().enumerate() {
+        if !address(word) || followed.contains(&word) {
+            continue;
+        }
+        if followed.len() == PROBE_TARGETS {
+            break;
+        }
+        followed.push(word);
+        let mut block = [0u8; PROBE_BYTES];
+        let mut shown = 0;
+        for (line, chunk) in block.chunks_mut(16).enumerate() {
+            if !read(word as usize + line * 16, chunk) {
+                break;
+            }
+            shown += 16;
+        }
+        text += &format!(
+            "      [w{index}] {word:#018x}: first {PROBE_BYTES} bytes are {}\n",
+            classify(&block[..shown])
+        );
+        for (line, chunk) in block[..shown].chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(
+                "      +{:#05x} | {} | {}\n",
+                line * 16,
+                hex.join(" "),
+                ascii(chunk, 16)
+            );
+        }
+        if shown == 0 {
+            text += "      (not readable)\n";
+        }
+    }
+    if unreadable > 0 {
+        text += &format!(
+            "      {unreadable} of {} lines of the description unreadable\n",
+            PROBE_WORDS * 8 / 16
+        );
+    }
+    text
+}
+
+/// Every argument of one call, [`DUMP_BYTES`] behind each, then [`probe`] of
+/// the description. The first call of each slot dumps once, so 18,432 calls
+/// cost two dumps.
+///
+/// The mismatch the dump settles: the description's first word points at a
+/// block that decodes as this process's own log text, so the record is not a
+/// description we know — the `iid` text, the size words and what each
+/// followed block's first bytes are say what it is instead.
 fn dump_call(slot: usize, this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> String {
     let mut text = format!("slot {slot:#x}: 4 arguments (this, desc, iid, out)\n");
     #[cfg(windows)]
@@ -523,15 +674,7 @@ fn dump_call(slot: usize, this: This, desc: *const u8, iid: *const Iid, out: *mu
     }
     text += &format!("      desc is {:#018x}:\n", desc as usize);
     if !desc.is_null() {
-        text += &layout_hint(desc as usize, &mut read);
-        let mut first = [0u8; 8];
-        if read(desc as usize, &mut first) {
-            let at = usize::try_from(u64::from_le_bytes(first)).unwrap_or(0);
-            if at != 0 {
-                text += &format!("      desc[0] = {at:#018x}:\n");
-                text += &layout_hint(at, &mut read);
-            }
-        }
+        text += &probe(desc as usize, &mut read);
     }
     text
 }
@@ -540,19 +683,45 @@ fn dump_call(slot: usize, this: This, desc: *const u8, iid: *const Iid, out: *mu
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently.
+/// pipeline, silently. 16,384 and 2,048 calls: the load burst.
 ///
-/// The layout of neither description is established: 128 bytes whose first
-/// word points at another 128 is neither the PC graphics description
-/// (0x2b0, shaders inline) nor the compute one (0x60), and no call so far
-/// says which word is the root signature, which is a stage and which a
-/// size. So both still fail, with `out` null; the first calls log what
-/// writing them needs: the words in hex, every word that reads as a small
-/// size, and the block it points at, which tells a byte count from a small
-/// pointer (a size beside a pointer is what a shader stage looks like).
-/// [`dump_call`] adds the raw bytes of every argument once per slot, and
-/// where the two known sizes appear, because 18,432 pipelines are lost here
-/// and the argument we assume is a description starts with text.
+/// **What the dumps establish** (argument index 1 is the record;
+/// `run-20261125-022502.log` and `run-named-fun-snail.log`, 33 logged
+/// records, every one read without a fault):
+///
+/// - It is at least 128 bytes, and neither description we translate: no word
+///   equals 0x2b0 (PC graphics, shaders inline) or 0x60 (console compute) in
+///   any record, so it is not the description of a slot we already implement
+///   under another number.
+/// - `0x1c8`, 12 of 16 records: word 0 an address, then six (address, size)
+///   pairs at [1,2] [3,4] [5,6] [7,8] [9,10] [11,12], then three zeros.
+///   Sizes 0x30 to 0x4a40. The 16,384th record differs: two pairs at
+///   [1,2] [3,4], four zeros, then a pair at [13,14] and a word at [15],
+///   which is why the probe reads 256 bytes now.
+/// - `0x218`, every record: [0] address, [1,2] (address, 0x1c), [3,4]
+///   (address, 0x14), [5,6] and [7,8] (address, size), [9,10] two
+///   addresses, [11] a 64-bit value that changes every call, [12] zero or an
+///   address, [13,14] (address, 0x1c), [15] an address. The [5,6] size
+///   grows 0x180 → 0x1f080 with the load.
+/// - Word 0 is not a description pointer. Its 128 bytes decode as
+///   `ESC[2m2026-11-25T01:17:05.605447Z` (0x218, first call of
+///   `run-named-fun-snail.log`, words 5..8: 363230326d325b1b
+///   305435322d31312d 2e35303a37313a31 5a373434353036) and, in the other
+///   run, as DXIL metadata names (`alias.scope`, `nontemporal`). An
+///   ANSI-coloured log line is this process's own, so at least that read
+///   lands in our recycled heap and the record's first word is not a live
+///   description pointer.
+/// - Nothing names a root signature or a stage: a (address, size) pair
+///   without a type word says neither what the bytes are nor which stage
+///   they belong to, so there is nothing to build a host pipeline from.
+///
+/// So both still fail, with `out` null, and a run logs [`probe`]: the
+/// description's hex and text, each block its pointer words name with what
+/// that block's first bytes are (a DXBC container, a root signature, a
+/// console description, or words), and the words that read as a size.
+/// What a next run must show to implement either: a block whose first bytes
+/// are `DXBC` (bytecode) or `RTS0` (root signature), at which point the
+/// pair it sits in is that subobject and the stage order is the one left.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -568,6 +737,15 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    if desc.is_null() {
+        // As every creation method here answers a description it cannot read.
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    let read =
+        |at: usize, bytes: &mut [u8]| at != 0 && crate::host::read_into(at as *const u8, bytes);
+    #[cfg(not(windows))]
+    let read = |_: usize, _: &mut [u8]| false;
     if calls == 1 {
         let dump = dump_call(SLOT, this, desc, iid, out);
         match dump_destination() {
@@ -594,49 +772,25 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         }
     }
     if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
-            })
-        };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
-        // A word that reads as a small size — a byte count, a count of
-        // words, a stage mask — is the only thing in a block of unknown
-        // words that says what the rest is, and the block it points at says
-        // whether it is a size of that block or a small pointer. Each one
-        // is followed.
-        let small: Vec<(usize, u64)> = description
+        let mut bytes = [0u8; PROBE_WORDS * 8];
+        let mut whole = true;
+        for (line, chunk) in bytes.chunks_mut(64).enumerate() {
+            whole &= read(desc as usize + line * 64, chunk);
+        }
+        let words = words_of(&bytes);
+        let sizes: Vec<(usize, u64)> = words
             .iter()
-            .flatten()
             .copied()
             .enumerate()
             .filter(|&(_, word)| word != 0 && word <= SMALL)
             .collect();
-        let pointed: Vec<String> = small
-            .iter()
-            .filter_map(|&(at, word)| {
-                words(word as usize).map(|block| format!("[{at}] {word:#x} -> {block:x?}"))
-            })
-            .collect();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            small = format_args!("{small:x?}"),
-            pointed = format_args!("{pointed:?}"),
+            whole,
+            words = format_args!("{words:x?}"),
+            sizes = format_args!("{sizes:x?}"),
+            text = %ascii(&bytes, 64),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
@@ -871,29 +1025,187 @@ mod tests {
         );
     }
 
-    /// The layout line names the offsets of the two documented sizes, in the
-    /// description and in the block its first word points at, so a shifted
-    /// description or a wrong argument shows up without a hex search.
+    /// The records the two slots were logged with, word for word, so the
+    /// shape the probe has to read is the shape the dump actually showed.
+    const RECORD_0X1C8: [u64; 16] = [
+        0x0000_0197_dbea_f430,
+        0x0000_000d_04f6_9758,
+        0x184,
+        0x0000_000d_04f6_98dc,
+        0xbc,
+        0x0000_000d_494b_3400,
+        0x1c0,
+        0x0000_000d_04f6_9998,
+        0xd0,
+        0x0000_000d_494b_3600,
+        0x180,
+        0x0000_000d_04f6_9a68,
+        0x2f0,
+        0,
+        0,
+        0,
+    ];
+    const RECORD_0X218: [u64; 16] = [
+        0x0000_0197_dbea_f8e0,
+        0x0000_000d_04d4_a550,
+        0x1c,
+        0x0000_000d_04d4_a56c,
+        0x14,
+        0x0000_000d_4942_0700,
+        0x2c0,
+        0x0000_000d_04d4_a580,
+        0x1d8,
+        0x0000_000d_03fb_5540,
+        0x0000_000d_03fb_47c0,
+        0x6c39_48d3_f99e_6117,
+        0,
+        0x0000_000d_04d4_a0f0,
+        0x1c,
+        0x0000_000d_04d4_a758,
+    ];
+
+    fn bytes_of(words: &[u64]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The 0x1c8 record is an address then six (address, size) pairs; the
+    /// 0x218 one repeats (address, 0x1c) and (address, 0x14) around two
+    /// growing sizes and a value that changes every call.
     #[test]
-    fn the_layout_hint_names_the_size_words() {
-        let mut block = [0u8; 128];
-        block[3 * 8..4 * 8].copy_from_slice(&GRAPHICS_DESCRIPTION.to_le_bytes());
-        block[5 * 8..6 * 8].copy_from_slice(&COMPUTE_DESCRIPTION.to_le_bytes());
+    fn the_logged_records_are_address_and_size_pairs() {
+        let bytes = bytes_of(&RECORD_0X1C8);
+        let words = words_of(&bytes);
+        let sizes: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|&(_, word)| *word != 0 && *word <= SMALL)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(sizes, vec![2, 4, 6, 8, 10, 12]);
+        assert_eq!(words[2], 0x184);
+        assert_eq!(words[12], 0x2f0);
+        // Every word before the sizes is an address, so that no pair is
+        // (size, size).
+        assert!((1..12).step_by(2).all(|index| address(words[index])));
+        let bytes = bytes_of(&RECORD_0X218);
+        let words = words_of(&bytes);
+        let sizes: Vec<(usize, u64)> = words
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, word)| word != 0 && word <= SMALL)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![(2, 0x1c), (4, 0x14), (6, 0x2c0), (8, 0x1d8), (14, 0x1c)]
+        );
+        // [9] and [10] are two addresses, [11] a value that is neither size
+        // nor address: the tagged word the record also holds.
+        assert!(address(words[9]) && address(words[10]));
+        assert!(!address(words[11]) && words[11] > SMALL);
+    }
+
+    /// Neither record names a description we translate, which is why the two
+    /// slots still refuse instead of building a pipeline from a guess.
+    #[test]
+    fn neither_record_names_a_description_we_handle() {
+        for record in [RECORD_0X1C8, RECORD_0X218] {
+            let bytes = bytes_of(&record);
+            assert!(size_words(&bytes, GRAPHICS_DESCRIPTION).is_empty());
+            assert!(size_words(&bytes, COMPUTE_DESCRIPTION).is_empty());
+        }
+    }
+
+    /// The timestamp that made the first dump useless, as the record logged
+    /// it: `ESC[2m2026-11-25T01:17:05.605447Z`, which no console description
+    /// holds, so that read landed in this process's own heap.
+    #[test]
+    fn a_block_holding_a_log_timestamp_is_this_processes_own_text() {
+        let words: Vec<u64> = vec![
+            0x3632_3032_6d32_5b1b,
+            0x3054_3532_2d31_312d,
+            0x2e35_303a_3731_3a31,
+            0x005a_3734_3435_3036,
+        ];
+        let bytes = bytes_of(&words);
+        let text = ascii(&bytes, 64);
+        assert!(text.contains("2026-11-25T01:17:05"), "{text}");
+        assert_eq!(classify(&bytes), "this process's own log text");
+    }
+
+    /// What a block's first bytes are, as the probe names it for the log.
+    #[test]
+    fn a_blocks_first_bytes_name_what_it_is() {
+        assert_eq!(classify(b"DXBC\x00\x01\x02\x03"), "a DXBC container");
+        assert_eq!(classify(b"RTS0rest"), "a serialised root signature");
+        assert_eq!(classify(b"DXIL"), "DXIL");
+        assert_eq!(classify(b"nontemporal\0alias.scope"), "text");
+        assert_eq!(classify(b"\x00\x01\x02\x03\x04\x05\x06\x07"), "words");
+        assert_eq!(classify(b""), "nothing");
+    }
+
+    /// A pointer word is followed and its block classified; a word that
+    /// reads as a size is not followed, because no size is an address. The
+    /// earlier dump followed the sizes and so never saw a block at all.
+    #[test]
+    fn addresses_are_followed_and_sizes_are_not() {
+        const BASE: usize = 0x2_0000_0000;
+        let mut memory = vec![0u8; 0x3000];
+        memory[0x1000..0x1008].copy_from_slice(&(BASE as u64 + 0x2000).to_le_bytes());
+        memory[0x1010..0x1018].copy_from_slice(&0x1cu64.to_le_bytes());
+        memory[0x2000..0x2004].copy_from_slice(b"DXBC");
+        let mut read_at: Vec<usize> = Vec::new();
         let mut read = |at: usize, bytes: &mut [u8]| {
-            let offset = at - 0x2000;
+            read_at.push(at);
             let len = bytes.len();
-            bytes.copy_from_slice(&block[offset..offset + len]);
-            true
+            memory
+                .get(at - BASE..at - BASE + len)
+                .map(|slice| bytes.copy_from_slice(slice))
+                .is_some()
         };
-        let hint = layout_hint(0x2000, &mut read);
-        assert!(hint.contains("0x2b0 graphics at [3]"), "{hint}");
-        assert!(hint.contains("0x60 compute at [5]"), "{hint}");
-        assert!(!hint.contains("partial"), "{hint}");
-        // A block that cannot be read says so instead of naming offsets.
+        let text = probe(BASE + 0x1000, &mut read);
+        assert!(
+            text.contains("[w0] 0x0000000200002000: first 64 bytes are a DXBC container"),
+            "{text}"
+        );
+        assert!(!text.contains("[w2]"), "{text}");
+        assert!(!read_at.contains(&0x1c), "{read_at:x?}");
+        assert!(
+            text.contains("sizes: 0x2b0 graphics at [], 0x60 compute at []"),
+            "{text}"
+        );
+        assert!(
+            text.contains("words that read as a size: [(2, 1c)]"),
+            "{text}"
+        );
+    }
+
+    /// A description that cannot be read says so and follows nothing.
+    #[test]
+    fn an_unreadable_description_says_so() {
         let mut none = |_: usize, _: &mut [u8]| false;
-        let hint = layout_hint(0x2000, &mut none);
-        assert!(hint.contains("graphics at []"), "{hint}");
-        assert!(hint.contains("(partial read)"), "{hint}");
+        let text = probe(0x2000, &mut none);
+        assert!(
+            text.contains("16 of 16 lines of the description unreadable"),
+            "{text}"
+        );
+        assert!(text.contains("sizes: 0x2b0 graphics at []"), "{text}");
+        assert!(!text.contains("[w"), "{text}");
+    }
+
+    /// A null description is refused the way every other creation method
+    /// here refuses one, and `out` is nulled first.
+    #[test]
+    fn a_null_description_is_invalid_argument() {
+        let mut out: This = 0x1 as This;
+        let hr = unknown_pipeline::<0x1c8>(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &raw mut out,
+        );
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(out.is_null());
     }
 
     /// A dump inside the tree would fail the asset policy; a folder outside

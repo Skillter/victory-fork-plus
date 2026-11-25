@@ -310,12 +310,17 @@ pub fn wait_for_previous() {
 /// never be written at all.
 fn summary(how: &str) {
     let secs = started().map_or(0.0, |start| start.elapsed().as_secs_f64());
-    // Frames rendered and the average rate stay out of this line until
-    // `victory-gpu` publishes its frame count: `frame::current` and
-    // `queue::presented` are both `pub(crate)`
-    // (crates/victory-gpu/src/frame.rs:83, crates/victory-gpu/src/queue.rs:749),
-    // and the per-window counters of `host::Stats` are private too.
-    tracing::info!("run summary: {how}; the title ran {secs:.1} s");
+    // Read straight from the queue: this crate already depends on
+    // `victory-gpu`, and the counter is a relaxed load of a static.
+    let frames = victory_gpu::queue::presented();
+    if frames > 0 && secs > 0.0 {
+        let fps = frames as f64 / secs;
+        tracing::info!(
+            "run summary: {how}; the title ran {secs:.1} s, {frames} frames ({fps:.1} fps)"
+        );
+    } else {
+        tracing::info!("run summary: {how}; the title ran {secs:.1} s");
+    }
 }
 
 fn end(how: &str) {

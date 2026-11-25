@@ -500,13 +500,101 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
-pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
+pub(crate) fn name(kind: &'static str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
-    h.finalize().to_hex()[..32].to_owned()
+    let name = h.finalize().to_hex()[..32].to_owned();
+    // The census below reads this as one pipeline, with this root block.
+    CENSUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Census::default)
+        .add(kind, root, &name);
+    name
+}
+
+/// One session's pipelines: their names, the root signatures they were made
+/// with, and their stage classes. One root signature per binding shape
+/// (`crate::pipeline::host::root_signature`) is what keeps this small; a
+/// library that stores far more per pipeline than the shape it holds is
+/// where a per-PSO cached blob would be measured next.
+#[derive(Default)]
+struct Census {
+    /// One name is one pipeline, however often the run names it.
+    names: HashSet<String>,
+    signatures: HashSet<blake3::Hash>,
+    classes: std::collections::BTreeMap<&'static str, u64>,
+    /// Names that found their root signature in the set already.
+    shared: u64,
+}
+
+static CENSUS: Mutex<Option<Census>> = Mutex::new(None);
+
+impl Census {
+    fn add(&mut self, kind: &'static str, root: &[u8], name: &str) {
+        if !self.names.insert(name.to_owned()) {
+            return;
+        }
+        *self.classes.entry(kind).or_default() += 1;
+        if !self.signatures.insert(blake3::hash(root)) {
+            self.shared += 1;
+        }
+    }
+
+    /// Pipelines, distinct root signatures, names that shared one, and the
+    /// bytes a pipeline takes in a library of `library` bytes when `handled`
+    /// pipelines (made or loaded this run) are what it holds.
+    fn counts(&self, library: u64, handled: u64) -> (u64, u64, u64, u64) {
+        let per_pipeline = library.checked_div(handled).unwrap_or(0);
+        (self.names.len() as u64, self.signatures.len() as u64, self.shared, per_pipeline)
+    }
+
+    fn classes(&self) -> String {
+        self.classes
+            .iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The census, once per session, at the first save that knows the library's
+/// size: distinct root signatures against distinct pipelines and stage
+/// classes, what the root-signature cache reused and created, and the bytes
+/// a pipeline takes in the library's file.
+fn report_census(library: u64) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let (pipelines, signatures, shared, per_pipeline, classes) = {
+        let census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(census) = census.as_ref() else { return };
+        if census.names.is_empty() {
+            return;
+        }
+        let made = MADE.load(Ordering::Relaxed);
+        let loaded = LOADED.load(Ordering::Relaxed);
+        let (pipelines, signatures, shared, per_pipeline) = census.counts(library, made + loaded);
+        (pipelines, signatures, shared, per_pipeline, census.classes())
+    };
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (hits, created) = super::host::root_signature_counts();
+    tracing::info!(
+        pipelines,
+        signatures,
+        shared,
+        created,
+        hits,
+        library,
+        made = MADE.load(Ordering::Relaxed),
+        loaded = LOADED.load(Ordering::Relaxed),
+        bytes_per_pipeline = per_pipeline,
+        classes = %classes,
+        "pipeline census"
+    );
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
@@ -650,7 +738,8 @@ pub(crate) fn save(now: bool) {
                 loaded = LOADED.load(Ordering::Relaxed),
                 started_early = EARLY.load(Ordering::Relaxed),
                 "host pipeline library saved"
-            )
+            );
+            report_census(size as u64);
         }
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
@@ -745,8 +834,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_change_with_what_goes_into_the_pipeline() {
-        let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
+    fn names_change_with_what_goes_into_the_pipeline() {        let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps2"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps"], "state2"));
@@ -754,6 +842,24 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// The census counts one pipeline once, however often it is named, and
+    /// holds the root signature it shares with another pipeline apart from
+    /// the ones only one of them has.
+    #[test]
+    fn the_census_counts_pipelines_signatures_and_classes() {
+        let mut census = Census::default();
+        census.add("compute", b"root A", "one");
+        census.add("compute", b"root A", "two");
+        census.add("graphics", b"root B", "three");
+        census.add("compute", b"root A", "one"); // the same pipeline again
+        let (pipelines, signatures, shared, per_pipeline) = census.counts(600, 3);
+        assert_eq!((pipelines, signatures, shared), (3, 2, 1));
+        assert_eq!(per_pipeline, 200, "600 bytes over the three pipelines made");
+        assert_eq!(census.classes(), "compute 2, graphics 1");
+        // Nothing made: no bytes claimed, and no divide by zero.
+        assert_eq!(census.counts(600, 0).3, 0);
     }
 
     #[test]

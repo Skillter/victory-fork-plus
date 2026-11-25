@@ -127,8 +127,26 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Ranges declared as written by shaders (`Shadow::writing`), the ones
+    /// already declared which took no bytes again, and the bytes they left
+    /// to the first declaration that took them.
+    BackDecl,
+    BackHeld,
+    BackHeldBytes,
+    /// The parts of the declared ranges no declaration held yet (the bytes
+    /// snapshotted), and how many of them were joined into one copy.
+    BackParts,
+    BackJoined,
+    /// Bytes put back into title memory after the card ran
+    /// (`Shadow::copy_back_with`).
+    BackWritten,
+    /// Pages a refresh found already holding what title memory holds, where
+    /// the bytes were ones we put there ourselves (`Shadow::copy_unless_there`);
+    /// and their bytes.
+    BackKept,
+    BackKeptBytes,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 86;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {

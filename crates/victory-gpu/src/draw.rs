@@ -37,6 +37,76 @@ enum Root {
     View(u64),
 }
 
+/// The kind of root view a draw sets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+/// A root argument the list has set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootArg {
+    /// The root signature's address: another signature at it is another host
+    /// signature, as another pipeline at a pipeline's address is another host
+    /// pipeline ([`State::bind`]).
+    signature: usize,
+    kind: RootKind,
+    value: u64,
+}
+
+/// What a list has set at its root parameters ([`State::set_root_arg`]). What
+/// a host list has at a parameter survives every other command on it, so a
+/// draw that repeats a value leaves the call out. The values are what the
+/// title's descriptors resolve to on this draw, so a descriptor the title
+/// rewrote resolves to another value and is set again: the cache never stands
+/// in for reading the title's descriptor.
+#[derive(Default)]
+struct RootArgs {
+    /// By (compute, parameter), ascending: a parameter holds one argument, and
+    /// a root signature has at most 64.
+    set: Vec<(bool, u32, RootArg)>,
+}
+
+impl RootArgs {
+    /// Whether the call must be made: the parameter holds another value, or
+    /// another kind of view, or was set under another root signature.
+    fn again(
+        &mut self,
+        signature: usize,
+        compute: bool,
+        param: u32,
+        kind: RootKind,
+        value: u64,
+    ) -> bool {
+        let arg = RootArg {
+            signature,
+            kind,
+            value,
+        };
+        match self
+            .set
+            .binary_search_by(|(space, at, _)| (*space, *at).cmp(&(compute, param)))
+        {
+            Ok(k) if self.set[k].2 == arg => false,
+            Ok(k) => {
+                self.set[k].2 = arg;
+                true
+            }
+            Err(k) => {
+                self.set.insert(k, (compute, param, arg));
+                true
+            }
+        }
+    }
+
+    /// A host list with nothing set (a cut, [`State::replay`]).
+    fn clear(&mut self) {
+        self.set.clear();
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -297,9 +367,12 @@ pub(crate) struct State {
     scratch_entries: Vec<u32>,
     scratch_selected: Vec<u32>,
     scratch_values: Vec<u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds, as runs of the view heap's ring;
+    /// given back when the list has run, is reset or released.
+    ring: crate::descriptor::host::DynamicList,
+    /// What the list last set at each root argument ([`RootArgs`]): a draw
+    /// that repeats one leaves the call out.
+    root_args: RootArgs,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -313,7 +386,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.ring.drain() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -328,14 +401,14 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.ring.is_empty() {
             return;
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
+        for (heap, first, n) in self.ring.drain() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
@@ -478,6 +551,30 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Slots due at which a pass with a backlog triples its bytes and span
+/// ([`pass_budget`]).
+const CATCHUP_SLOTS: usize = 1024;
+
+/// Bytes and span a pass of [`State::heap_textures`] gets: three times the
+/// plain budget when a backlog is due (`catchup`) **and** the card has room
+/// (`room`). A full card never triples: with no room the pass only spends
+/// the longer span in the refusing loop, three times as long per pass
+/// (250 to 750 ms), while the same head of the queue stays due and nothing
+/// is uploaded.
+fn pass_budget(
+    catchup: bool,
+    room: bool,
+    due: usize,
+    per_frame: u64,
+    span: std::time::Duration,
+) -> (u64, std::time::Duration) {
+    if catchup && room && due >= CATCHUP_SLOTS {
+        (per_frame * 3, span * 3)
+    } else {
+        (per_frame, span)
+    }
+}
 
 /// What a look at a texture it uploaded whole leaves `heap_textures` to do
 /// ([`RECHECK_FRAMES`]): `looks` looks have been made, `print` is the
@@ -801,6 +898,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // The new host list has no root argument set.
+        self.root_args.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1108,6 +1207,9 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            // A root signature switch leaves the root arguments undefined:
+            // every one this draw sets is set again.
+            self.root_args.clear();
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1184,17 +1286,10 @@ impl State {
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
-                        // Ours: the directory of title memory by address.
+                        // Ours: the directory of title memory by address. It
+                        // lives as long as the process and the list holds it.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            self.set_root_arg(list, compute, param, RootKind::Srv, m.directory);
                         }
                         continue;
                     }
@@ -1202,15 +1297,11 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            // The table lives as long as the heap the list
+                            // holds.
+                            Some(gpu) => {
+                                self.set_root_arg(list, compute, param, RootKind::Srv, gpu);
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1249,30 +1340,17 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    // The address is in live memory the list holds.
+                    let kind = if srv { RootKind::Srv } else { RootKind::Cbv };
+                    self.set_root_arg(list, compute, param, kind, gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
-                    // Ours: where shaders note the pages they found empty.
+                    // Ours: where shaders note the pages they found empty;
+                    // the buffer lives as long as the process.
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        self.set_root_arg(list, compute, param, RootKind::Uav, m.faults);
                     }
                     continue;
                 }
@@ -1293,6 +1371,37 @@ impl State {
         list.twins_written();
         self.scratch_made = made;
         true
+    }
+
+    /// Sets a root CBV, SRV or UAV at `param`: a draw that repeats the value
+    /// the list has there leaves the call out, as the pipeline, the root
+    /// signature and the heaps are left out. A cut's new host list has none
+    /// of them ([`State::replay`]), and neither has one under another root
+    /// signature.
+    fn set_root_arg(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        param: u32,
+        kind: RootKind,
+        value: u64,
+    ) {
+        let signature = self.host_roots[usize::from(compute)];
+        if !self.root_args.again(signature, compute, param, kind, value) {
+            return;
+        }
+        // SAFETY: an open list; the value is a GPU address in live memory the
+        // list holds.
+        unsafe {
+            match (compute, kind) {
+                (false, RootKind::Cbv) => list.list.SetGraphicsRootConstantBufferView(param, value),
+                (false, RootKind::Srv) => list.list.SetGraphicsRootShaderResourceView(param, value),
+                (false, RootKind::Uav) => list.list.SetGraphicsRootUnorderedAccessView(param, value),
+                (true, RootKind::Cbv) => list.list.SetComputeRootConstantBufferView(param, value),
+                (true, RootKind::Srv) => list.list.SetComputeRootShaderResourceView(param, value),
+                (true, RootKind::Uav) => list.list.SetComputeRootUnorderedAccessView(param, value),
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1349,14 +1458,8 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            // The address is in a buffer the list holds.
+            self.set_root_arg(list, compute, param, RootKind::Uav, gpu);
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1372,10 +1475,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1443,10 +1545,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -1774,6 +1875,8 @@ impl State {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
         }
         let mut refused = 0u64;
+        let mut reclaimed = 0u64;
+        let mut reclaimed_bytes = 0u64;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1851,7 +1954,7 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = pass_budget(catchup, no_room.is_none(), due.len(), per_frame, span);
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -1957,9 +2060,29 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
+            // From here on a host texture is made: not without room. Before
+            // the slot is left due, a host copy only this slot's idle
+            // descriptor holds is reclaimed: its slot is marked gone, as
+            // when its memory was streamed out (`texture_slot_gone` above),
+            // and the slot waits to be looked at again, so the head of the
+            // queue moves instead of the same slots being refused every
+            // pass. `placed_made` never makes a resource; `slot_only_idle`
+            // asks before anything is unmade.
             if no_room.is_some() {
+                if let Some(View::Placed(false, d14, v16)) = heap.handle(index).and_then(crate::descriptor::view)
+                    && let Some(at) = crate::resource::placed_made(
+                        u64::from(v16[10]) | u64::from(v16[11]) << 32,
+                        &d14,
+                    )
+                    && crate::resource::slot_only_idle(at)
+                    && host.texture_slot_gone(index)
+                    && let Some(bytes) = crate::resource::let_go_for_room(at)
+                {
+                    reclaimed += 1;
+                    reclaimed_bytes += bytes;
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -2055,8 +2178,17 @@ impl State {
         if let Some(why) = no_room {
             static LAST: AtomicU64 = AtomicU64::new(0);
             static REFUSED: AtomicU64 = AtomicU64::new(0);
+            static RECLAIMED: AtomicU64 = AtomicU64::new(0);
+            static RECLAIMED_BYTES: AtomicU64 = AtomicU64::new(0);
             let refused = REFUSED.fetch_add(refused, Ordering::Relaxed) + refused;
+            let reclaimed = RECLAIMED.fetch_add(reclaimed, Ordering::Relaxed) + reclaimed;
+            let reclaimed_bytes =
+                RECLAIMED_BYTES.fetch_add(reclaimed_bytes, Ordering::Relaxed) + reclaimed_bytes;
             let now = crate::host::now_ms();
+            // The first refusal starts the window: without this the first line
+            // says "in the last 188 s" and the rate it prints is a lifetime
+            // average.
+            let _ = LAST.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
             let last = LAST.load(Ordering::Relaxed);
             if now >= last + 5_000
                 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
@@ -2064,11 +2196,38 @@ impl State {
                 REFUSED.store(0, Ordering::Relaxed);
                 tracing::info!(
                     "textures picked by index: no room for more in the last {} s: {refused} slots refused since the last line, \
-                     {} still due; {}",
+                     {reclaimed} reclaimed ({} KiB), {} still due; {}",
                     now.saturating_sub(last).max(1) / 1000,
+                    reclaimed_bytes >> 10,
                     HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
                     why.why()
                 );
+            }
+        }
+        // Protected and probation host copies, once a window: frequency
+        // admission either keeps the world set (protected) or leaves
+        // streaming pages evictable (probation), and the bytes say which
+        // the card is full of.
+        {
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            let last = LAST.load(Ordering::Relaxed);
+            if now >= last + 5_000
+                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let [protected, protected_bytes, probation, probation_bytes] =
+                    crate::resource::admission();
+                if protected + probation > 0 {
+                    tracing::info!(
+                        "textures picked by index: {protected} protected from the sweep ({} MB, sampled again and \
+                         again), {probation} on probation ({} MB, sampled once); {} slots due, {} waiting for \
+                         their memory",
+                        protected_bytes >> 20,
+                        probation_bytes >> 20,
+                        HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
+                        HEAP_TEXTURES_QUEUE[2].load(Ordering::Relaxed),
+                    );
+                }
             }
         }
     }
@@ -2451,7 +2610,7 @@ impl State {
                 made.push((slot, seen * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic_in(&mut self.ring, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -2459,10 +2618,9 @@ impl State {
             };
             // Records other than those these slots were made for: the
             // identity of this table's contents is a new generation, taken
-            // from the one it replaced.
+            // from the one it replaced. The run is the list's ring, given
+            // back whole by `State::tables_done`.
             self.fresh_made(identity, words, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3059,6 +3217,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            // Sampled: counts the hit that admits a texture seen again and
+            // again to the protected set (`crate::resource::note_sampled`).
+            crate::resource::note_sampled(*resource as This);
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -3582,5 +3743,174 @@ mod tests {
             ON.with(|on| on.set(false));
             (done, BLOCKS.with(|blocks| blocks.get()) - before)
         }
+    }
+
+    /// Catch-up tripled a pass's bytes and span whenever a backlog was due,
+    /// even with the card full: the pass then spent three times as long
+    /// (250 to 750 ms) refusing the same slots and uploaded nothing. A full
+    /// card never triples.
+    #[test]
+    fn catch_up_cannot_run_while_the_card_refuses() {
+        use std::time::Duration;
+        let (bytes, span) = (4 << 20, Duration::from_millis(50));
+        assert_eq!(
+            pass_budget(true, true, CATCHUP_SLOTS, bytes, span),
+            (bytes * 3, span * 3),
+            "a backlog with room"
+        );
+        assert_eq!(
+            pass_budget(true, false, CATCHUP_SLOTS, bytes, span),
+            (bytes, span),
+            "no room: the catch-up would only refuse for longer"
+        );
+        assert_eq!(
+            pass_budget(true, true, CATCHUP_SLOTS - 1, bytes, span),
+            (bytes, span),
+            "no backlog"
+        );
+        assert_eq!(
+            pass_budget(false, true, CATCHUP_SLOTS * 8, bytes, span),
+            (bytes, span),
+            "catch-up off"
+        );
+    }
+
+    /// A synthetic slot-due trace: a small persistent set sampled every
+    /// frame and many one-touch streaming pages. Replayed through frequency
+    /// admission ([`crate::resource::admit_step`]) and the sweep's veto
+    /// ([`crate::resource::sweepable`]). The old pass restarted from the
+    /// same head every time (a refused slot left due), so the head never
+    /// moved; the reclaim reschedules the slot it took a copy from
+    /// (`texture_slot_later`), so the head advances through every slot. The
+    /// persistent set is protected after two samples and the sweep leaves it
+    /// alone, while a page sampled once stays evictable.
+    #[test]
+    fn the_head_advances_and_the_persistent_set_survives() {
+        /// Slots one pass looks at: the cap the refusing pass stopped at.
+        const CAP: usize = 256;
+        /// One-touch streaming pages, more than the head saw in a pass.
+        const PAGES: usize = 700;
+        /// The world set, sampled every frame.
+        const PERSISTENT: usize = 16;
+        let slots = PERSISTENT + PAGES;
+        let mut hits = vec![0u8; slots];
+        let mut first = vec![0u64; slots];
+        let mut last = vec![0u64; slots];
+        let mut admit = vec![0u8; slots];
+        // The old pass: the same first CAP slots, refused, every pass.
+        let mut old_head = std::collections::BTreeSet::new();
+        // The new pass: each pass looks further along the queue.
+        let mut new_head = std::collections::BTreeSet::new();
+        let mut head = 0usize;
+        for frame in 0..8u64 {
+            for i in 0..slots {
+                if i < PERSISTENT || frame == 0 {
+                    let (h, f, a) = crate::resource::admit_step(hits[i], first[i], last[i], frame);
+                    (hits[i], first[i], last[i], admit[i]) = (h, f, frame, a);
+                }
+            }
+            // Refused slots left due: the same head every pass.
+            old_head.extend(0..CAP);
+            // Reclaimed slots rescheduled: the head moves on.
+            let end = (head + CAP).min(slots);
+            new_head.extend(head..end);
+            head = end;
+        }
+        assert_eq!(old_head.len(), CAP, "the old head never moved");
+        assert_eq!(new_head.len(), slots, "the rescheduled head reached every slot");
+        for j in 0..PERSISTENT {
+            assert_eq!(admit[j], 2, "persistent {j} protected");
+            assert!(
+                !crate::resource::sweepable(true, 1, 1, admit[j] == 2),
+                "the sweep leaves the world set alone"
+            );
+        }
+        assert_eq!(admit[PERSISTENT], 1, "a one-touch page is on probation");
+        assert!(
+            crate::resource::sweepable(true, 1, 1, admit[PERSISTENT] == 2),
+            "a one-touch page is evictable"
+        );
+    }
+
+    /// A draw that repeats the root arguments another draw of the list set
+    /// leaves every `SetGraphicsRoot*View` out: 1,000 draws of three root
+    /// views make three calls, which is what the list is told ([`RootArgs`]).
+    #[test]
+    fn repeated_root_arguments_are_set_once() {
+        let mut args = RootArgs::default();
+        let signature = 0x1000_0000usize;
+        let draw = [
+            (0u32, RootKind::Cbv, 0xc000_0000u64),
+            (2, RootKind::Srv, 0xd000_0000),
+            (3, RootKind::Uav, 0xe000_0000),
+        ];
+        let mut calls = 0;
+        for _ in 0..1_000 {
+            for &(param, kind, value) in &draw {
+                if args.again(signature, false, param, kind, value) {
+                    calls += 1;
+                }
+            }
+        }
+        assert_eq!(calls, draw.len(), "SetGraphicsRoot*View calls");
+        // Another value at any of them is set: the title set another one.
+        assert!(args.again(signature, false, 2, RootKind::Srv, 0xd000_0100));
+        // Another kind of view at a parameter is another argument.
+        assert!(args.again(signature, false, 3, RootKind::Cbv, 0xe000_0000));
+        // The compute space is another set of parameters.
+        assert!(args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
+        assert!(!args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
+    }
+
+    /// A descriptor the title rewrote between two draws resolves to another
+    /// value at the same title address, and the root argument is set again: a
+    /// title that rewrites its descriptors every draw gets every argument set
+    /// (the cache is fed what this draw read, never the address the title
+    /// set).
+    #[test]
+    fn a_rewritten_root_view_is_set_again() {
+        let mut args = RootArgs::default();
+        let signature = 0x1000_0000usize;
+        // The title's root CBV address, and what the descriptor there
+        // resolves to: `root_view` reads the record at the address on every
+        // draw, so a rewrite is another value at the same address.
+        let address = 0x7ff6_0000u64;
+        let mut resolved = std::collections::HashMap::from([(address, 0xaaaa_0000u64)]);
+        let mut calls = 0;
+        for draw in 0..3 {
+            if draw == 1 {
+                // Another resource described where the old one was.
+                resolved.insert(address, 0xbbbb_0000);
+            }
+            if args.again(signature, false, 1, RootKind::Cbv, resolved[&address]) {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 2, "the rewrite was not read");
+    }
+
+    /// A root signature switch and a cut's new host list leave nothing set:
+    /// every argument is set again.
+    #[test]
+    fn a_new_signature_or_list_sets_every_root_argument_again() {
+        // Another signature, then a cut ([`State::bind`], [`State::replay`]).
+        let script = [
+            (0x1000_0000usize, false),
+            (0x1000_0000, false),
+            (0x2000_0000, true),
+            (0x2000_0000, false),
+            (0x2000_0000, true),
+        ];
+        let mut args = RootArgs::default();
+        let mut calls = 0;
+        for (signature, cleared) in script {
+            if cleared {
+                args.clear();
+            }
+            if args.again(signature, false, 0, RootKind::Cbv, 0xc000_0000) {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 3);
     }
 }

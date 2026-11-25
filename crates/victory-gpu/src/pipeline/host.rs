@@ -5,8 +5,10 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -570,7 +572,7 @@ impl HostPipeline {
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
         // The ranges table parameters point at, alive until the root
         // signature is made.
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
@@ -588,16 +590,25 @@ impl HostPipeline {
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
+                params.push(Param {
+                    key: ParamKey {
+                        visibility: visibility.0,
+                        kind: Kind::Constants,
+                        space: USER_DATA_SPACE,
+                        register: 0,
+                        size: dwords,
                     },
-                    ShaderVisibility: visibility,
+                    desc: D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Constants: D3D12_ROOT_CONSTANTS {
+                                ShaderRegister: 0,
+                                RegisterSpace: USER_DATA_SPACE,
+                                Num32BitValues: dwords,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    },
                 });
             }
             for (slots, kind, out) in [
@@ -648,29 +659,53 @@ impl HostPipeline {
                         }));
                         let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
                         out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
+                        params.push(Param {
+                            key: ParamKey {
+                                visibility: visibility.0,
+                                kind: if uav { Kind::UavTable } else { Kind::SrvTable },
+                                space: ROOT_CBV_SPACE,
+                                register: u32::from(slot),
+                                size: 1,
                             },
-                            ShaderVisibility: visibility,
+                            desc: D3D12_ROOT_PARAMETER1 {
+                                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                        NumDescriptorRanges: 1,
+                                        pDescriptorRanges: range,
+                                    },
+                                },
+                                ShaderVisibility: visibility,
+                            },
                         });
                         continue;
                     }
                     out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    params.push(Param {
+                        key: ParamKey {
+                            visibility: visibility.0,
+                            kind: if kind == D3D12_ROOT_PARAMETER_TYPE_CBV {
+                                Kind::Cbv
+                            } else if uav {
+                                Kind::Uav
+                            } else {
+                                Kind::Srv
                             },
+                            space: ROOT_CBV_SPACE,
+                            register: u32::from(slot),
+                            size: 1,
                         },
-                        ShaderVisibility: visibility,
+                        desc: D3D12_ROOT_PARAMETER1 {
+                            ParameterType: kind,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                    ShaderRegister: u32::from(slot),
+                                    RegisterSpace: ROOT_CBV_SPACE,
+                                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                                },
+                            },
+                            ShaderVisibility: visibility,
+                        },
                     });
                 }
             }
@@ -693,6 +728,24 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // One order for one binding shape: the same bindings declared in
+        // another order (the slots a shader names, the order its stages were
+        // walked in) then make the same bytes, so they find one entry in the
+        // host's pipeline library and one compiled signature in the driver's
+        // cache instead of two. Each stage's own indices follow the move.
+        let place = canonical_params(&mut params);
+        for stage in &mut bound {
+            if let Some((param, _)) = &mut stage.user_data {
+                *param = place[*param as usize];
+            }
+            for views in [&mut stage.root_cbvs, &mut stage.root_srvs, &mut stage.root_uavs] {
+                for (_, param) in views.iter_mut() {
+                    *param = place[*param as usize];
+                }
+            }
+        }
+        let samplers = canonical_samplers(&samplers);
+        let params: Vec<D3D12_ROOT_PARAMETER1> = params.into_iter().map(|p| p.desc).collect();
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -1205,12 +1258,118 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The kind of binding a root parameter holds, in the order the canonical
+/// signature groups them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    /// 32-bit constants (a stage's user data).
+    Constants,
+    Cbv,
+    Srv,
+    SrvTable,
+    Uav,
+    UavTable,
+}
+
+/// What a root parameter binds: the stage that sees it, its kind, where the
+/// shader names it, and its size (dwords of constants, descriptors of a
+/// table). Its order is the canonical order of the signature's parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ParamKey {
+    /// `D3D12_SHADER_VISIBILITY`: a stage's own block stays a block.
+    visibility: i32,
+    kind: Kind,
+    space: u32,
+    register: u32,
+    size: u32,
+}
+
+/// A root parameter and the binding it holds.
+#[derive(Clone, Copy)]
+struct Param {
+    key: ParamKey,
+    desc: D3D12_ROOT_PARAMETER1,
+}
+
+/// Puts the parameters in one order for one binding shape, and gives back
+/// where each built parameter went: a stage's recorded indices are the ones
+/// it had while the block was built.
+///
+/// The order holds no fact about the pipeline: a root parameter is named by
+/// its register and space, and the draws reach theirs through the indices
+/// this returns. Two pipelines whose bindings differ only in the order the
+/// slots were named in therefore make one signature, and one blob in the
+/// host library's name.
+fn canonical_params(params: &mut [Param]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..params.len() as u32).collect();
+    order.sort_by_key(|&at| params[at as usize].key);
+    let mut place = vec![0u32; params.len()];
+    for (to, &from) in order.iter().enumerate() {
+        place[from as usize] = to as u32;
+    }
+    // `sort_by_key` is stable and so is the sort above: equal keys keep the
+    // order they were built in on both sides, so `place` matches.
+    params.sort_by_key(|p| p.key);
+    place
+}
+
+/// The static samplers of the whole signature, one per register when every
+/// stage that names that register names the same sampler (visible to all of
+/// them then), sorted; as built — one per stage — when two stages name
+/// different samplers there, which is legal and which the console's own
+/// shaders do use: a static sampler is the shader's own declaration, not a
+/// root argument of the draw.
+fn canonical_samplers(built: &[D3D12_STATIC_SAMPLER_DESC]) -> Vec<D3D12_STATIC_SAMPLER_DESC> {
+    let seen = |mut s: D3D12_STATIC_SAMPLER_DESC| {
+        s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        s
+    };
+    let mut out: Vec<D3D12_STATIC_SAMPLER_DESC> = Vec::with_capacity(built.len());
+    for &sampler in built {
+        let sampler = seen(sampler);
+        match out
+            .iter()
+            .find(|s| (s.RegisterSpace, s.ShaderRegister) == (sampler.RegisterSpace, sampler.ShaderRegister))
+        {
+            Some(same) if *same == sampler => {}
+            Some(_) => return built.to_vec(),
+            None => out.push(sampler),
+        }
+    }
+    out.sort_by_key(|s| (s.RegisterSpace, s.ShaderRegister));
+    out
+}
+
+/// The root signatures this run has made, by their serialised bytes: the
+/// bytes are the shape, and they are also what the host's pipeline library
+/// keys a pipeline by and what the driver keys its own compiled signatures
+/// by, so a shape met again is neither serialised nor created again.
+type Roots = HashMap<Vec<u8>, (ID3D12RootSignature, Arc<Vec<u8>>)>;
+
+fn roots() -> std::sync::MutexGuard<'static, Option<Roots>> {
+    static ROOTS: Mutex<Option<Roots>> = Mutex::new(None);
+    let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    roots.get_or_insert_with(Roots::new);
+    roots
+}
+
+/// Root signatures found already made, and created, this run (the census).
+pub(crate) fn root_signature_counts() -> (u64, u64) {
+    (ROOT_HITS.load(Ordering::Relaxed), ROOT_CREATED.load(Ordering::Relaxed))
+}
+
+static ROOT_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// The root signature the parameters and samplers describe, and its
+/// serialised bytes. A signature whose bytes this run already has is handed
+/// out again rather than created anew.
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<(ID3D12RootSignature, Arc<Vec<u8>>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -1248,7 +1407,27 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        // A shape this run has already made: the same signature, made once.
+        let found = {
+            let roots = roots();
+            roots
+                .as_ref()
+                .and_then(|roots| roots.get(bytes))
+                .map(|(root, made)| (root.clone(), made.clone()))
+        };
+        if let Some(found) = found {
+            ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(found);
+        }
+        // Made outside the lock: a create is a driver call. Two threads that
+        // meet on a new shape may both make one; the second is dropped, and
+        // the bytes — what the library and the driver key on — are the same.
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        ROOT_CREATED.fetch_add(1, Ordering::Relaxed);
+        let made = Arc::new(bytes.to_vec());
+        let mut roots = roots();
+        let map = roots.as_mut().expect("the map is made by `roots`");
+        Ok(map.entry(made.as_ref().clone()).or_insert((root, made)).clone())
     }
 }
 
@@ -1258,6 +1437,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+    use windows::core::Interface;
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -1654,5 +1834,154 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    /// One bounded root view, as `HostPipeline::new` builds it.
+    fn view(slot: u8, visibility: D3D12_SHADER_VISIBILITY) -> Param {
+        Param {
+            key: ParamKey {
+                visibility: visibility.0,
+                kind: Kind::Srv,
+                space: ROOT_CBV_SPACE,
+                register: u32::from(slot),
+                size: 1,
+            },
+            desc: D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            },
+        }
+    }
+
+    /// A stage's user data, as `HostPipeline::new` builds it.
+    fn constants(dwords: u32, visibility: D3D12_SHADER_VISIBILITY) -> Param {
+        Param {
+            key: ParamKey {
+                visibility: visibility.0,
+                kind: Kind::Constants,
+                space: USER_DATA_SPACE,
+                register: 0,
+                size: dwords,
+            },
+            desc: D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: USER_DATA_SPACE,
+                        Num32BitValues: dwords,
+                    },
+                },
+                ShaderVisibility: visibility,
+            },
+        }
+    }
+
+    fn keys(params: &[Param]) -> Vec<ParamKey> {
+        params.iter().map(|param| param.key).collect()
+    }
+
+    /// One signature per binding shape: two pipelines whose root views are
+    /// declared in another order make one block (the parameters are named by
+    /// their register, and each stage reaches its own through the indices
+    /// `canonical_params` hands back), and a pipeline whose bindings really
+    /// differ keeps a signature of its own.
+    #[test]
+    fn one_root_signature_per_binding_shape() {
+        let mut one = vec![view(3, D3D12_SHADER_VISIBILITY_VERTEX), view(1, D3D12_SHADER_VISIBILITY_VERTEX), constants(8, D3D12_SHADER_VISIBILITY_VERTEX)];
+        let mut two = vec![constants(8, D3D12_SHADER_VISIBILITY_VERTEX), view(1, D3D12_SHADER_VISIBILITY_VERTEX), view(3, D3D12_SHADER_VISIBILITY_VERTEX)];
+        let place = canonical_params(&mut one);
+        canonical_params(&mut two);
+        assert_eq!(keys(&one), keys(&two), "the same bindings, in another order, are one shape");
+        // The stage's own indices follow: its root view 3 is the third
+        // parameter now, its user data the first.
+        assert_eq!(keys(&one)[place[0] as usize], view(3, D3D12_SHADER_VISIBILITY_VERTEX).key);
+        assert_eq!(keys(&one)[place[2] as usize], constants(8, D3D12_SHADER_VISIBILITY_VERTEX).key);
+        // A root view more is another shape.
+        let mut three = vec![
+            view(3, D3D12_SHADER_VISIBILITY_VERTEX),
+            view(1, D3D12_SHADER_VISIBILITY_VERTEX),
+            constants(8, D3D12_SHADER_VISIBILITY_VERTEX),
+            view(0, D3D12_SHADER_VISIBILITY_VERTEX),
+        ];
+        canonical_params(&mut three);
+        assert_ne!(keys(&one), keys(&three));
+        // Another stage's view of the same register keeps its own parameter:
+        // the draw sets each stage's from that stage's binding.
+        let mut both = vec![view(3, D3D12_SHADER_VISIBILITY_VERTEX), view(3, D3D12_SHADER_VISIBILITY_PIXEL)];
+        canonical_params(&mut both);
+        assert_eq!(both.len(), 2);
+        assert_ne!(both[0].key.visibility, both[1].key.visibility);
+    }
+
+    fn sampler(register: u32, filter: D3D12_FILTER, visibility: D3D12_SHADER_VISIBILITY) -> D3D12_STATIC_SAMPLER_DESC {
+        D3D12_STATIC_SAMPLER_DESC {
+            Filter: filter,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+            ShaderRegister: register,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: visibility,
+            ..Default::default()
+        }
+    }
+
+    /// Two stages that name the same sampler at one register share one static
+    /// sampler, visible to both; two that name different samplers there keep
+    /// one each, which is legal and which the console's shaders use.
+    #[test]
+    fn one_static_sampler_per_register_when_the_stages_agree() {
+        let (point, linear) = (D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        let (vs, ps) = (D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL);
+        let one = canonical_samplers(&[sampler(0, point, vs), sampler(0, point, ps)]);
+        assert_eq!(one.len(), 1, "one register, one sampler, visible to both stages");
+        assert_eq!(one[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        let both = canonical_samplers(&[sampler(0, point, vs), sampler(0, linear, ps)]);
+        assert_eq!(both.len(), 2, "different samplers at one register stay apart");
+        assert!(both.iter().any(|s| s.ShaderVisibility == vs));
+        assert!(both.iter().any(|s| s.ShaderVisibility == ps));
+    }
+
+    /// A shape met again is not created again: two pipelines whose root views
+    /// are declared in another order are handed the same root signature, and
+    /// the same bytes into the library's name, and a pipeline whose bindings
+    /// differ is handed another.
+    #[test]
+    fn a_shape_met_again_is_not_created_again() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let mut one = vec![view(3, D3D12_SHADER_VISIBILITY_VERTEX), view(1, D3D12_SHADER_VISIBILITY_VERTEX)];
+        let mut two = vec![view(1, D3D12_SHADER_VISIBILITY_VERTEX), view(3, D3D12_SHADER_VISIBILITY_VERTEX)];
+        canonical_params(&mut one);
+        canonical_params(&mut two);
+        let descs = |params: &[Param]| params.iter().map(|param| param.desc).collect::<Vec<_>>();
+        let Ok((root, blob)) = root_signature(&host.device, &descs(&one), &[], false) else {
+            eprintln!("the host refused a root signature; skipped");
+            return;
+        };
+        let Ok((same, blob_again)) = root_signature(&host.device, &descs(&two), &[], false) else {
+            eprintln!("the host refused a root signature; skipped");
+            return;
+        };
+        assert_eq!(root.as_raw(), same.as_raw(), "one root signature for one binding shape");
+        assert_eq!(blob.as_ref(), blob_again.as_ref(), "and one block of bytes, the library's key");
+        let mut other = one.clone();
+        other.push(view(0, D3D12_SHADER_VISIBILITY_VERTEX));
+        canonical_params(&mut other);
+        let Ok((different, _)) = root_signature(&host.device, &descs(&other), &[], false) else {
+            eprintln!("the host refused a root signature; skipped");
+            return;
+        };
+        assert_ne!(root.as_raw(), different.as_raw(), "another binding shape is another signature");
     }
 }

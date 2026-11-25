@@ -45,10 +45,59 @@ pub fn init_stderr(default_level: &str) {
 /// `<log_dir>/run-<UTC date>-<UTC time>.log` of its own unless `VICTORY_LOG_FILE`
 /// says otherwise.
 pub fn init_run(default_level: &str, log_dir: &Path) {
+    if override_path().is_none() {
+        prune_run_logs(log_dir);
+    }
     install(
         default_level,
         log_target(override_path().as_deref(), Some(log_dir)),
     );
+}
+
+/// Stamped run logs kept in the data directory. Each run writes its own file,
+/// so without a bound they would accumulate at a few megabytes per session.
+const RUN_LOGS_KEPT: usize = 20;
+
+/// Removes the oldest stamped run logs, keeping the newest [`RUN_LOGS_KEPT`].
+///
+/// Only names [`log_target`] itself makes are candidates, so a log a developer
+/// put beside them (`VICTORY_LOG_FILE`, a copied file) is never touched.
+fn prune_run_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_run_log(name))
+        .collect();
+    if names.len() <= RUN_LOGS_KEPT {
+        return;
+    }
+    // The name starts with the UTC date and time, so sorting by name is
+    // sorting by age.
+    names.sort();
+    for name in &names[..names.len() - RUN_LOGS_KEPT] {
+        if let Err(error) = std::fs::remove_file(dir.join(name)) {
+            // The subscriber is not installed yet, so this goes to stderr.
+            eprintln!("cannot remove the old run log {name}: {error}");
+        }
+    }
+}
+
+/// `run-YYYYMMDD-HHMMSS.log`, the name [`log_target`] gives a default log.
+fn is_run_log(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("run-") else {
+        return false;
+    };
+    let Some(stamp) = rest.strip_suffix(".log") else {
+        return false;
+    };
+    let Some((date, time)) = stamp.split_once('-') else {
+        return false;
+    };
+    date.len() == 8 && time.len() == 6 && date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit())
 }
 
 /// `VICTORY_LOG_FILE`, read once because the subscriber is built once.
@@ -281,5 +330,35 @@ mod tests {
             std::fs::read_to_string(&path).expect("read"),
             "second run\n"
         );
+    }
+
+    #[test]
+    fn only_the_newest_run_logs_are_kept() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let made: Vec<String> = (0..RUN_LOGS_KEPT + 5)
+            .map(|i| format!("run-20260101-{:06}.log", i))
+            .collect();
+        for name in &made {
+            std::fs::write(dir.path().join(name), "log\n").expect("write");
+        }
+        // Names this function must never remove, and one log that is not ours.
+        for name in ["notes.log", "run-latest.log", "run-20260101-00000.log"] {
+            std::fs::write(dir.path().join(name), "keep\n").expect("write");
+        }
+        prune_run_logs(dir.path());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| is_run_log(name))
+            .collect();
+        // The five oldest stamped logs went; the kept ones are the newest.
+        assert_eq!(left.len(), RUN_LOGS_KEPT);
+        assert!(!left.contains(&made[0]));
+        assert!(!left.contains(&made[4]));
+        assert!(left.contains(&made[5]));
+        assert!(dir.path().join("notes.log").exists());
+        assert!(dir.path().join("run-latest.log").exists());
+        assert!(dir.path().join("run-20260101-00000.log").exists());
     }
 }

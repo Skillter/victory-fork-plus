@@ -123,7 +123,7 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 
 | Switch | Effect | Notes |
 |---|---|---|
-| `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off | **in the working config** |
+| `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off; that is now the default, so the variable is no longer read (`VICTORY_BACKGROUND_PROCESSING=normal` gives the older behaviour back) | **in the working config** |
 | `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable**: 473 → 350 ms, then `device removed after 3 submissions sent ahead` (TDR) |
 | `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as `RELAY`; assume the same risk |
 | `VICTORY_WIDE_BACK=1` | snapshot compares spread across cores | safe; sold as part of the fast config |
@@ -143,7 +143,8 @@ Log destination. `VICTORY_LOG_FILE=<path>` writes the log to that file in
 addition to stderr. `VICTORY_LOG_FILE=0` (or `off`) disables the file copy, so
 the log is stderr only. When the variable is unset, `victory run` logs to
 `<data-dir>/logs/run-<YYYYMMDD>-<HHMMSS>.log` (UTC, one file per run, so no
-run overwrites another), and every other command logs to stderr only. If the data directory cannot hold the file (asset
+run overwrites another; the newest 20 are kept and older ones are removed at
+start-up), and every other command logs to stderr only. If the data directory cannot hold the file (asset
 policy, permissions), the run falls back to stderr instead of refusing to
 start. A capture that must survive a closed window is therefore
 `VICTORY_LOG_FILE=<path> target\release\victory.exe run ...`; a relative value
@@ -166,18 +167,18 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
   sun flares, floating motes, correct single-line subtitles. Frames were
   captured to `<data-dir>/world/`.
 - **The world renders** with working controls, HUD and pause menu.
-- Pipeline library accumulates across sessions, so each session drops fewer
-  draws. *(re-measured)* after one session
-  `<cache-dir>/pipelines/host-pipelines.bin` was **232,858,822 bytes (222 MiB)**,
-  with **2,853** names in `early-pipelines.txt` beside it. The
-  `97 KB → 231 KB → 320 KB` progression quoted by earlier notes was an
-  early-session figure, taken while most pipeline creation still failed; it is
-  not reproducible, so expect a few hundred MiB, not a few hundred KB. The blob
-  is rewritten whole on every save and is coupled to the driver, so a driver
-  update discards it and the next run rebuilds from empty.
+- Pipeline library accumulates across sessions. *(re-measured)*
+  `<cache-dir>/pipelines/host-pipelines.bin` measured 232,858,822 B (222 MiB)
+  in one session, 465,924,678 B (444 MiB) in the 02:56 run and 500,821,110 B
+  after it, with **2,853 → 2,893 → 2,907** names in `early-pipelines.txt`
+  beside it: it grows with the content the title has shown, at ~187 KB per
+  pipeline. The `97 KB → 231 KB → 320 KB` progression quoted by earlier notes
+  was an early-session figure, taken while most pipeline creation still
+  failed. The blob is rewritten whole on every save and is coupled to the
+  driver, so a driver update discards it and the next run rebuilds from empty.
   `dropped N (0 being made)` means the backlog is drained; `M being made` means
   compilation is the limit that frame.
-- With the library warm: `dropped ~350-400 without a host pipeline (0 being made)`.
+- With the library warm: `dropped ~350-400`, almost all `BuilderOff` (§5.2).
 
 ---
 
@@ -202,23 +203,24 @@ inherent to the port, not a bug.
 
 ## 5.2 Missing content — clothes and materials
 
-~350 draws/frame dropped with **`0 being made`**, i.e. their pipelines can never
-be built. Ten shaders, five rules:
+Most of what is dropped each frame is not a shader problem. In the 02:56 run
+(`run-20261125-025614.log`) the drops were **382.0/frame `BuilderOff` against
+5.0/frame `NoPipeline`**: the ray-tracing structure builder is off
+(`VICTORY_BVH_BUILDER` unset, `crates/victory-gpu/src/pipeline.rs:287-289`),
+and its draw stages are dropped on purpose. Shader refusals explain ~1 % of the
+loss; set `VICTORY_BVH_BUILDER=1` before blaming a rule.
 
-| Count | Error | Stage |
-|---|---|---|
-| 3 | `the first half of an interpolation is not supported` | pixel |
-| 3 | `a descriptor read only as data is not supported` | pixel |
-| 2 | `v_cvt_f32_f64 is not supported` | — |
-| 1 | `v_permlanex16_b32 is not supported` | compute |
-| 1 | `a wave sum of 16-bit floats where not every lane runs` | compute |
+The refusals that remain in that run (7 programs): 4× `a descriptor read only as
+data` (pixel), 2× `a lane mask exchanged where not every lane runs` (compute),
+1× `a descriptor's address or format read as data` (compute).
 
-Plus one mesh pipeline the host refuses (`0x80070057`). In the log it appears
-as `shader does not translate; its pipelines' draws are dropped ... stage=...
-error=converter shader.dxil v1: GFX10 code at 0x....`.
+Separately, the host refuses 7 compute pipelines and 1 mesh pipeline with
+`0x80070057`; `pipeline/host.rs` prints `suspected=[]` for them, so the
+parameter is not known yet.
 
-**Start with the two pixel rules** — clothes are pixel-shaded, so those are the
-likely culprits, and each is a bounded rule in
+In the log a refusal appears as `shader does not translate; its pipelines'
+draws are dropped ... stage=... error=converter shader.dxil v1: GFX10 code at
+0x....`. Each is a bounded rule in
 `crates/victory-shader/src/emit/lower.rs`.
 
 ## 5.3 Light in shadow — black interiors
@@ -320,6 +322,10 @@ Sample run clock:
               pipeline prewarm queue grows (799 → 1119) during menus
      …        intro: cutscene renders, ~1-2 fps, ~350 dropped draws
               world: 2.1 fps, 473 ms/frame
+
+*(re-measured 02:56)* the same world at 3.8 fps / 264 ms/frame; the ~385 drops
+per frame split 382.0 `BuilderOff` + 5.0 `NoPipeline` (§5.2), so the drop count
+is not a shader-refusal count.
 
 Saves and settings live under `<data-dir>/<title-id>/`
 (`saves\0009000000000001\...\Player~<hash>\v5\{0,1,manifest}`,
