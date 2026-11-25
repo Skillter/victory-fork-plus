@@ -779,6 +779,9 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The run's frame count, for the `STOP` block: a count of a static, so a
+    // path that ends the process elsewhere still has it.
+    victory_core::meter::meter().count("frames_n", 1);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

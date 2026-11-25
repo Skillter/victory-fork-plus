@@ -953,6 +953,31 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The presents that cannot do what they were asked are counted and say
+    /// which occurrence they are ([`victory_core::logging::warn_once`]): a
+    /// client area dragged under the swap chain's size refuses on every
+    /// present, and a `Once` reported that once and then read as if the window
+    /// had stopped being dragged.
+    #[test]
+    fn a_present_refusal_says_which_occurrence_it_is() {
+        use super::{frame_not_float, resize_refused};
+        for nth in 1..=10 {
+            let logged = frame_not_float(28, 87);
+            assert_eq!(logged, nth == 1 || nth == 10, "occurrence {nth} of the present's format");
+        }
+        assert!(resize_refused("E_FAIL", (640, 480)), "the first refusal is logged");
+        assert!(!resize_refused("E_FAIL", (640, 480)), "the second is counted");
+        let totals = victory_core::logging::warn_once_totals();
+        let count = |key: &str| {
+            totals
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, count)| *count)
+        };
+        assert_eq!(count("present.frame_format"), Some(10), "{totals:?}");
+        assert_eq!(count("present.resize"), Some(2), "{totals:?}");
+    }
+
     /// The switch has three spellings, unknown text is refused to `off`
     /// rather than obeyed, nothing named is `off`, and only `measure` lets
     /// the runtime commit its measurements.
@@ -6180,12 +6205,41 @@ fn frame_view(format: DXGI_FORMAT, swap: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(if typeless(format) { swap } else { format })
 }
 
+/// The frame's format is not one the present pass reads as float, so the
+/// present is DXGI's own stretch: every frame of the run meets it again.
+///
+/// [`victory_core::logging::warn_once`] says which occurrence it is, so a run
+/// whose frames never let the pass read them reports the total instead of a
+/// single line a `Once` wrote on the first present.
+fn frame_not_float(frame_format: i32, swap_format: i32) -> bool {
+    victory_core::logging::warn_once("present.frame_format", || {
+        format!(
+            "the frame's format is not one the present pass reads as float: DXGI stretches it \
+             instead; frame_format={frame_format} swap_format={swap_format}"
+        )
+    })
+}
+
+/// The swap chain could not be resized to the client area: the present is
+/// skipped under the size the chain still has, and a window being dragged
+/// meets the same refusal on every present until it stops moving.
+fn resize_refused(error: impl std::fmt::Display, client: (u32, u32)) -> bool {
+    victory_core::logging::warn_once("present.resize", move || {
+        format!(
+            "swap chain not resized; error={error} client_width={} client_height={}",
+            client.0, client.1
+        )
+    })
+}
+
 /// Says once, each way, what the present pass reads a frame with: a view D3D12
 /// refuses is silent, so the two formats behind a black window are in the log
 /// and nowhere else.
+///
+/// The stretch is the one case a run meets on every present, so its line comes
+/// from `warn_once` and carries the running total ([`frame_not_float`]).
 fn note_frame_view(format: DXGI_FORMAT, swap: DXGI_FORMAT, view: Option<DXGI_FORMAT>) {
     static OWN: OnceLock<()> = OnceLock::new();
-    static NONE: OnceLock<()> = OnceLock::new();
     match view {
         Some(view) if view != swap && OWN.set(()).is_ok() => tracing::info!(
             frame_format = format.0,
@@ -6193,11 +6247,9 @@ fn note_frame_view(format: DXGI_FORMAT, swap: DXGI_FORMAT, view: Option<DXGI_FOR
             view_format = view.0,
             "the frame is read with its own format: the swap chain's is not one D3D12 allows for its resource"
         ),
-        None if NONE.set(()).is_ok() => tracing::warn!(
-            frame_format = format.0,
-            swap_format = swap.0,
-            "the frame's format is not one the present pass reads as float: DXGI stretches it instead"
-        ),
+        None => {
+            frame_not_float(format.0, swap.0);
+        }
         _ => {}
     }
 }
@@ -6953,12 +7005,7 @@ impl Host {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        client_width = client.0,
-                        client_height = client.1,
-                        "swap chain not resized"
-                    );
+                    resize_refused(&e, client);
                     return None;
                 }
             }

@@ -12,6 +12,10 @@ blake3.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# The run's records live there (`report`, `logging`, `meter`): the end of a run
+# is written from this layer's present path and from `victory-hle`'s lifecycle,
+# neither of which returns through the binary's own shutdown.
+victory-core.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true

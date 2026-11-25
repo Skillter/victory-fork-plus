@@ -323,11 +323,38 @@ fn summary(how: &str) {
     }
 }
 
+/// Writes the records an end of a run leaves - the summary line and the
+/// process's one `STOP` block - and says whether this call wrote them.
+///
+/// The suspend routines returning and the deadline that stops waiting for them
+/// both reach [`end`], and the process is terminated rather than returned
+/// from, so nothing here can be asked afterwards which of them ended the run:
+/// `victory_gpu::report::stop_block` renders the block once per process and
+/// tells the later caller there is nothing left to say, and that caller writes
+/// no second summary either.
+///
+/// Everything the block reads is a static of `victory_core` (the meter and the
+/// `logging` warning watches), so it is written even though the GPU layer may
+/// already have let go of its arenas - no directory is walked and no device
+/// object is asked for anything.
+fn last_records(how: &str) -> bool {
+    let duration = started().map_or(Duration::ZERO, |start| start.elapsed());
+    let Some(block) = victory_gpu::report::stop_block(how, duration) else {
+        return false;
+    };
+    summary(how);
+    // One record, however many lines: `emit` writes each of them to the log
+    // file and to stderr and ignores the level filter, so `grep '^STOP '`
+    // returns the whole footer even in a run with the log turned down.
+    victory_gpu::logging::emit("INFO", &block);
+    true
+}
+
 fn end(how: &str) {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
-    summary(how);
+    last_records(how);
     // `victory_core::logging` buffers nothing: each event reaches the file
     // as it is logged (`logging::Locked` writes the `File` directly,
     // crates/victory-core/src/logging.rs:183), and stderr is unbuffered. This
@@ -383,6 +410,31 @@ mod tests {
         // A second note keeps the first moment, so the summary cannot be
         // made to understate how long the title ran.
         assert_eq!(*started().expect("still noted"), noted);
+    }
+
+    /// The suspend routines and the deadline that stops waiting for them both
+    /// reach [`end`], and `end` cannot return to be asked how often it ran:
+    /// the records are written by [`last_records`], which says once that it
+    /// wrote them and nothing after that. The block it writes is the footer
+    /// `victory run` writes, rendered from the counters this path still has.
+    #[test]
+    fn the_two_ends_of_a_suspend_write_one_stop_block() {
+        note_run_start();
+        assert!(
+            last_records("title suspended"),
+            "the first end writes the run's last records"
+        );
+        assert!(
+            !last_records("title did not finish suspending in time"),
+            "the deadline that ends the process after the routines must not write a second STOP block"
+        );
+        let text = victory_gpu::report::RunFooter::from_counters(
+            "title suspended",
+            Duration::from_secs(2),
+        )
+        .render();
+        assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
+        assert!(text.contains("\"title suspended\""), "{text}");
     }
 
     #[test]
