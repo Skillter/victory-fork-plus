@@ -173,6 +173,11 @@
   spare, per 5 s in every build (`draw::commands_line`): a per-draw cost that
   line does not show is `host`'s barriers and copies, not a command of the
   draw's.
+- `list::census` (`VICTORY_BARRIER_CENSUS=1`, diagnostics only) splits a
+  frame's barrier decisions by source: the draw path's `ensure_state` asks by
+  the state asked for (a target, the depth buffer, a shader read, other), and
+  the title's own `ResourceBarrier` calls (barriers passed, mapped, dropped).
+  `draw::commands_line` counts only the first; the census names both.
 - `flow` counts in every build, and logs after each frame line: which call
   site moved how many bytes between title memory and ours, in how long, and
   at what rate. `copystat` names the ranges and the memory kinds behind them.
