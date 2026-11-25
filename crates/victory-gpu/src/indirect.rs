@@ -20,6 +20,8 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -223,6 +225,58 @@ fn commands(plan: &Plan) -> u32 {
 unsafe impl Send for Clamp {}
 // SAFETY: as above.
 unsafe impl Sync for Clamp {}
+
+/// Whether the title's indirect arguments are clamped: `VICTORY_CLAMP=off`
+/// (also `0`, `false`, `no`) passes them to the card unchecked, which is the
+/// measurement arm for what a clamp costs; anything else, and nothing, clamps.
+fn parse_switch(value: Option<&std::ffi::OsStr>) -> bool {
+    !matches!(
+        value
+            .and_then(|v| v.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("off" | "0" | "false" | "no")
+    )
+}
+
+/// [`parse_switch`] of `VICTORY_CLAMP`, read once.
+pub(crate) fn clamp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_switch(std::env::var_os("VICTORY_CLAMP").as_deref()))
+}
+
+/// Clamps dispatched, runs passed through unchecked, and the barrier records
+/// a clamp emitted (both of its pairs and the one that hands the scratch back).
+static CLAMPED: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+static CLAMP_BARRIERS: AtomicU64 = AtomicU64::new(0);
+
+/// One indirect run whose arguments went to the card without a clamp
+/// ([`clamp_on`] off), counted, and said once: this arm can hang the card.
+pub(crate) fn skipped() {
+    SKIPPED.fetch_add(1, Ordering::Relaxed);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "a clamp was skipped: the title's indirect arguments are passed to the card \
+             unchecked, so a malformed one can hang it (VICTORY_CLAMP=off)"
+        )
+    });
+}
+
+/// What the clamp did since the last line, in every build: the figure the
+/// switch exists to be measured against, and the barrier records it emits
+/// (which `list::census` does not see, as they are recorded here).
+pub(crate) fn clamps_line() -> Option<String> {
+    let [clamped, skipped, barriers] = [&CLAMPED, &SKIPPED, &CLAMP_BARRIERS]
+        .map(|c| c.swap(0, Ordering::Relaxed));
+    (clamped + skipped > 0).then(|| {
+        format!(
+            "argument clamp: {clamped} clamped and {barriers} barrier records, \
+             {skipped} passed through unchecked"
+        )
+    })
+}
 
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
@@ -535,9 +589,11 @@ fn record_clamp_as(
             emitted(Command::RootView, u64::from(plan.views));
             l.Dispatch(records.div_ceil(64), 1, 1);
             emitted(Command::Clamp, 1);
+            CLAMPED.fetch_add(1, Ordering::Relaxed);
         }
         l.ResourceBarrier(&second[skip..]);
         emitted(Command::Barrier, (second.len() - skip) as u64);
+        CLAMP_BARRIERS.fetch_add((first.len() + second.len() - 2 * skip) as u64, Ordering::Relaxed);
     }
     true
 }
@@ -558,6 +614,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
         )])
     };
     emitted(Command::Barrier, 1);
+    CLAMP_BARRIERS.fetch_add(1, Ordering::Relaxed);
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -880,6 +937,20 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// `VICTORY_CLAMP` turns the clamp off, in each spelling a run may use,
+    /// and anything else (and nothing) leaves it on.
+    #[test]
+    fn the_clamp_switch_reads_off_and_nothing_else() {
+        let read = |v: &str| super::parse_switch(Some(std::ffi::OsStr::new(v)));
+        for spelled in ["off", "OFF", "0", "false", "no"] {
+            assert!(!read(spelled), "{spelled} turns the clamp off");
+        }
+        for spelled in ["on", "1", "true", "yes", ""] {
+            assert!(read(spelled), "{spelled} leaves the clamp on");
+        }
+        assert!(super::parse_switch(None), "unset leaves the clamp on");
     }
 
     #[test]
