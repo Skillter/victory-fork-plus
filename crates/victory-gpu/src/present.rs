@@ -70,8 +70,8 @@ pub(crate) struct Target {
     dimension: u32,
     /// `D3D12_RESOURCE_DESC::MipLevels` and `DepthOrArraySize`: the pass copies
     /// a whole resource into the swap chain's buffer, which has one mip and one
-    /// slice, so a texture with more cannot stand in for the frame
-    /// (`CopyResource` of it is refused and shows nothing at all).
+    /// slice, so a texture with more is only a frame while the pass draws it
+    /// through a view ([`showable`]).
     pub(crate) mip_levels: u16,
     pub(crate) depth_or_array_size: u16,
     /// A shader read it since the last present as well.
@@ -268,9 +268,31 @@ fn target(at: usize, sampled: bool) -> Option<Target> {
     })
 }
 
+/// Whether a whole copy can show a resource as it is: a `CopyResource` into the
+/// swap chain's buffer takes a resource of one mip and one slice, and a mip
+/// chain or an array is one the host refuses — the window then shows nothing.
+pub(crate) fn whole(mip_levels: u16, depth_or_array_size: u16) -> bool {
+    mip_levels == 1 && depth_or_array_size == 1
+}
+
+/// Whether a target of this shape can stand for the frame: one the pass draws
+/// through a view of its own (`readable`: any shape, the view names mip 0 and
+/// slice 0), or, failing that, one a copy takes whole ([`whole`]). The copy's
+/// shape rule is the copy's alone: asking it of a target the pass draws refused
+/// frames the pass could show.
+pub(crate) fn showable(
+    mip_levels: u16,
+    depth_or_array_size: u16,
+    readable: bool,
+    copyable: bool,
+) -> bool {
+    readable || (copyable && whole(mip_levels, depth_or_array_size))
+}
+
 /// The target of `since` to show instead of the frame of `size`, or why the
 /// frame is shown as it is. `presentable` is the present pass's own test of a
-/// target: it names a format the pass can read.
+/// target: whether it can show one of this shape, drawn or copied
+/// ([`showable`]).
 pub(crate) fn pick(
     size: (u32, u32),
     since: &Since,
@@ -289,10 +311,6 @@ pub(crate) fn pick(
             t.width > 0
                 && t.height > 0
                 && t.dimension == TEXTURE_2D
-                // The pass copies the whole resource into the swap chain's
-                // buffer: one mip, one slice.
-                && t.mip_levels == 1
-                && t.depth_or_array_size == 1
                 && presentable(t)
                 && (f64::from(t.width) / f64::from(t.height) - shape).abs()
                     <= shape * ASPECT_TOLERANCE
@@ -349,7 +367,7 @@ pub(crate) fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{Since, Target, Why, pick};
+    use super::{Since, Target, Why, pick, showable, whole};
 
     /// A written 16:9 texture of `width` x `height`, read by a shader or not.
     fn target(key: usize, width: u32, height: u32, sampled: bool) -> Target {
@@ -567,28 +585,56 @@ mod tests {
         );
     }
 
-    /// A target of more than one mip, or of more than one slice, is no frame:
-    /// the pass copies the whole resource into the swap chain's buffer, which
-    /// is one mip and one slice, and the host refuses that copy — the window
-    /// then shows nothing at all rather than the frame it had.
+    /// A target of more than one mip, or of more than one slice, is a frame the
+    /// pass draws and not one a copy takes: a copy goes into a buffer of one
+    /// mip and one slice, and the host refuses `CopyResource` of an array or a
+    /// mip chain — the window then shows nothing. So the shape rule is the
+    /// copy's alone, and holds where a copy would be taken ([`showable`]).
     #[test]
-    fn a_target_with_mips_or_slices_is_no_frame() {
+    fn a_target_with_mips_or_slices_is_a_frame_the_pass_draws() {
         let mut mips = target(0x10, 1280, 720, false);
         mips.mip_levels = 4;
+        // Read by the pass: drawn through a view that names mip 0, of any shape.
+        assert!(showable(mips.mip_levels, mips.depth_or_array_size, true, false));
         assert_eq!(
-            pick((1920, 1080), &since(false, vec![mips]), |_| true),
-            Err(Why::Nothing)
-        );
-        let mut array = target(0x20, 1280, 720, false);
-        array.depth_or_array_size = 6;
-        assert_eq!(
-            pick((1920, 1080), &since(false, vec![array]), |_| true),
-            Err(Why::Nothing)
-        );
-        // One mip and one slice is the back buffer's own shape: picked.
-        assert_eq!(
-            pick((1920, 1080), &since(false, vec![target(0x30, 1280, 720, false)]), |_| true),
+            pick((1920, 1080), &since(false, vec![mips]), |t| showable(
+                t.mip_levels,
+                t.depth_or_array_size,
+                true,
+                false
+            )),
             Ok(0)
         );
+        // A copy is the only way to show it: refused, and the frame stays.
+        assert!(!showable(mips.mip_levels, mips.depth_or_array_size, false, true));
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![mips]), |t| showable(
+                t.mip_levels,
+                t.depth_or_array_size,
+                false,
+                true
+            )),
+            Err(Why::Nothing)
+        );
+        // The same, slice by slice.
+        let mut array = target(0x20, 1280, 720, false);
+        array.depth_or_array_size = 6;
+        assert!(showable(array.mip_levels, array.depth_or_array_size, true, true));
+        assert!(!showable(array.mip_levels, array.depth_or_array_size, false, true));
+        // One mip and one slice is the back buffer's own shape: either shows it.
+        assert!(whole(1, 1));
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![target(0x30, 1280, 720, false)]), |t| showable(
+                t.mip_levels,
+                t.depth_or_array_size,
+                false,
+                true
+            )),
+            Ok(0)
+        );
+        // A resource of more is not one a copy takes whole, however it is read.
+        assert!(!whole(4, 1));
+        assert!(!whole(1, 6));
+        assert!(!whole(0, 1), "an unbounded chain is not one resource a copy takes");
     }
 }

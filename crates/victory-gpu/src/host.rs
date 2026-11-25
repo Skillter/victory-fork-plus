@@ -2097,6 +2097,11 @@ static COPY_QUEUE_STATS: [std::sync::atomic::AtomicU64; 4] =
 /// shaders read ([`Host::relay_card_fetch`]) with no list of its own on the
 /// copy queue, so the next batch of copies waits for the value the fetch's
 /// wait ends at before it writes one of those buffers ([`Host::card_copies`]).
+///
+/// Written and cleared only under [`CopyLists`]' lock *and* [`QUEUE_ORDER`]
+/// ([`Host::relay_card_fetch`]): a batch reads it under the same two, so a
+/// batch that sees it is one the fetch's value is ordered against, and one
+/// recorded after a failed fetch is cleared before it can see it.
 static FETCH_BARRIER: Mutex<Option<(ID3D12Fence, u64)>> = Mutex::new(None);
 
 /// What the copy queue and the direct queue know of each other: every batch
@@ -2107,8 +2112,17 @@ static FETCH_BARRIER: Mutex<Option<(ID3D12Fence, u64)>> = Mutex::new(None);
 /// needs none of this: the order of that queue says it.
 #[derive(Default)]
 struct CopyOrder {
-    /// The last value signalled on the copy fence.
+    /// The last value a batch was numbered with, signalled or not: each batch
+    /// takes one above it, so a value is used once however its signal went.
+    /// Never a value to wait for (`last_signalled` is).
     sent: u64,
+    /// The last value a batch's `Signal` actually carried: the newest value the
+    /// copy fence can reach. Every wait on that fence names this or an older
+    /// value. A number between the two is one no signal will carry and no
+    /// completion will raise, so a wait for it never returns (a hang on the
+    /// direct queue, and the timeout that follows); `sent` advanced past a
+    /// failed signal is exactly how that used to be reached.
+    last_signalled: u64,
     /// The last value the direct queue was told to wait for.
     waited: u64,
     /// The last value signalled on the direct queue's fence.
@@ -2122,10 +2136,16 @@ impl CopyOrder {
         self.sent
     }
 
+    /// The batch numbered `value` got its signal: that value is on the fence,
+    /// and the completion of every batch before it is named by it.
+    fn signalled(&mut self, value: u64) {
+        self.last_signalled = self.last_signalled.max(value);
+    }
+
     /// The value the direct queue must wait for before a list that reads a
-    /// copy, if any batch was sent whose completion it has not waited for.
+    /// copy, if any batch was signalled whose completion it has not waited for.
     fn wait(&self) -> Option<u64> {
-        (self.sent > self.waited).then_some(self.sent)
+        (self.last_signalled > self.waited).then_some(self.last_signalled)
     }
 
     /// The direct queue waits for `value`: every batch sent before it is in
@@ -2224,6 +2244,15 @@ fn batch_done(value: Option<u64>, after: Option<u64>, done: u64) -> bool {
     }
 }
 
+/// The value a relay fetch makes the direct queue wait for, from the copy
+/// queue's order: the newest value the copy fence carries, and nothing when no
+/// batch has been signalled at all (`Host::relay_card_fetch`). Never
+/// [`CopyOrder::sent`]: the newest batch's signal may have failed, and a wait
+/// on the direct queue for a value no signal carries never returns.
+fn fetch_waits(order: &CopyOrder) -> Option<u64> {
+    (order.last_signalled > 0).then_some(order.last_signalled)
+}
+
 /// The copy queue's lists, and the order the two queues keep
 /// ([`CopyOrder`]). A list is recorded, sent, and given back only when the
 /// batch it recorded has completed: an allocator cannot be reset while the
@@ -2272,6 +2301,48 @@ impl CopyLists {
     /// can be told about.
     fn wait_value(&self) -> Option<u64> {
         self.flying.iter().find_map(|(value, _)| *value)
+    }
+
+    /// A batch whose signal failed, drained here: the batch is already on the
+    /// copy queue, so a value signalled after it names its completion, and this
+    /// thread waits for that value on the fence before anything reads the
+    /// copies it wrote. It is the caller's `last_signalled` too, so the direct
+    /// queue's waits can name it.
+    ///
+    /// `None` when that signal fails as well: no wait can be ordered against
+    /// the batch then, and the copies its list wrote are read by the
+    /// submission's own list, unsynchronised. A fence that refuses two signals
+    /// in a row is one the device has removed.
+    fn drain(
+        &mut self,
+        queue: &ID3D12CommandQueue,
+        fence: &ID3D12Fence,
+        event: HANDLE,
+    ) -> Option<u64> {
+        let value = self.order.sending();
+        // SAFETY: our copy queue, its fence, and the event of its one wait.
+        let signalled = unsafe {
+            (|| -> windows::core::Result<()> {
+                fence.SetEventOnCompletion(value, event)?;
+                queue.Signal(fence, value)?;
+                WaitForSingleObject(event, INFINITE);
+                Ok(())
+            })()
+        };
+        match signalled {
+            Ok(()) => {
+                self.order.signalled(value);
+                Some(value)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "no value to drain the copies into the card's memory with: a list of the \
+                     direct queue copies them instead"
+                );
+                None
+            }
+        }
     }
 
     /// A list to record the next batch in: one whose batch completed, a new one
@@ -2797,6 +2868,14 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// list is on the queue, and while a fetch of pieces goes to the queue: a
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
+///
+/// **Lock order: this one first, [`CopyLists`] second.** Both sites that take
+/// both take this one first (`Host::card_before`, which then reaches
+/// `Host::card_copies`, and `Host::relay_card_fetch`), and neither takes this
+/// one while the lists' is held. That is not tidiness: a batch's number and
+/// the [`FETCH_BARRIER`] it reads are one step only because no batch can be
+/// numbered while a fetch holds both (`Host::relay_card_fetch` says what the
+/// inversion deadlocks).
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 
 /// Since the last frame-rate line, of the thread that lands flights
@@ -4623,7 +4702,11 @@ impl Host {
     /// the value returned is the one signalled after it, which every list
     /// the direct queue runs next waits for ([`copied_state`] for the state
     /// the batch leaves a copy in). `None` with the switch off, no copy
-    /// queue, or no list to record in: the caller copies in its own list.
+    /// queue, or no list to record in: the caller copies in its own list. A
+    /// batch whose signal failed is drained on this thread
+    /// ([`CopyLists::drain`]) and returns the value of that drain; a batch
+    /// whose drain failed too returns `None`, and the caller copies in its own
+    /// list with the batch's copies unordered against it.
     fn card_copies(
         &self,
         dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
@@ -4712,10 +4795,19 @@ impl Host {
         }
         let value = lists.order.sending();
         // SAFETY: our copy queue and its fence; the batch is on the queue.
-        let signalled = unsafe { copies.queue.Signal(&copies.fence, value) };
-        if let Err(ref e) = signalled {
-            tracing::warn!(error = %e, "no signal for the copies into the card's memory");
-        }
+        let carried = match unsafe { copies.queue.Signal(&copies.fence, value) } {
+            Ok(()) => {
+                lists.order.signalled(value);
+                Some(value)
+            }
+            // The value this batch would have been named by never reaches the
+            // fence, so no wait may name it (`last_signalled`): the copies are
+            // drained here instead, before the hash passes below read them.
+            Err(e) => {
+                tracing::warn!(error = %e, "no signal for the copies into the card's memory");
+                lists.drain(&copies.queue, &copies.fence, copies.event)
+            }
+        };
         // Whether the batch before this one ran beside the direct queue while
         // this one was recorded: one of the two counts for every batch that a
         // later one arrived behind, and neither for the batches still in the
@@ -4723,11 +4815,12 @@ impl Host {
         if before > 0 {
             COPY_QUEUE_STATS[overlap_slot(before, done)].fetch_add(1, Ordering::Relaxed);
         }
-        // A batch whose signal failed is `None`: the value is in the fence's
-        // sequence but never named by a signal, so no wait can be for it and
-        // [`CopyLists::front_done`] reads it as done behind the first value
-        // after it instead of waiting forever on a value that never comes.
-        lists.flying.push_back((signalled.is_ok().then_some(value), (allocator, list)));
+        // A batch with no value at all (its signal and the drain's both
+        // failed) is `None`: nothing names its completion, so no wait can be
+        // told about it, and [`CopyLists::front_done`] reads it as run behind
+        // the first value after it instead of waiting forever on a value that
+        // never comes.
+        lists.flying.push_back((carried, (allocator, list)));
         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
         crate::shadow::CARD_STATS[1].fetch_add(ranges, Ordering::Relaxed);
         COPY_QUEUE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4736,7 +4829,7 @@ impl Host {
         // hash passes below read the copies it wrote, and so does the
         // submission. A batch nothing can be told about waits for nothing:
         // its copies are then ordered only by the submissions that follow.
-        if signalled.is_ok()
+        if carried.is_some()
             && let Some(value) = lists.order.wait()
         {
             // SAFETY: our copy queue, its fence, and the direct queue.
@@ -4746,7 +4839,9 @@ impl Host {
             }
             lists.order.waited(value);
         }
-        Some(value)
+        // `None` when the copies are not known to have run: the caller copies
+        // them in its own list, and reads them as `COPY_DEST`.
+        carried
     }
 
     /// Before a submission's lists run, for copies in the card's memory
@@ -5123,21 +5218,22 @@ impl Host {
         f.sent += 1;
         let ((allocator, list), fence, sent) = (f.list.clone(), f.fence.clone(), f.sent);
         // The copy queue's batches write the same card-side buffers this fetch
-        // reads, and it is a queue of its own: the fetch waits for the batches
-        // sent so far ([`CopyOrder`]), and the batches recorded from here on
-        // wait for this fetch, published as [`FETCH_BARRIER`] in the same hold
-        // of the lists lock so that every batch is on one side of the fetch or
-        // the other.
+        // reads, and it is a queue of its own: the fetch waits for the last
+        // batch signalled so far ([`CopyOrder`]), and the batches recorded from
+        // here on wait for this fetch, published as [`FETCH_BARRIER`].
+        //
+        // Both under [`QUEUE_ORDER`], held from the publication to the fetch's
+        // own signal: a batch takes its number and reads that barrier under
+        // both locks ([`Host::card_copies`]), so with the order held no batch
+        // is between the two. A batch is then either numbered before the
+        // publication — the fetch waits for it, and it waited for an older
+        // fetch or for nothing — or numbered after it, and it waited for this
+        // fetch, which does not wait for it. Publishing before taking the order
+        // is what used to break that: a batch numbered after the publication
+        // (and reading the new barrier) was still counted in the value the
+        // fetch waits for, so the copy queue waited for the fetch while the
+        // fetch waited for that batch, and neither queue ever moved again.
         let copies = self.copies.as_ref();
-        let fetch_waits = copies.map(|copies| {
-            let lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
-            let waits = lists.order.sent;
-            if waits > 0 {
-                *FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((fence.clone(), sent * 2));
-            }
-            waits
-        });
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -5155,34 +5251,60 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                // A copy queue of its own writes those buffers too: waited for
-                // before the fetch reads one of them.
-                if let (Some(copies), Some(waits)) = (copies, fetch_waits.filter(|w| *w > 0)) {
-                    self.queue.Wait(&copies.fence, waits)?;
-                }
-                // A signal before the fetch: when it completes, everything
-                // sent before the fetch has run, and the time until it did
-                // is the waiting behind that work, not the fetch's own.
-                self.queue.Signal(&fence, sent * 2 - 1)?;
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
+                let mut published = false;
+                let enqueued = (|| -> windows::core::Result<()> {
+                    if let Some(copies) = copies {
+                        // The copy queue's last signalled batch, and the value
+                        // this fetch ends at, in one hold of its lists: a batch
+                        // recorded from here on waits for the fetch before it
+                        // writes a buffer the fetch reads, whether or not a
+                        // batch was sent before this one.
+                        let wait = {
+                            let lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+                            let wait = fetch_waits(&lists.order);
+                            *FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((fence.clone(), sent * 2));
+                            wait
+                        };
+                        published = true;
+                        if let Some(wait) = wait {
+                            self.queue.Wait(&copies.fence, wait)?;
+                        }
+                    }
+                    // A signal before the fetch: when it completes, everything
+                    // sent before the fetch has run, and the time until it did
+                    // is the waiting behind that work, not the fetch's own.
+                    self.queue.Signal(&fence, sent * 2 - 1)?;
+                    self.queue.ExecuteCommandLists(&lists);
+                    // The fetch's own value, last: a batch waits for it, so it
+                    // must be on the queue before the order is let go.
+                    self.queue.Signal(&fence, sent * 2)?;
+                    Ok(())
+                })();
+                let after = match enqueued {
+                    Ok(()) => *order,
+                    Err(e) => {
+                        // No fetch reached the queue, or the value a batch would
+                        // wait for never will: the barrier goes back, and under
+                        // the order, so that no batch is recorded against it.
+                        if published {
+                            let mut barrier =
+                                FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner());
+                            if barrier.as_ref().is_some_and(|(_, value)| *value == sent * 2) {
+                                *barrier = None;
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent * 2)?;
                 Ok(after)
             })()
         };
         let after = match ran {
             Ok(after) => after,
             Err(e) => {
-                // No fetch reached the queue: a batch waiting for its value
-                // would wait for a value that never comes.
-                if fetch_waits.is_some_and(|waits| waits > 0) {
-                    let mut barrier = FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner());
-                    if barrier.as_ref().is_some_and(|(_, value)| *value == sent * 2) {
-                        *barrier = None;
-                    }
-                }
                 fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)"))
             }
         };
@@ -8705,18 +8827,28 @@ impl Host {
         let mut picture = texture;
         let mut picture_state = state;
         let mut picture_this = None;
+        // Whether the pass will draw a target at all: the presenter is made
+        // with the pass only when it has a pipeline for this format
+        // ([`Host::presenter`]), and the copy takes a whole resource and nothing
+        // else, so a target of more than one mip or slice is showable only
+        // through the pass ([`crate::present::showable`]).
+        let pass_there = present_pass().is_some_and(|pass| pass.pipeline(format).is_some());
         match crate::present::pick((desc.Width as u32, desc.Height), since, |t| {
             const DEPTH: u32 = 0x2;
             const DENY_SHADER_RESOURCE: u32 = 0x8;
             let candidate = DXGI_FORMAT(t.format);
             t.sample_count <= 1
                 && t.flags & (DEPTH | DENY_SHADER_RESOURCE) == 0
-                // The pass reads it, or a copy takes it as it is: a target
+                // The pass draws it, or a copy takes it whole: a target
                 // neither can show is no substitute (a copy of another format
                 // is one the device refuses, and a wrong image is worse than a
                 // black one).
-                && (frame_view(candidate, format).is_some()
-                    || copy_compatible(candidate, format))
+                && crate::present::showable(
+                    t.mip_levels,
+                    t.depth_or_array_size,
+                    pass_there && frame_view(candidate, format).is_some(),
+                    copy_compatible(candidate, format),
+                )
         }) {
             Ok(index) => {
                 let shown = since.targets.get(index).and_then(|target| {
@@ -8727,11 +8859,17 @@ impl Host {
                     Some((target, texture)) => {
                         // SAFETY: a live host texture.
                         desc = unsafe { texture.GetDesc() };
-                        // The state it is in now: the pass reads it, and the
-                        // list puts it back, as it would for a frame.
+                        // The state the pass finds it in, read and not taken:
+                        // the list moves it from that state, and a way out that
+                        // presents nothing leaves it tracked as it was
+                        // (`Restore`). Taking it here would leave a target
+                        // tracked as the frame's shader read with no barrier
+                        // that ever moved it there.
                         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
-                        picture_state = crate::resource::host_transition(target.this(), read)
-                            .map_or(read, |(_, before)| before);
+                        picture_state = crate::resource::host_copy(target.this()).map_or(
+                            read,
+                            |copy| copy.state.load(Ordering::Relaxed),
+                        );
                         picture = texture;
                         picture_this = Some(target.this());
                         if since.cleared {
@@ -8825,8 +8963,12 @@ impl Host {
         );
         // Whether a copy can show this picture as it is: the swap chain's own
         // format, at the client area's size ([`copy_compatible`],
-        // [`draw_or_copy`]).
-        let copyable = copy_compatible(desc.Format, format);
+        // [`draw_or_copy`]), and a resource of one mip and one slice, which is
+        // all a `CopyResource` into a back buffer takes whole — a copy of a mip
+        // chain or an array is refused, so such a picture is drawn by the pass
+        // instead ([`crate::present::whole`]).
+        let copyable = copy_compatible(desc.Format, format)
+            && crate::present::whole(desc.MipLevels, desc.DepthOrArraySize);
         let (chain, show) = match draw_or_copy(drawn.is_some(), copyable, client == size) {
             Some(true) => (client, Show::Drawn(fit(size, client)?)),
             Some(false) => (size, Show::Copy),
@@ -9947,8 +10089,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(test)]
 mod copy_queue {
     use super::{
-        COPY_LISTS, CopyOrder, ListFrom, batch_done, copy_queue_window, copied_state, list_from,
-        overlap_slot,
+        COPY_LISTS, CopyOrder, ListFrom, batch_done, copy_queue_window, copied_state, fetch_waits,
+        list_from, overlap_slot,
     };
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
@@ -10033,16 +10175,122 @@ mod copy_queue {
         // Nothing has been sent: the direct queue waits for nothing.
         assert_eq!(order.wait(), None);
         let first = order.sending();
+        order.signalled(first);
         assert_eq!(order.wait(), Some(first));
         order.waited(first);
         assert_eq!(order.wait(), None, "a batch waited for is not waited for again");
         // A second batch is a value behind the first, and a wait of its own.
         let second = order.sending();
+        order.signalled(second);
         assert!(second > first);
         assert_eq!(order.wait(), Some(second));
         // Waiting for an older value leaves the newer one to be waited for.
         order.waited(first);
         assert_eq!(order.wait(), Some(second));
+    }
+
+    /// A batch whose `Signal` failed is numbered and never named by the fence:
+    /// no wait may name its number, or it never returns — the copy queue drains
+    /// such a batch on the CPU instead ([`super::CopyLists::drain`]) and names
+    /// that. Until then a wait names the last value a signal carried.
+    #[test]
+    fn a_failed_signal_leaves_no_value_to_wait_for() {
+        let mut order = CopyOrder::default();
+        // Nothing signalled at all: nothing to wait for, on either queue.
+        assert_eq!(fetch_waits(&order), None);
+        assert_eq!(order.wait(), None);
+        let first = order.sending();
+        order.signalled(first);
+        assert_eq!(fetch_waits(&order), Some(first));
+        order.waited(first);
+        // The next batch's signal failed: its number is spent, not on the fence.
+        let failed = order.sending();
+        assert!(failed > first, "a number is used once, however its signal went");
+        assert_ne!(fetch_waits(&order), Some(failed), "the fetch does not wait for it");
+        assert_eq!(order.wait(), None, "nor does the direct queue");
+        // The drain that follows is signalled above it, and names both batches.
+        let drained = order.sending();
+        order.signalled(drained);
+        assert_eq!(fetch_waits(&order), Some(drained));
+        assert_eq!(order.wait(), Some(drained));
+        assert!(batch_done(Some(drained), None, drained), "the drained batch is run with it");
+    }
+
+    /// The steps a batch or a fetch takes on [`super::QUEUE_ORDER`]: one a
+    /// batch takes (numbered, and the [`super::FETCH_BARRIER`] it reads in the
+    /// same hold), and two a fetch takes, which may be one hold of the order or
+    /// two releases of it.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// A batch: numbered now, and it waits for the fetch in force.
+        Batch,
+        /// The fetch publishes its own value as the barrier.
+        FetchPublishes,
+        /// The fetch takes the last value signalled and enqueues its own signal.
+        FetchWaits,
+    }
+
+    /// Runs a script of steps and names the first cycle it closes: a batch that
+    /// waits for a fetch which waits for that batch. Fence values are the
+    /// batches' own numbers, so the two are comparable.
+    fn cycle_in(script: &[Step]) -> Option<(u64, u64)> {
+        let mut order = CopyOrder::default();
+        let mut barrier: Option<u64> = None;
+        let mut own = 0u64;
+        // Every batch: its number, and the fetch it waits for.
+        let mut batches: Vec<(u64, Option<u64>)> = Vec::new();
+        // Every fetch: its own value, and the batch number it waits for.
+        let mut fetches: Vec<(u64, Option<u64>)> = Vec::new();
+        for step in script {
+            match step {
+                Step::Batch => {
+                    let number = order.sending();
+                    order.signalled(number);
+                    batches.push((number, barrier));
+                }
+                Step::FetchPublishes => {
+                    own += 2;
+                    barrier = Some(own);
+                }
+                Step::FetchWaits => fetches.push((own, fetch_waits(&order))),
+            }
+        }
+        for (number, fetch) in &batches {
+            let Some(value) = fetch else { continue };
+            let Some((_, waits)) = fetches.iter().find(|(own, _)| own == value) else {
+                continue;
+            };
+            if *waits == Some(*number) {
+                return Some((*number, *value));
+            }
+        }
+        None
+    }
+
+    /// What keeps the two queues in a chain and never in a cycle, modelled on
+    /// the steps under [`super::QUEUE_ORDER`] (`Host::relay_card_fetch`,
+    /// `Host::card_copies`): a fetch publishes its own value and takes the last
+    /// signalled one in one hold, and a batch takes its number and reads that
+    /// barrier in another. So a batch that waits for a fetch was numbered after
+    /// every batch that fetch waits for, and no fetch waits for a batch that
+    /// waits for it. Publishing the barrier before taking the order — what the
+    /// fetch used to do, the two steps separated — is the cycle the queues died
+    /// in: the copy queue waited for the fetch while the fetch waited for the
+    /// batch that had just read the new barrier.
+    #[test]
+    fn a_fetch_and_the_batches_that_wait_for_it_form_a_chain() {
+        use Step::{Batch, FetchPublishes, FetchWaits};
+        let held = [Batch, Batch, FetchPublishes, FetchWaits];
+        let held = [held.as_slice(), &held, &held].concat();
+        assert_eq!(cycle_in(&held), None, "the publication and the wait, one hold");
+        // The shape that deadlocked: the publication, a batch numbered against
+        // it, and only then the value the fetch waits for.
+        let split = [Batch, FetchPublishes, FetchWaits, Batch, FetchPublishes, Batch, FetchWaits];
+        assert_eq!(
+            cycle_in(&split),
+            Some((3, 4)),
+            "the copy queue and the fetch wait for each other"
+        );
     }
 
     /// The write of a batch reaches the direct queue only after the copy
