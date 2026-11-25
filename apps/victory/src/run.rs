@@ -74,6 +74,12 @@ pub fn run(
         },
     );
 
+    // The launch policy: read here, inside `run`, from `<data-dir>/launch.toml`
+    // (`%LOCALAPPDATA%\victory\data\launch.toml` on Windows, or wherever
+    // `VICTORY_DATA_DIR` points), so a toggle takes effect on the next launch
+    // with no rebuild and the same file serves every worktree a run is started
+    // from. The layer applies it once the window exists.
+    victory_hle::autokeys::install(read_launch_policy(&cfg));
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
@@ -213,6 +219,24 @@ fn emit_header(cfg: &victory_core::Config, header: &Header<'_>) {
         env: victory_env(),
     };
     victory_core::logging::emit("INFO", &run.render());
+}
+
+/// The run's launch policy, from `launch.toml`, and the one `RUN launch` line
+/// that states what it decided.
+///
+/// `run` calls this at every launch, which is what makes an edit to the file
+/// apply to the next run: nothing is baked in, and no environment variable is
+/// needed. A file that is missing leaves both features off and says where it
+/// would be; a file that does not parse is a warning and changes nothing else,
+/// because a bad config must never stop the title from booting.
+#[cfg(windows)]
+fn read_launch_policy(cfg: &victory_core::Config) -> victory_core::launch::LaunchPolicy {
+    let readout = victory_core::launch::read(&victory_core::launch::path(&cfg.data_dir));
+    if let Some(warn) = &readout.warn {
+        victory_core::logging::emit("WARN", warn);
+    }
+    victory_core::logging::emit("INFO", &readout.info);
+    readout.policy
 }
 
 /// The console the header, the footer and the history row name.

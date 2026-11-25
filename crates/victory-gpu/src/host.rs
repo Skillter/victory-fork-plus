@@ -9383,6 +9383,12 @@ impl Host {
                     return None;
                 }
             };
+            // The window is the one the swap chain presents on, and this is
+            // where the layer first knows it: `launch.toml`'s focus and Enter
+            // schedule starts from here (`victory_core::launch`).
+            if let Some(p) = presenter.as_ref() {
+                crate::autokeys::window_ready(p.hwnd.0 as isize);
+            }
         }
         let p = presenter.as_mut()?;
         // Every present the layer is shown drives the meter, whether or not
