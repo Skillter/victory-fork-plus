@@ -35,6 +35,12 @@ pub fn init(default_level: &str) {
     install(default_level, log_target(override_path().as_deref(), None));
 }
 
+/// Logging for the audio recorder `run` starts: stderr only. It must not read
+/// `VICTORY_LOG_FILE`, which the parent that started it is writing.
+pub fn init_stderr(default_level: &str) {
+    install(default_level, None);
+}
+
 /// Logging for `run`, which knows its data directory by now: stderr, plus
 /// `<log_dir>/run.log` unless `VICTORY_LOG_FILE` says otherwise.
 pub fn init_run(default_level: &str, log_dir: &Path) {

@@ -127,7 +127,7 @@ fn main() -> Result<()> {
     // later, once the config has named the data directory its file belongs in.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::is_child() {
-        victory_core::logging::init("info");
+        victory_core::logging::init_stderr("info");
         victory_hle::modules::audio::capture::child();
         return Ok(());
     }
