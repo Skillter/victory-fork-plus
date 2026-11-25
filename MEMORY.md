@@ -218,6 +218,15 @@ Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 1.8 ms over 6.4 MB), 1.7 ms on the GPU, 1.7 ms copying back 1.4 MB; the frame
 that first built 2,298 draws took 11,076.5 ms and dropped 3,763 of them.
 
+Copies out of title memory run at 1.2–2.5 GB/s when the pages are in memory and
+33–68 MB/s in the intro (`run-20261125-043856.log`: 96.3 MB in 1,409 ms), which
+nothing that stays inside the process accounts for: a 64 MB `ReadProcessMemory`
+of this process's own pages takes 10–17 ms (3.8–6.7 GB/s), the same bytes one
+4 KiB page a call 1.2–2.1 µs a page (2.0–3.5 GB/s), and 17,494 faults from a
+page trimmed out of the working set cost nothing measurable (the same read came
+back at 5.6–9.3 GB/s) — measured 25 Nov by
+`cargo test -p victory-gpu --lib what_a_copy_costs -- --ignored --nocapture`.
+
 The readback exists because the console has unified memory and the PC does not:
 compute shaders write buffers that the title's CPU code then reads, so VIctory
 must find what changed and copy it back, before the title proceeds.
