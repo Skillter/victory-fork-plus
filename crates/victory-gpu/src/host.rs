@@ -6176,14 +6176,12 @@ impl Host {
         // shortcut: a swap chain of the window's size would cut the present's
         // copy to a quarter (4K into a 2K window) and let a shader of ours
         // filter the scale; it needs a fullscreen pipeline this path has none
-        // of, so DXGI scales each present instead, keeping the frame's aspect
-        // (a window of another shape is letterboxed, not stretched into).
+        // of, so DXGI stretches each present into the window. A window of
+        // another shape therefore distorts the picture until that pass exists:
+        // for a Win32 flip chain the aspect-ratio scaling mode is documented as
+        // behaving like a plain stretch, so asking for it would not letterbox.
         let client = client_size(hwnd);
-        // Which way the host GPU scales a frame into the window: stretching
-        // fills a window of the frame's shape exactly, and a window of another
-        // shape is letterboxed instead, so the picture never distorts. Chosen
-        // once, here: a scaling mode cannot change without a new swap chain.
-        let letterbox = client.is_some_and(|c| !same_shape(c, (width, height)));
+        let same = client.is_some_and(|c| same_shape(c, (width, height)));
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6201,34 +6199,13 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let made = factory
-                .CreateSwapChainForHwnd(
-                    &self.queue,
-                    hwnd,
-                    &desc(if letterbox {
-                        DXGI_SCALING_ASPECT_RATIO_STRETCH
-                    } else {
-                        DXGI_SCALING_STRETCH
-                    }),
-                    None,
-                    None,
-                )
-                .or_else(|e| {
-                    if !letterbox {
-                        return Err(e);
-                    }
-                    tracing::warn!(
-                        error = %e,
-                        "no swap chain that keeps the frame's aspect; stretching into the window"
-                    );
-                    factory.CreateSwapChainForHwnd(
-                        &self.queue,
-                        hwnd,
-                        &desc(DXGI_SCALING_STRETCH),
-                        None,
-                        None,
-                    )
-                })?;
+            let made = factory.CreateSwapChainForHwnd(
+                &self.queue,
+                hwnd,
+                &desc(DXGI_SCALING_STRETCH),
+                None,
+                None,
+            )?;
             let swap_chain = made.cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
@@ -6241,13 +6218,13 @@ impl Host {
                     height,
                     window_width,
                     window_height,
-                    scaled = if letterbox {
-                        "letterboxed to the frame's aspect"
+                    scaled = if same {
+                        "the window has the frame's shape"
                     } else {
-                        "stretched to the window"
+                        "the window has another shape: distorted until a scale pass of our own exists"
                     },
-                    "the window is another size than the frame: the host GPU scales each present into it (the title renders \
-                     the size of the console's display mode, VICTORY_DISPLAY_MODE=WxH)"
+                    "the window is another size than the frame: the host GPU stretches each present into it (the title \
+                     renders the size of the console's display mode, VICTORY_DISPLAY_MODE=WxH)"
                 );
             }
             Ok(Presenter {

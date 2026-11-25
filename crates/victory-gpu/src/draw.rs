@@ -1474,21 +1474,34 @@ impl State {
         // count and the cap, so a texture written and never re-read says so.
         {
             static LAST: AtomicU64 = AtomicU64::new(0);
-            let dropped = crate::descriptor::host::RANGES_DROPPED.swap(0, Ordering::Relaxed);
+            static SINCE: AtomicU64 = AtomicU64::new(0);
+            // Taken every frame: the queue hands them over once, so a count
+            // read only on the printing frame would lose the others.
+            SINCE.fetch_add(
+                crate::descriptor::host::RANGES_DROPPED.swap(0, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             let now = crate::host::now_ms();
             let last = LAST.load(Ordering::Relaxed);
-            if dropped > 0
-                && now >= last + 5_000
-                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            if now >= last + 5_000
+                && LAST
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
             {
-                tracing::info!(
-                    "textures picked by index: {dropped} ranges of memory mapped, unmapped or written under texture views were \
-                     dropped in the last {} s: the queue holds {} of them ({} KiB), and they were not taken before it filled; \
-                     the slots there are looked at when they are due",
-                    now.saturating_sub(last).max(1) / 1000,
-                    crate::descriptor::host::RANGE_CAP,
-                    (crate::descriptor::host::RANGE_CAP * std::mem::size_of::<(u64, u64)>()) >> 10
-                );
+                let dropped = SINCE.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    let window = match last {
+                        0 => "since the start".to_string(),
+                        last => format!("in the last {} s", now.saturating_sub(last).max(1) / 1000),
+                    };
+                    tracing::info!(
+                        "textures picked by index: {dropped} ranges of memory mapped, unmapped or written under texture \
+                         views were dropped {window}: the queue holds {} of them ({} KiB), and they were not taken \
+                         before it filled; the slots there are looked at when they are due",
+                        crate::descriptor::host::RANGE_CAP,
+                        (crate::descriptor::host::RANGE_CAP * std::mem::size_of::<(u64, u64)>()) >> 10
+                    );
+                }
             }
         }
         let (due, census) = host.texture_slots_due(frame, 4096);

@@ -33,7 +33,7 @@ Two directories hold all derived state, both outside `<repo>`: `<cache-dir>`
     <cache-dir>/shaders/     translated shaders, keyed by this build's hash
     <cache-dir>/pipelines/   host-pipelines.bin, early-pipelines.txt
     <cache-dir>/images/      prepared copies of the title's images
-    <data-dir>/data/<title-id>/  saves, settings, crashes.log, temp
+    <data-dir>/<title-id>/  saves, settings, crashes.log, temp
     <data-dir>/logs/         run.log from `victory run`, if no VICTORY_LOG_FILE
     <data-dir>/capture/      captured frames
     <data-dir>/world*/       frame dumps from earlier sessions
@@ -41,7 +41,7 @@ Two directories hold all derived state, both outside `<repo>`: `<cache-dir>`
 
 The game folder is read-only by preference. Nothing should ever need to write
 there: the title sees the package as `G:` and its writable storage as `Z:`/`T:`
-over `<data-dir>/data/<title-id>/`.
+over `<data-dir>/<title-id>/`.
 
 ---
 
@@ -279,7 +279,7 @@ request is visible today.
 - **In-game resolution setting.** Earlier notes called this a dead end; it
   exists. They claimed `settings.xml` had no resolution key and no ray-tracing
   key, and that was wrong. *(re-measured)*
-  `<data-dir>/data/<title-id>/storage/settings/settings.xml` is readable text
+  `<data-dir>/<title-id>/storage/settings/settings.xml` is readable text
   and carries, among others, `resolutionFullscreen` (`3840x2160`),
   `frameRateLimit` (`30`), `vSync`, `hdr`, `fsrQuality`,
   `graphicsQualityPreset`, `rtDynamicShadows` (**`true` by default**),
@@ -320,7 +320,7 @@ Sample run clock:
      …        intro: cutscene renders, ~1-2 fps, ~350 dropped draws
               world: 2.1 fps, 473 ms/frame
 
-Saves and settings live under `<data-dir>/data/<title-id>/`
+Saves and settings live under `<data-dir>/<title-id>/`
 (`saves\0009000000000001\...\Player~<hash>\v5\{0,1,manifest}`,
 `SettingsProfileSettings~<hash>\v2\...`). *(re-measured)* the version folder is
 part of the title's format and was **v5** (`Player~<hash>`), **v2**
@@ -362,7 +362,7 @@ deferred path here ever looks wrong rather than dark, check target formats first
 - A GPU hang resets the display and shows up as
   `host GPU device removed ... (0x887A0006)`. Set `VICTORY_D3D12_DRED=1` first
   if a run might die — it names the faulting command.
-  `<data-dir>/data/<title-id>/crashes.log` and the title's own
+  `<data-dir>/<title-id>/crashes.log` and the title's own
   `temp\victory-*.crash.log` both survive a crash.
 - `VICTORY_CAPTURE` frames 1-1024 are black during boot; the menu art only
   streams in around frame 700-768. Pick later frames or you will debug a black

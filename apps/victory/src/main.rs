@@ -123,19 +123,13 @@ enum Console {
 
 fn main() -> Result<()> {
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`. It has no
-    // CLI and no config, so it settles for stderr before `child` logs
-    // through it; `run` itself starts logging later, once the config has
-    // named the data directory its file belongs in.
+    // CLI and no config, so it settles for stderr; `run` itself starts logging
+    // later, once the config has named the data directory its file belongs in.
     #[cfg(all(windows, feature = "diagnostics"))]
-    {
-        if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
-            && std::env::var_os("VICTORY_AUDIO_CAPTURE_OF").is_some()
-        {
-            victory_core::logging::init("info");
-        }
-        if victory_hle::modules::audio::capture::child() {
-            return Ok(());
-        }
+    if victory_hle::modules::audio::capture::is_child() {
+        victory_core::logging::init("info");
+        victory_hle::modules::audio::capture::child();
+        return Ok(());
     }
     let cli = Cli::parse();
     // `run` installs logging itself, once the config has named the data

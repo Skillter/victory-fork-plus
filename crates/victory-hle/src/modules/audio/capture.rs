@@ -79,7 +79,18 @@ pub fn start() {
 
 /// In the recorder (a child started by [`start`]): records until the
 /// target exits and returns true; false in any other process.
+/// Whether this process is the recorder [`child`] starts: the parent named a
+/// file and left a pid that parses. A stray pair of these variables in a
+/// normal shell is not a child, so it must not take the log subscriber.
+pub fn is_child() -> bool {
+    std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
+        && std::env::var(TARGET).is_ok_and(|pid| pid.parse::<u32>().is_ok())
+}
+
 pub fn child() -> bool {
+    if !is_child() {
+        return false;
+    }
     let (Some(pid), Some(path)) = (
         std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
         std::env::var_os("VICTORY_AUDIO_CAPTURE"),

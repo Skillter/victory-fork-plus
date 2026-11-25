@@ -16,6 +16,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::prepare::{IMAGE_NAME_PREFIX, IMAGE_NAME_SUFFIX};
@@ -73,6 +74,16 @@ pub struct Pruned {
 /// what the directory holds after the pass; the copy about to be written is
 /// not counted until the next pass sees it.
 pub fn prune(dir: &Path, live: &Path) -> Pruned {
+    // Every copy this process maps is spared for the rest of the run, not only
+    // the one about to be written: `write_if_changed` leaves an unchanged copy
+    // with its old timestamp, so a month-old main image is still the file the
+    // loader has mapped, and the next title DLL's pass must not try to remove
+    // it (Windows refuses, and the warning would repeat for every DLL).
+    if let Ok(mut names) = mapped().lock()
+        && !names.iter().any(|p| p == live)
+    {
+        names.push(live.to_path_buf());
+    }
     let pruned = prune_with(dir, live, PrunePolicy::default(), SystemTime::now());
     if pruned.entries > 0 {
         tracing::info!(
@@ -85,6 +96,13 @@ pub fn prune(dir: &Path, live: &Path) -> Pruned {
         );
     }
     pruned
+}
+
+/// Copies this process has written or mapped, by full path. Only [`prune`]
+/// fills it; [`prune_with`] reads it.
+fn mapped() -> &'static Mutex<Vec<PathBuf>> {
+    static MAPPED: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    MAPPED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// [`prune`] with the clock and the policy given, for tests.
@@ -102,14 +120,18 @@ pub fn prune_with(dir: &Path, live: &Path, policy: PrunePolicy, now: SystemTime)
         return pruned;
     }
     // `write_if_changed` leaves an unchanged copy in place, so the copy this
-    // run maps can carry a month-old timestamp: it is protected by name.
+    // run maps can carry a month-old timestamp: it is protected by name, and
+    // every copy mapped earlier in the run by path.
     let live = live.file_name();
-    let is_live = |name: &OsStr| Some(name) == live;
+    let protected = mapped().lock().map(|names| names.clone()).unwrap_or_default();
+    let is_live = |entry: &Entry| {
+        Some(entry.name.as_os_str()) == live || protected.iter().any(|p| p == &entry.path)
+    };
     let mut kept: Vec<Entry> = Vec::new();
     for entry in entries(dir) {
         // A time in the future (a clock that moved) counts as untouched.
         let idle = now.duration_since(entry.modified).unwrap_or_default();
-        if !is_live(&entry.name) && idle > policy.max_idle && remove(&entry, &mut pruned) {
+        if !is_live(&entry) && idle > policy.max_idle && remove(&entry, &mut pruned) {
             continue;
         }
         kept.push(entry);
@@ -124,7 +146,7 @@ pub fn prune_with(dir: &Path, live: &Path, policy: PrunePolicy, now: SystemTime)
             if remaining_bytes <= policy.max_bytes {
                 break;
             }
-            if is_live(&entry.name) || !remove(entry, &mut pruned) {
+            if is_live(entry) || !remove(entry, &mut pruned) {
                 continue;
             }
             remaining_bytes = remaining_bytes.saturating_sub(entry.len);
