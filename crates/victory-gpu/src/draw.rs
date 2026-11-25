@@ -37,6 +37,76 @@ enum Root {
     View(u64),
 }
 
+/// The kind of root view a draw sets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+/// A root argument the list has set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootArg {
+    /// The root signature's address: another signature at it is another host
+    /// signature, as another pipeline at a pipeline's address is another host
+    /// pipeline ([`State::bind`]).
+    signature: usize,
+    kind: RootKind,
+    value: u64,
+}
+
+/// What a list has set at its root parameters ([`State::set_root_arg`]). What
+/// a host list has at a parameter survives every other command on it, so a
+/// draw that repeats a value leaves the call out. The values are what the
+/// title's descriptors resolve to on this draw, so a descriptor the title
+/// rewrote resolves to another value and is set again: the cache never stands
+/// in for reading the title's descriptor.
+#[derive(Default)]
+struct RootArgs {
+    /// By (compute, parameter), ascending: a parameter holds one argument, and
+    /// a root signature has at most 64.
+    set: Vec<(bool, u32, RootArg)>,
+}
+
+impl RootArgs {
+    /// Whether the call must be made: the parameter holds another value, or
+    /// another kind of view, or was set under another root signature.
+    fn again(
+        &mut self,
+        signature: usize,
+        compute: bool,
+        param: u32,
+        kind: RootKind,
+        value: u64,
+    ) -> bool {
+        let arg = RootArg {
+            signature,
+            kind,
+            value,
+        };
+        match self
+            .set
+            .binary_search_by(|(space, at, _)| (*space, *at).cmp(&(compute, param)))
+        {
+            Ok(k) if self.set[k].2 == arg => false,
+            Ok(k) => {
+                self.set[k].2 = arg;
+                true
+            }
+            Err(k) => {
+                self.set.insert(k, (compute, param, arg));
+                true
+            }
+        }
+    }
+
+    /// A host list with nothing set (a cut, [`State::replay`]).
+    fn clear(&mut self) {
+        self.set.clear();
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -226,9 +296,12 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds, as runs of the view heap's ring;
+    /// given back when the list has run, is reset or released.
+    ring: crate::descriptor::host::DynamicList,
+    /// What the list last set at each root argument ([`RootArgs`]): a draw
+    /// that repeats one leaves the call out.
+    root_args: RootArgs,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -242,7 +315,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.ring.drain() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -257,14 +330,14 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.ring.is_empty() {
             return;
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
+        for (heap, first, n) in self.ring.drain() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
@@ -724,6 +797,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // The new host list has no root argument set.
+        self.root_args.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -996,6 +1071,9 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            // A root signature switch leaves the root arguments undefined:
+            // every one this draw sets is set again.
+            self.root_args.clear();
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1059,17 +1137,10 @@ impl State {
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
-                        // Ours: the directory of title memory by address.
+                        // Ours: the directory of title memory by address. It
+                        // lives as long as the process and the list holds it.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            self.set_root_arg(list, compute, param, RootKind::Srv, m.directory);
                         }
                         continue;
                     }
@@ -1077,15 +1148,11 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            // The table lives as long as the heap the list
+                            // holds.
+                            Some(gpu) => {
+                                self.set_root_arg(list, compute, param, RootKind::Srv, gpu);
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1124,30 +1191,17 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    // The address is in live memory the list holds.
+                    let kind = if srv { RootKind::Srv } else { RootKind::Cbv };
+                    self.set_root_arg(list, compute, param, kind, gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
-                    // Ours: where shaders note the pages they found empty.
+                    // Ours: where shaders note the pages they found empty;
+                    // the buffer lives as long as the process.
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        self.set_root_arg(list, compute, param, RootKind::Uav, m.faults);
                     }
                     continue;
                 }
@@ -1167,6 +1221,37 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// Sets a root CBV, SRV or UAV at `param`: a draw that repeats the value
+    /// the list has there leaves the call out, as the pipeline, the root
+    /// signature and the heaps are left out. A cut's new host list has none
+    /// of them ([`State::replay`]), and neither has one under another root
+    /// signature.
+    fn set_root_arg(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        param: u32,
+        kind: RootKind,
+        value: u64,
+    ) {
+        let signature = self.host_roots[usize::from(compute)];
+        if !self.root_args.again(signature, compute, param, kind, value) {
+            return;
+        }
+        // SAFETY: an open list; the value is a GPU address in live memory the
+        // list holds.
+        unsafe {
+            match (compute, kind) {
+                (false, RootKind::Cbv) => list.list.SetGraphicsRootConstantBufferView(param, value),
+                (false, RootKind::Srv) => list.list.SetGraphicsRootShaderResourceView(param, value),
+                (false, RootKind::Uav) => list.list.SetGraphicsRootUnorderedAccessView(param, value),
+                (true, RootKind::Cbv) => list.list.SetComputeRootConstantBufferView(param, value),
+                (true, RootKind::Srv) => list.list.SetComputeRootShaderResourceView(param, value),
+                (true, RootKind::Uav) => list.list.SetComputeRootUnorderedAccessView(param, value),
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1223,14 +1308,8 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            // The address is in a buffer the list holds.
+            self.set_root_arg(list, compute, param, RootKind::Uav, gpu);
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1246,10 +1325,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1317,10 +1395,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2369,15 +2446,13 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic_in(&mut self.ring, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3243,5 +3318,87 @@ mod tests {
             crate::resource::sweepable(true, 1, 1, admit[PERSISTENT] == 2),
             "a one-touch page is evictable"
         );
+    }
+
+    /// A draw that repeats the root arguments another draw of the list set
+    /// leaves every `SetGraphicsRoot*View` out: 1,000 draws of three root
+    /// views make three calls, which is what the list is told ([`RootArgs`]).
+    #[test]
+    fn repeated_root_arguments_are_set_once() {
+        let mut args = RootArgs::default();
+        let signature = 0x1000_0000usize;
+        let draw = [
+            (0u32, RootKind::Cbv, 0xc000_0000u64),
+            (2, RootKind::Srv, 0xd000_0000),
+            (3, RootKind::Uav, 0xe000_0000),
+        ];
+        let mut calls = 0;
+        for _ in 0..1_000 {
+            for &(param, kind, value) in &draw {
+                if args.again(signature, false, param, kind, value) {
+                    calls += 1;
+                }
+            }
+        }
+        assert_eq!(calls, draw.len(), "SetGraphicsRoot*View calls");
+        // Another value at any of them is set: the title set another one.
+        assert!(args.again(signature, false, 2, RootKind::Srv, 0xd000_0100));
+        // Another kind of view at a parameter is another argument.
+        assert!(args.again(signature, false, 3, RootKind::Cbv, 0xe000_0000));
+        // The compute space is another set of parameters.
+        assert!(args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
+        assert!(!args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
+    }
+
+    /// A descriptor the title rewrote between two draws resolves to another
+    /// value at the same title address, and the root argument is set again: a
+    /// title that rewrites its descriptors every draw gets every argument set
+    /// (the cache is fed what this draw read, never the address the title
+    /// set).
+    #[test]
+    fn a_rewritten_root_view_is_set_again() {
+        let mut args = RootArgs::default();
+        let signature = 0x1000_0000usize;
+        // The title's root CBV address, and what the descriptor there
+        // resolves to: `root_view` reads the record at the address on every
+        // draw, so a rewrite is another value at the same address.
+        let address = 0x7ff6_0000u64;
+        let mut resolved = std::collections::HashMap::from([(address, 0xaaaa_0000u64)]);
+        let mut calls = 0;
+        for draw in 0..3 {
+            if draw == 1 {
+                // Another resource described where the old one was.
+                resolved.insert(address, 0xbbbb_0000);
+            }
+            if args.again(signature, false, 1, RootKind::Cbv, resolved[&address]) {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 2, "the rewrite was not read");
+    }
+
+    /// A root signature switch and a cut's new host list leave nothing set:
+    /// every argument is set again.
+    #[test]
+    fn a_new_signature_or_list_sets_every_root_argument_again() {
+        // Another signature, then a cut ([`State::bind`], [`State::replay`]).
+        let script = [
+            (0x1000_0000usize, false),
+            (0x1000_0000, false),
+            (0x2000_0000, true),
+            (0x2000_0000, false),
+            (0x2000_0000, true),
+        ];
+        let mut args = RootArgs::default();
+        let mut calls = 0;
+        for (signature, cleared) in script {
+            if cleared {
+                args.clear();
+            }
+            if args.again(signature, false, 0, RootKind::Cbv, 0xc000_0000) {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 3);
     }
 }

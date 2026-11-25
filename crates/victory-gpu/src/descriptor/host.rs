@@ -31,24 +31,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
-    free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
+    /// The dynamic slots (view heaps only): the bump cursor and the runs
+    /// given back ([`Ring`]). Taken a whole list at a time ([`DynamicList`]):
+    /// the drawing thread never locks this per table.
+    ring: Mutex<Ring>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -705,9 +691,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            ring: Mutex::new(Ring::new(extra)),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -790,10 +774,257 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// The dynamic slots of a view heap: a bump cursor that walks the ring once,
+/// and the runs lists gave back, taken again from the front.
+///
+/// A list is given one run at a time and steps through it itself
+/// ([`DynamicList`]), so what it asks for costs arithmetic on its own run and
+/// never a walk of the ring: the walk touched up to 262 KiB with the lock
+/// every table needs held, per draw.
+struct Ring {
+    /// The first slot not handed out since the ring was made.
+    at: u32,
+    /// Slots in the ring: [`DYNAMIC`] in view heaps.
+    capacity: u32,
+    /// Runs given back, first and length: ascending, never adjacent.
+    runs: Vec<(u32, u32)>,
+    /// Free slots: the cursor's tail and the runs. With fewer than a table
+    /// needs nothing is looked at. Once the world had taken them all, every
+    /// later table of the frame searched every slot before it was refused.
+    free: u32,
+    /// The shortest run asked for since slots were last given back that none
+    /// held (`u32::MAX`: none). Until something is given back the free runs
+    /// only shrink, so a run of that length or longer is refused without a
+    /// search: enough slots were free, but in pieces, and every such table
+    /// walked the whole ring before it was refused (0.33 ms each with
+    /// 131,072 slots, 1.0 s of the recording threads in a frame that refused
+    /// 3,143, run 45).
+    refused: u32,
+    /// Slots this looked at and runs it read, for the test that says a run of
+    /// allocations does not walk the ring.
+    #[cfg(test)]
+    steps: u64,
+}
+
+impl Ring {
+    fn new(capacity: u32) -> Self {
+        Ring {
+            at: 0,
+            capacity,
+            runs: Vec::new(),
+            free: capacity,
+            refused: u32::MAX,
+            #[cfg(test)]
+            steps: 0,
+        }
+    }
+
+    /// `n` consecutive free slots, as (first, length): the cursor's tail
+    /// first, then the runs given back, shortest search first.
+    fn take(&mut self, n: u32) -> Option<(u32, u32)> {
+        if n == 0 || n > self.capacity || self.free < n {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+        // A table of the length that last found nothing (and every longer
+        // one) is refused without the search: they have only got rarer.
+        if n >= self.refused {
+            return None;
+        }
+        if self.at + n <= self.capacity {
+            let first = self.at;
+            self.at += n;
+            self.free -= n;
+            return Some((first, n));
+        }
+        for k in 0..self.runs.len() {
+            #[cfg(test)]
+            {
+                self.steps += 1;
+            }
+            let (first, len) = self.runs[k];
+            if len < n {
+                continue;
+            }
+            if len == n {
+                self.runs.remove(k);
+            } else {
+                self.runs[k] = (first + n, len - n);
+            }
+            self.free -= n;
+            return Some((first, n));
+        }
+        self.refused = n;
+        None
+    }
+
+    /// Slots `first` on, `len` of them, free again: merged with the runs
+    /// around them, which a list gives back one after another.
+    fn give_back(&mut self, first: u32, len: u32) {
+        if first >= self.capacity {
+            return;
+        }
+        let mut len = len.min(self.capacity - first);
+        if len == 0 {
+            return;
+        }
+        self.refused = u32::MAX;
+        self.free += len;
+        let mut first = first;
+        if let Some(k) = self.runs.partition_point(|&(f, _)| f < first).checked_sub(1) {
+            let (before, before_len) = self.runs[k];
+            if before + before_len == first {
+                self.runs.remove(k);
+                first = before;
+                len += before_len;
+            }
+        }
+        let at = self.runs.partition_point(|&(f, _)| f < first);
+        if let Some(&(after, after_len)) = self.runs.get(at)
+            && first + len == after
+        {
+            len += after_len;
+            self.runs.remove(at);
+        }
+        self.runs.insert(at, (first, len));
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+    }
+}
+
+/// A run of dynamic slots one list holds: `first` to `end` of the host heap
+/// whose address is `heap` (by host heap, so that a heap released and another
+/// made at its address is another heap), with `next` the slot its next table
+/// starts at.
+struct Region {
+    heap: usize,
+    first: u32,
+    next: u32,
+    end: u32,
+}
+
+/// The dynamic slots one list holds ([`HostHeap::dynamic`]): runs of its view
+/// heap's ring, given back as a whole when the list's submission has run or
+/// the list is released. A run is taken once and stepped through here, so a
+/// table costs the list an add.
+#[derive(Default)]
+pub(crate) struct DynamicList {
+    regions: Vec<Region>,
+}
+
+impl DynamicList {
+    /// The run this list holds that takes `n` more slots of heap `heap` and
+    /// the slot they start at, or `None` for the caller to reserve one.
+    fn step(&mut self, heap: usize, n: u32) -> Option<u32> {
+        let region = self.regions.last_mut()?;
+        if region.heap != heap || region.next + n > region.end {
+            return None;
+        }
+        let at = region.next;
+        region.next = at + n;
+        Some(at)
+    }
+
+    /// `n` consecutive dynamic slots of `heap`: the first's host index, taken
+    /// until [`DynamicList::drain`].
+    fn alloc(&mut self, heap: &HostHeap, n: u32) -> Option<u32> {
+        let id = heap.id();
+        if let Some(first) = self.step(id, n) {
+            return Some(first);
+        }
+        // A run twice the size of the last one, up to a page of slots, so
+        // that a list of many tables does not ask for a run per table; and
+        // never past what a table can be.
+        let held = self
+            .regions
+            .last()
+            .filter(|region| region.heap == id)
+            .map_or(0, |region| region.end - region.first);
+        let len = n.max(held.min(GROWTH));
+        // Room for the table but not for the run it would like (other lists
+        // are holding slots): take its slots alone rather than refuse a table
+        // the ring could hold.
+        let (first, len) = match heap.reserve(len) {
+            Some(taken) => taken,
+            None if len > n => heap.reserve(n)?,
+            None => return None,
+        };
+        // Next to the run the list already holds: grown in place, so that a
+        // list that outgrows its run keeps one run.
+        match self.regions.last_mut() {
+            Some(region) if region.heap == id && region.end == first => {
+                region.end += len;
+                let at = region.next;
+                region.next = at + n;
+                Some(at)
+            }
+            _ => {
+                self.regions.push(Region {
+                    heap: id,
+                    first,
+                    next: first + n,
+                    end: first + len,
+                });
+                Some(first)
+            }
+        }
+    }
+
+    /// Gives every run back, as (host heap, first slot, slots). The caller
+    /// releases them ([`crate::descriptor::release_dynamic`]): the heap may
+    /// be gone by then.
+    pub(crate) fn drain(&mut self) -> Vec<(usize, u32, u32)> {
+        self.regions
+            .drain(..)
+            .map(|region| (region.heap, region.first, region.end - region.first))
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+}
+
+/// The most slots one reservation grows to: a list of small tables asks the
+/// ring again once per this many slots, not once per table.
+const GROWTH: u32 = 4096;
+
 impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// This heap as a list names it (see [`Region::heap`]).
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// `len` slots of the ring as (host index, length), to be given back with
+    /// [`HostHeap::release`].
+    fn reserve(&self, len: u32) -> Option<(u32, u32)> {
+        let (first, len) = self
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(len)?;
+        Some((self.count + first, len))
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only) for `list`, taken
+    /// until it gives them back ([`DynamicList::drain`]): the first's host
+    /// index.
+    pub(crate) fn dynamic_in(&self, list: &mut DynamicList, n: u32) -> Option<u32> {
+        self.take_slots(n, Some(list))
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only) held for the
+    /// heap's life (the memory directory's views): the first's host index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.take_slots(n, None)
+    }
+
+    fn take_slots(&self, n: u32, list: Option<&mut DynamicList>) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -801,48 +1032,23 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
-            return None;
+        let made = match list {
+            Some(list) => list.alloc(self, n),
+            None => self.reserve(n).map(|(first, _)| first),
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+        {
+            use crate::copystat::{C, add};
+            if made.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        if made.is_none() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+        }
+        made
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1157,22 +1363,16 @@ impl HostHeap {
         stale
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
-    ///
-    /// [`dynamic`]: HostHeap::dynamic
+    /// Gives back `n` dynamic slots from `first` (a host index a
+    /// [`drain`](DynamicList::drain) named), free for another list's run.
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
-        }
+        self.ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give_back(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2554,18 +2754,136 @@ mod tests {
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 
+    /// A run of allocations makes no search: each of 10,000 tables in a ring
+    /// that holds them costs the cursor one step and reads no slot of it.
+    /// Everything given back merges into one run, and the tables after that
+    /// cost one run read apiece.
     #[test]
-    fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
+    fn ten_thousand_allocations_do_not_walk_the_ring() {
+        const TABLES: u32 = 10_000;
+        let mut ring = Ring::new(TABLES);
+        assert_eq!(ring.free, TABLES);
+        for table in 0..TABLES {
+            let before = ring.steps;
+            assert_eq!(ring.take(1), Some((table, 1)), "table {table}");
+            assert_eq!(ring.steps - before, 1, "table {table} read the ring");
+        }
+        // Full: the ring has nothing left and the cursor is at its end.
+        assert_eq!((ring.free, ring.at), (0, TABLES));
+        assert_eq!(ring.take(1), None);
+        // Given back one run at a time in the order they were taken, the runs
+        // merge: the whole ring is one run again.
+        for table in 0..TABLES {
+            ring.give_back(table, 1);
+        }
+        assert_eq!(ring.runs, [(0, TABLES)]);
+        assert_eq!(ring.free, TABLES);
+        let before = ring.steps;
+        for table in 0..TABLES {
+            assert_eq!(ring.take(1), Some((table, 1)), "again {table}");
+        }
+        // One step per table plus one run read for the first: the run is
+        // looked at per take, and no more than that.
+        assert_eq!(ring.steps - before, 2 * u64::from(TABLES));
+    }
+
+    /// A list's tables come out of the run it holds: 10,000 of them cost it
+    /// the run's cursor, and the ring is not read. Another heap's run is
+    /// never stepped through.
+    #[test]
+    fn a_lists_tables_come_from_its_own_run() {
+        let mut list = DynamicList {
+            regions: vec![Region {
+                heap: 7,
+                first: 100,
+                next: 100,
+                end: 10_100,
+            }],
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
-        // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        for table in 0..10_000u32 {
+            assert_eq!(list.step(7, 1), Some(100 + table));
+        }
+        // Spent: the list asks the ring for another run.
+        assert_eq!(list.step(7, 1), None);
+        assert_eq!(list.step(8, 1), None);
+    }
+
+    /// Runs never overlap, whatever the order tables are asked for and given
+    /// back in (a slot handed out twice is a table the other list reads).
+    #[test]
+    fn runs_never_overlap() {
+        let mut ring = Ring::new(256);
+        // A fixed sequence: no card, no clock.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |of: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(of)) as u32
+        };
+        let mut held: Vec<(u32, u32)> = Vec::new();
+        let mut refused = 0;
+        for _ in 0..20_000 {
+            let n = 1 + next(40);
+            match ring.take(n) {
+                Some((first, len)) => {
+                    for &(f, l) in &held {
+                        assert!(first + len <= f || f + l <= first, "{first}+{len} over {f}+{l}");
+                    }
+                    held.push((first, len));
+                }
+                None => refused += 1,
+            }
+            if !held.is_empty() && next(3) == 0 {
+                let k = next(held.len() as u32) as usize;
+                let (f, l) = held.swap_remove(k);
+                ring.give_back(f, l);
+            }
+        }
+        // Slots were refused for want of one run, so the ring was worked.
+        assert!(refused > 0, "nothing was refused");
+    }
+
+    /// A table of a length that found no run is refused without a search
+    /// until slots are given back, as it was (enough slots were free, but in
+    /// pieces, and every such table walked the whole ring).
+    #[test]
+    fn a_refused_table_is_refused_again_without_a_search() {
+        let mut ring = Ring::new(64);
+        for at in 0..8u32 {
+            assert_eq!(ring.take(8), Some((at * 8, 8)));
+        }
+        // Two runs of eight at either end of the ring.
+        ring.give_back(0, 8);
+        ring.give_back(16, 8);
+        assert_eq!((ring.free, ring.at), (16, 64));
+        // Sixteen slots free, and sixteen nowhere: refused, and noted.
+        assert_eq!(ring.take(16), None);
+        assert_eq!((ring.free, ring.refused), (16, 16));
+        // A shorter table still fits, and reads one run for it.
+        let before = ring.steps;
+        assert_eq!(ring.take(8), Some((0, 8)));
+        assert_eq!(ring.steps - before, 2);
+        // Slots given back join the run next to them: the length refused is
+        // forgotten, and the table that was refused fits.
+        ring.give_back(8, 8);
+        assert_eq!((ring.runs.as_slice(), ring.refused), (&[(8, 16)][..], u32::MAX));
+        assert_eq!(ring.take(16), Some((8, 16)));
+    }
+
+    /// A list whose run cannot be had takes the table alone
+    /// (`DynamicList::alloc`): a refused table is a draw without its
+    /// descriptors.
+    #[test]
+    fn a_shortened_run_fits_where_the_wanted_one_does_not() {
+        let mut ring = Ring::new(64);
+        for at in 0..7u32 {
+            assert_eq!(ring.take(8), Some((at * 8, 8)));
+        }
+        // Eight slots free at the end of the ring, and no run of the sixteen
+        // a growing list would ask for.
+        assert_eq!((ring.free, ring.at), (8, 56));
+        assert_eq!(ring.take(16), None);
+        assert_eq!(ring.take(8), Some((56, 8)));
     }
 }
