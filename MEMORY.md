@@ -317,6 +317,12 @@ anywhere — there is no shading-rate code in `crates/victory-gpu` or
 `settings.xml` carries a `vrsEnabled` key (§6), which is the only place the
 request is visible today.
 
+- **The two unknown pipeline creations** (`device::unknown_pipeline`, slots
+  `0x1c8` and `0x218`, 16,384 + 2,048 calls) are handed one pointer each, not a
+  description: `title+0x2477578` passes a task's record word at `node+0x40`
+  and `title+0x24800d5` a hash map's value slot at `node+0x18`, so every byte
+  the dumps read past word 0 is record or bucket memory.
+
 ---
 
 # 6. Dead ends — do not retry these
