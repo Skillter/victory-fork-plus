@@ -717,13 +717,8 @@ impl HostHeap {
                 .collect(),
             placed: Mutex::default(),
         };
-        // The ring the 5 s line and a refusal name (`dynamic_line`), in every
-        // build: nothing else said a table was refused in a release run.
-        if h.dynamic > 0 {
-            DYN_SLOTS.fetch_add(u64::from(h.dynamic), Ordering::Relaxed);
-            DYN_FREE.fetch_add(u64::from(h.dynamic), Ordering::Relaxed);
-            DYN_RINGS.fetch_add(1, Ordering::Relaxed);
-        }
+        // The ring the 5 s line and a refusal name (`dynamic_line`, `gauge`)
+        // counts itself, so nothing is said about it here.
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -865,7 +860,6 @@ impl Ring {
             let first = self.at;
             self.at += n;
             self.free -= n;
-            std::sync::atomic::AtomicU64::fetch_sub(&DYN_FREE, u64::from(n), Ordering::Relaxed);
             return Some((first, n));
         }
         for k in 0..self.runs.len() {
@@ -883,7 +877,6 @@ impl Ring {
                 self.runs[k] = (first + n, len - n);
             }
             self.free -= n;
-            std::sync::atomic::AtomicU64::fetch_sub(&DYN_FREE, u64::from(n), Ordering::Relaxed);
             return Some((first, n));
         }
         self.refused = n;
@@ -891,18 +884,59 @@ impl Ring {
     }
 
     /// Slots `first` on, `len` of them, free again: merged with the runs
-    /// around them, which a list gives back one after another.
-    fn give_back(&mut self, first: u32, len: u32) {
-        if first >= self.capacity {
-            return;
+    /// around them, which a list gives back one after another. Returns the
+    /// slots it credited: all of them, unless some were free already.
+    ///
+    /// A run is given back once, whole. Slots that are free already are
+    /// neither credited nor put in the runs again (a second credit would leave
+    /// `free` past `capacity`, and `take` would hand the slots of one run to
+    /// two lists), and neither are the slots the cursor has not handed out:
+    /// each give-back is credited for the slots that came back, never for the
+    /// run it merges into.
+    fn give_back(&mut self, first: u32, len: u32) -> u32 {
+        let end = first.saturating_add(len).min(self.capacity).min(self.at);
+        let mut credited = 0;
+        let mut at = first;
+        while at < end {
+            match self.next_run(at) {
+                Some((start, run_end)) if start < end => {
+                    if start > at {
+                        self.credit(at, start - at);
+                        credited += start - at;
+                    }
+                    at = run_end;
+                }
+                _ => {
+                    self.credit(at, end - at);
+                    credited += end - at;
+                    at = end;
+                }
+            }
         }
-        let mut len = len.min(self.capacity - first);
-        if len == 0 {
-            return;
-        }
+        credited
+    }
+
+    /// The first span at or after `at` that a run given back made free: where
+    /// it starts (never below `at`) and where it ends.
+    fn next_run(&self, at: u32) -> Option<(u32, u32)> {
+        let k = self.runs.partition_point(|&(first, len)| first + len <= at);
+        let &(first, len) = self.runs.get(k)?;
+        Some((first.max(at), first + len))
+    }
+
+    /// Slots `first` on, `len` of them, free: counted once and merged with
+    /// the runs next to them.
+    fn credit(&mut self, first: u32, len: u32) {
         self.refused = u32::MAX;
         self.free += len;
+        debug_assert!(
+            self.free <= self.capacity,
+            "the ring credited more slots than it holds: {} of {}",
+            self.free,
+            self.capacity
+        );
         let mut first = first;
+        let mut len = len;
         if let Some(k) = self.runs.partition_point(|&(f, _)| f < first).checked_sub(1) {
             let (before, before_len) = self.runs[k];
             if before + before_len == first {
@@ -923,7 +957,6 @@ impl Ring {
         {
             self.steps += 1;
         }
-        std::sync::atomic::AtomicU64::fetch_add(&DYN_FREE, u64::from(len), Ordering::Relaxed);
     }
 }
 
@@ -968,7 +1001,16 @@ fn give_back(ring: &Mutex<Ring>, count: u32, first: u32, n: u32) {
     let Some(at) = first.checked_sub(count) else {
         return;
     };
-    ring.lock().unwrap_or_else(|e| e.into_inner()).give_back(at, n);
+    let credited = ring.lock().unwrap_or_else(|e| e.into_inner()).give_back(at, n);
+    if credited < n {
+        // A run given back twice (a list drained twice, or with a length it
+        // no longer holds) is credited once: the ring is not left with slots
+        // it does not have, and no table is served one of them twice.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(first, n, credited, "a run of dynamic slots was given back twice");
+        });
+    }
 }
 
 /// Gives back `n` dynamic slots of the host heap whose identity is `ident`,
@@ -990,11 +1032,35 @@ const DYN_ASKED: usize = 0;
 const DYN_REFUSED: usize = 1;
 const DYN_DROPPED: usize = 2;
 const DYN_ROOM_MADE: usize = 3;
-/// The gauge the refusal and the 5 s line name: slots free, slots in all
-/// view heaps' rings, and how many rings there are.
-static DYN_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DYN_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DYN_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The dynamic slots of every view heap alive: free, in all its rings, and how
+/// many rings there are.
+///
+/// Counted from the rings rather than kept as slots are handed out and given
+/// back: a counter credited with each run a list gave back credited the merged
+/// run whole, and stood at 1.31 billion free of 262,144 after a world scene
+/// (run 2026-11-25 05:53); a heap let go also left its slots in the total.
+fn gauge() -> (u64, u64, u64) {
+    gauge_of(live_rings().into_iter())
+}
+
+/// The rings of every view heap alive: a heap let go is not one of them.
+fn live_rings() -> Vec<std::sync::Arc<Mutex<Ring>>> {
+    let rings = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    rings.iter().filter_map(|(_, _, ring)| ring.upgrade()).collect()
+}
+
+/// [`gauge`] of the rings given.
+fn gauge_of(rings: impl Iterator<Item = std::sync::Arc<Mutex<Ring>>>) -> (u64, u64, u64) {
+    let (mut free, mut slots, mut count) = (0u64, 0u64, 0u64);
+    for ring in rings {
+        let ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+        free += u64::from(ring.free);
+        slots += u64::from(ring.capacity);
+        count += 1;
+    }
+    (free, slots, count)
+}
 
 /// How long a refusal waits before it asks the card to finish the
 /// submissions in the air, so the lists behind them give their runs back.
@@ -1049,11 +1115,12 @@ fn refused_line(n: u32) {
         return;
     }
     LAST.store(now, Relaxed);
+    let (free, slots, rings) = gauge();
     tracing::warn!(
         n,
-        free = DYN_FREE.load(Relaxed),
-        slots = DYN_SLOTS.load(Relaxed),
-        rings = DYN_RINGS.load(Relaxed),
+        free,
+        slots,
+        rings,
         in_air = crate::host::lists_in_air(),
         "no free dynamic descriptor slots: a table is not made, and the draw goes without it"
     );
@@ -1070,23 +1137,18 @@ pub(crate) fn note_dropped_draw() {
 /// wait for the card answered.
 pub(crate) fn dynamic_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let slots = DYN_SLOTS.load(Relaxed);
+    let (free, slots, rings) = gauge();
     if slots == 0 {
         // No view heap yet, or a run that made none.
         return;
     }
-    let (free, rings) = (DYN_FREE.load(Relaxed), DYN_RINGS.load(Relaxed));
     let [asked, refused, dropped, answered] = DYN.each_ref().map(|c| c.swap(0, Relaxed));
     let per_frame = |n: u64| n as f64 / frames;
     tracing::info!(
         "dynamic descriptor slots: {free} of {slots} free in {rings} view heap(s), {:.1} % used; per frame: {:.0} tables \
          asked, {:.0} refused ({:.0} draws dropped for want of one), {:.0} refusals a wait for the card answered; \
          {} lists in the air",
-        if slots == 0 {
-            0.0
-        } else {
-            100.0 * (slots - free) as f64 / slots as f64
-        },
+        100.0 * slots.saturating_sub(free) as f64 / slots as f64,
         per_frame(asked),
         per_frame(refused),
         per_frame(dropped),
@@ -2053,8 +2115,12 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
 /// ([`refusal`]). The console is laxer than the host on every one of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refused {
-    /// No elements: what the console reads as the rest of the buffer.
+    /// No elements, and a descriptor of a dimension that is not a buffer's:
+    /// the host has no buffer to work an element of.
     NoElements,
+    /// No elements, and the buffer it is of declares no bytes: there is no
+    /// rest of it to read.
+    NoLength,
     /// A raw view that is not R32 typeless without a stride.
     RawShape,
     /// A raw view that does not begin on 16 bytes.
@@ -2069,8 +2135,9 @@ enum Refused {
 
 impl Refused {
     /// Every reason, in the order `REFUSED_REASONS` counts them.
-    const ALL: [Refused; 6] = [
+    const ALL: [Refused; 7] = [
         Refused::NoElements,
+        Refused::NoLength,
         Refused::RawShape,
         Refused::RawStart,
         Refused::StructuredShape,
@@ -2082,7 +2149,8 @@ impl Refused {
     /// What the reason is, in the log's words.
     fn name(self) -> &'static str {
         match self {
-            Refused::NoElements => "the view has no elements",
+            Refused::NoElements => "a view of no elements whose descriptor is not a buffer's",
+            Refused::NoLength => "a view of no elements of a buffer that declares no bytes",
             Refused::RawShape => "a raw view that is not R32 typeless without a stride",
             Refused::RawStart => "a raw view that does not begin on 16 bytes",
             Refused::StructuredShape => "a structured view of a stride the host does not take",
@@ -2176,6 +2244,11 @@ fn elements_left(first: u64, element: u64, offset: u64, len: u64, width: u64) ->
 /// (a descriptor of another dimension has no elements to read past, and its
 /// fields are another's), and the host copy the view is on is `offset` bytes
 /// in, `len` bytes of a buffer, `width` bytes wide.
+///
+/// `Err` where there is nothing to work the rest out from and the view stays
+/// null for a reason of its own: a buffer that declares no bytes (a placed
+/// buffer the title described none wide, run 2026-11-25 05:53) has no rest,
+/// and a view that begins past its buffer's end has none either.
 #[allow(clippy::too_many_arguments)]
 fn view_count(
     buffer: bool,
@@ -2187,14 +2260,19 @@ fn view_count(
     offset: u64,
     len: u64,
     width: u64,
-) -> u32 {
+) -> Result<u32, Refused> {
     if count > 0 || !buffer {
-        return count;
+        return Ok(count);
     }
-    buffer_element(format, stride, raw)
-        .ok()
-        .and_then(|element| elements_left(first, element, offset, len, width))
-        .unwrap_or(0)
+    let Ok(element) = buffer_element(format, stride, raw) else {
+        // Not a shape the host takes a view of: `buffer_view_ok` names why.
+        return Ok(0);
+    };
+    match elements_left(first, element, offset, len, width) {
+        Some(left) => Ok(left),
+        None if len == 0 => Err(Refused::NoLength),
+        None => Err(Refused::PastTheEnd),
+    }
 }
 
 /// Counts a buffer view left null, and logs the first of its reason: the
@@ -2308,8 +2386,9 @@ fn buffer_srv(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     // A view of no elements is the console's for the rest of its buffer (see
-    // `elements_left`).
-    let count = view_count(
+    // `elements_left`); one of a buffer that declares no bytes has no rest,
+    // and stays null for that reason of its own.
+    let count = match view_count(
         desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER,
         desc.Format,
         first,
@@ -2319,7 +2398,17 @@ fn buffer_srv(
         offset,
         len,
         width,
-    );
+    ) {
+        Ok(count) => count,
+        Err(why) => {
+            // The console's "no elements is the rest of its buffer" has no
+            // rest to give here: the buffer declares no bytes, or the view
+            // begins past its end.
+            buffer.NumElements = 0;
+            refused(why, false, desc.Format, first, 0, stride, raw, width, (address, len));
+            return None;
+        }
+    };
     buffer.NumElements = count;
     if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         refused(why, false, desc.Format, first, count, stride, raw, width, (address, len));
@@ -2393,8 +2482,9 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     // A view of no elements is the console's for the rest of its buffer (see
-    // `elements_left`).
-    let count = view_count(
+    // `elements_left`); one of a buffer that declares no bytes has no rest,
+    // and stays null for that reason of its own.
+    let count = match view_count(
         desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
         desc.Format,
         first,
@@ -2404,7 +2494,17 @@ fn buffer_uav(
         offset,
         len,
         width,
-    );
+    ) {
+        Ok(count) => count,
+        Err(why) => {
+            // The console's "no elements is the rest of its buffer" has no
+            // rest to give here: the buffer declares no bytes, or the view
+            // begins past its end.
+            buffer.NumElements = 0;
+            refused(why, true, desc.Format, first, 0, stride, raw, width, (address, len));
+            return None;
+        }
+    };
     buffer.NumElements = count;
     if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         refused(why, true, desc.Format, first, count, stride, raw, width, (address, len));
@@ -3365,6 +3465,81 @@ mod tests {
         assert_eq!(ring.take(16), Some((8, 16)));
     }
 
+    /// A run given back twice is credited once: the ring never holds more
+    /// free slots than it has, so it never hands one run to two lists. (The
+    /// gauge the 5 s line printed was credited with each merged run whole,
+    /// and stood at 1.31 billion free of 262,144 in run 2026-11-25 05:53.)
+    #[test]
+    fn a_run_given_back_twice_is_not_credited_twice() {
+        let mut ring = Ring::new(64);
+        assert_eq!(ring.take(8), Some((0, 8)));
+        ring.give_back(0, 8);
+        assert_eq!((ring.free, ring.runs.as_slice()), (64, &[(0, 8)][..]));
+        // The same run again, as a list drained twice would give it: nothing
+        // comes back, and the run it is counted in does not grow.
+        ring.give_back(0, 8);
+        assert_eq!(ring.free, 64, "the same run was credited twice");
+        assert!(ring.free <= ring.capacity, "{} free of {}", ring.free, ring.capacity);
+        assert_eq!(ring.runs.as_slice(), &[(0, 8)][..], "the run grew past what was taken");
+        // All of it is free, and no slot of it more than once.
+        assert_eq!((ring.free, ring.runs.as_slice()), (64, &[(0, 8)][..]));
+        // Sixty-four slots to give, not seventy-two: sixteen from the tail the
+        // cursor has not handed out, eight from the run, and the rest.
+        assert_eq!(ring.take(16), Some((8, 16)));
+        assert_eq!(ring.take(8), Some((24, 8)));
+        assert_eq!(ring.take(8), Some((32, 8)));
+        // Thirty-two free, in two places: the run of eight and the tail of
+        // twenty-four, and no table of thirty-two that fits either.
+        assert_eq!(ring.take(33), None);
+        assert_eq!(ring.take(32), None);
+        assert_eq!(ring.take(24), Some((40, 24)));
+        assert_eq!(ring.take(8), Some((0, 8)));
+        assert_eq!(ring.free, 0, "the ring gave out slots it does not have");
+    }
+
+    /// The gauge the 5 s line and a refusal name is the rings' own count, one
+    /// slot once: a run that merges with the run next to it is credited for
+    /// its own slots only (the counter it replaced was credited the whole
+    /// merged run, 366,972 free of 262,144 in the first 5 s line of run
+    /// 2026-11-25 05:53, 1.31 billion by 06:02), and a heap let go takes its
+    /// ring out of the total.
+    #[test]
+    fn the_gauge_counts_a_free_slot_once() {
+        let rings: Vec<std::sync::Arc<Mutex<Ring>>> =
+            (0..2).map(|_| std::sync::Arc::new(Mutex::new(Ring::new(64)))).collect();
+        assert_eq!(gauge_of(rings.clone().into_iter()), (128, 128, 2));
+        for ring in &rings {
+            let mut ring = ring.lock().unwrap();
+            for at in 0..4u32 {
+                assert_eq!(ring.take(8), Some((at * 8, 8)));
+            }
+            // Two runs, one after the other: the second release merges with
+            // the first, and is credited for itself alone.
+            assert_eq!(ring.give_back(0, 8), 8);
+            assert_eq!(ring.give_back(8, 8), 8);
+            assert_eq!((ring.free, ring.capacity, ring.runs.as_slice()), (48, 64, &[(0, 16)][..]));
+            // Half of each ring is still handed out.
+        }
+        let (free, slots, count) = gauge_of(rings.clone().into_iter());
+        assert_eq!((free, slots, count), (96, 128, 2), "a merged run was credited twice");
+        assert!(free <= slots, "{free} free of {slots}");
+        drop(rings);
+
+        // A heap let go is no heap: its ring leaves the gauge with it.
+        let ring = std::sync::Arc::new(Mutex::new(Ring::new(16)));
+        let weak = std::sync::Arc::downgrade(&ring);
+        register(next_ident(), 0, &ring);
+        assert!(live_rings().iter().any(|live| std::sync::Arc::ptr_eq(live, &ring)), "a live heap's ring");
+        drop(ring);
+        assert!(weak.upgrade().is_none(), "the registry outlived the heap");
+        assert!(
+            !live_rings()
+                .iter()
+                .any(|live| std::sync::Weak::ptr_eq(&std::sync::Arc::downgrade(live), &weak)),
+            "a heap let go was still counted"
+        );
+    }
+
     /// A list whose run cannot be had takes the table alone
     /// (`DynamicList::alloc`): a refused table is a draw without its
     /// descriptors.
@@ -3395,7 +3570,8 @@ mod tests {
         // The same view on 16 bytes: the host takes it.
         assert_eq!(raw(4, 32, 4_194_304), Ok(()));
         // `first=10880256 count=0 stride=0 raw=true width=182452224` (line
-        // 7328): no elements.
+        // 7328): a count of none. The caller works the rest out first
+        // (`view_count`), so only a view with no rest left reaches this.
         assert_eq!(raw(10_880_256, 0, 182_452_224), Err(Refused::NoElements));
         // Read as the rest of the 174 MB buffer, the same view is taken:
         // 43,521,024 bytes in, 34,732,800 dwords to the buffer's end.
@@ -3405,7 +3581,9 @@ mod tests {
 
     /// A view of no elements is given the rest of its own buffer, not the rest
     /// of the copy the buffer lies in; a view of some keeps its count, and a
-    /// descriptor of another dimension is left alone.
+    /// descriptor of another dimension is left alone. A buffer that declares
+    /// no bytes has no rest, and one whose view begins past its end has none
+    /// either: each is refused for its own reason.
     #[test]
     fn only_a_view_of_no_elements_gets_the_rest_of_its_buffer() {
         let count = |buffer, first, count, offset, len, width| {
@@ -3413,24 +3591,28 @@ mod tests {
         };
         // The log's shape: the rest of the 174 MB buffer (43,521,024 bytes in,
         // 138,931,200 bytes to its end).
-        assert_eq!(count(true, 10_880_256, 0, 0, 182_452_224, 182_452_224), 34_732_800);
+        assert_eq!(count(true, 10_880_256, 0, 0, 182_452_224, 182_452_224), Ok(34_732_800));
         // A view of some keeps what it asked for.
-        assert_eq!(count(true, 2, 32, 0, 4_194_304, 4_194_304), 32);
+        assert_eq!(count(true, 2, 32, 0, 4_194_304, 4_194_304), Ok(32));
         // A descriptor of another dimension has no elements to read past.
-        assert_eq!(count(false, 10_880_256, 0, 0, 182_452_224, 182_452_224), 0);
+        assert_eq!(count(false, 10_880_256, 0, 0, 182_452_224, 182_452_224), Ok(0));
         // A shape the host takes no view of is left at none (and refused).
         assert_eq!(
             view_count(true, DXGI_FORMAT_UNKNOWN, 10_880_256, 0, 0, true, 0, 182_452_224, 182_452_224),
-            0
+            Ok(0)
         );
         // A 4 MiB buffer 8 MiB into a 174 MiB copy: the 4 MiB after it.
-        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 182_452_224), 1_048_576);
-        // From its last dword: one dword left; from its end, and past it: none.
-        assert_eq!(count(true, 3_145_727, 0, 8_388_608, 4_194_304, 182_452_224), 1);
-        assert_eq!(count(true, 3_145_728, 0, 8_388_608, 4_194_304, 182_452_224), 0);
-        assert_eq!(count(true, 4_000_000, 0, 8_388_608, 4_194_304, 182_452_224), 0);
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 182_452_224), Ok(1_048_576));
+        // From its last dword: one dword left; from its end, and past it: none
+        // to read, and no rest either: the view is refused, not served none.
+        assert_eq!(count(true, 3_145_727, 0, 8_388_608, 4_194_304, 182_452_224), Ok(1));
+        assert_eq!(count(true, 3_145_728, 0, 8_388_608, 4_194_304, 182_452_224), Err(Refused::PastTheEnd));
+        assert_eq!(count(true, 4_000_000, 0, 8_388_608, 4_194_304, 182_452_224), Err(Refused::PastTheEnd));
         // The copy ends before the buffer does: what is there is all there is.
-        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 10_485_760), 524_288);
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 10_485_760), Ok(524_288));
+        // A buffer that declares no bytes (a placed buffer the title describes
+        // none wide, run 2026-11-25 05:53): no rest to give, named apart.
+        assert_eq!(count(true, 0, 0, 0, 0, 0), Err(Refused::NoLength));
         // A structured view counts elements of its stride.
         assert_eq!(elements_left(0, 32, 0, 1_048_576, 1_048_576), Some(32_768));
     }
@@ -3446,29 +3628,36 @@ mod tests {
         assert_eq!(Refused::ALL.len(), Refused::COUNT);
         assert_eq!(by_reason([0; Refused::COUNT]), None);
         let mut counts = [0; Refused::COUNT];
-        counts[Refused::NoElements as usize] = 6494;
+        counts[Refused::NoLength as usize] = 6494;
         counts[Refused::RawStart as usize] = 12;
         let counted = by_reason(counts).unwrap();
-        assert!(counted.contains("the view has no elements 6494"), "{counted}");
+        // The two no-element reasons are told apart: the log of run
+        // 2026-11-25 05:53 counted views of a buffer that declares no bytes,
+        // not views of another dimension.
+        assert!(
+            counted.contains("a view of no elements of a buffer that declares no bytes 6494"),
+            "{counted}"
+        );
+        assert!(!counted.contains(Refused::NoElements.name()), "{counted}");
         assert!(counted.contains("a raw view that does not begin on 16 bytes 12"), "{counted}");
         assert!(!counted.contains("typed"), "{counted}");
         // The line of the log's shape: the reason, the fields that decided it,
         // and the buffer (its address and bytes).
         let line = refusal(
-            Refused::NoElements,
+            Refused::NoLength,
             true,
             DXGI_FORMAT_R32_TYPELESS,
-            10_880_256,
+            10_681_472,
             0,
             0,
             true,
             182_452_224,
-            (0xae00_0000, 182_452_224),
+            (0x1c24_f200, 0),
         );
-        assert!(line.contains("the view has no elements"), "{line}");
+        assert!(line.contains("a view of no elements of a buffer that declares no bytes"), "{line}");
         assert!(line.contains("unordered"), "{line}");
-        assert!(line.contains("format=39 first=10880256 count=0 stride=0 raw=true"), "{line}");
-        assert!(line.contains("0xae000000+182452224"), "{line}");
+        assert!(line.contains("format=39 first=10681472 count=0 stride=0 raw=true"), "{line}");
+        assert!(line.contains("0x1c24f200+0"), "{line}");
         let line = refusal(
             Refused::RawStart,
             false,
