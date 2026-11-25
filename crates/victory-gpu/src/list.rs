@@ -1035,6 +1035,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
+            // A copy destination is a target, as a render target is
+            // (`crate::present`).
+            crate::present::note_target(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1167,6 +1170,7 @@ extern "system" fn copy_texture_region(
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        crate::present::note_target(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1321,6 +1325,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        crate::present::note_target(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1393,6 +1398,8 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        // A clear writes it: a target (`crate::present`).
+        crate::present::note_target(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1447,6 +1454,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        crate::present::note_target(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

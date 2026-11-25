@@ -1,0 +1,376 @@
+//! What a present shows when nothing wrote the frame the title asked for.
+//!
+//! A title renders the world at one size and presents a larger texture,
+//! upscaled on the console by its scaler and on the PC by FidelityFX's compute
+//! programs. While those programs do not translate, the presented texture is
+//! never written, so the window is black although the frame exists at the size
+//! the title did render (series-s: 1920x1080 presented, 1280x720 written, none
+//! of 12 071 recorded operations at world frame 3318 naming a 1920-wide
+//! resource).
+//!
+//! So every operation that names a texture as a target (a render target, a
+//! depth buffer, an unordered access view, a copy or resolve destination, a
+//! clear) and every shader read of one says so here, and a present whose frame
+//! was written by none of them shows a target that was ([`pick`]).
+//!
+//! The rules are conservative on purpose: a wrong image is worse than a black
+//! one.
+//!
+//! - A frame written since the last present - or the one before it, as a title
+//!   that alternates two textures presents each one every second frame - is
+//!   shown as it is, and the run is the one it was.
+//! - A target a shader also read is the frame's own source, and is preferred
+//!   to a larger one that nothing read.
+//! - Only a target of the frame's shape (within [`ASPECT_TOLERANCE`]) may
+//!   stand for it, and only the largest: a bloom chain's levels are the frame's
+//!   shape too, at a quarter of its size and less.
+//! - Two sizes as good as each other compete, and then nothing is shown: the
+//!   frame of a title that pads 1080 lines to 1088 is either texture, and
+//!   guessing between them draws the wrong one.
+//!
+//! `VICTORY_PRESENT_FALLBACK=0` turns the fallback off; it is on by default.
+#![cfg_attr(not(windows), allow(dead_code))] // the decision is tested everywhere
+
+use std::sync::Mutex;
+
+use crate::object::This;
+
+/// How far a target's shape may be from the frame's: 3 %, which holds a
+/// 1088-line texture for a 1080-line frame and refuses anything of another
+/// shape.
+const ASPECT_TOLERANCE: f64 = 0.03;
+
+/// How close two targets' areas may be, in percent, before neither is the
+/// better guess: 1 %, which is 1080 lines against 1088.
+const AREA_TOLERANCE: u64 = 1;
+
+/// `D3D12_RESOURCE_DIMENSION_TEXTURE2D`: what the present pass reads.
+const TEXTURE_2D: u32 = 3;
+
+/// A texture an operation named as a target since the last present, with the
+/// shape its host copy has now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Target {
+    /// The title texture, as its address.
+    key: usize,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `DXGI_FORMAT`.
+    pub(crate) format: i32,
+    /// `D3D12_RESOURCE_FLAGS`.
+    pub(crate) flags: u32,
+    pub(crate) sample_count: u32,
+    /// `D3D12_RESOURCE_DIMENSION`.
+    dimension: u32,
+    /// A shader read it since the last present as well.
+    sampled: bool,
+}
+
+impl Target {
+    /// The title texture this names.
+    pub(crate) fn this(&self) -> This {
+        self.key as This
+    }
+}
+
+/// What the operations since the last present named, for one present.
+#[derive(Debug, Default)]
+pub(crate) struct Since {
+    /// The presented texture was written since the last present, or the one
+    /// before it: it is shown as it is.
+    pub(crate) written: bool,
+    /// The other textures named as targets, with the shape they have now.
+    pub(crate) targets: Vec<Target>,
+}
+
+/// Why a present has nothing better than its frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// The title wrote the presented texture: it is the frame.
+    Written,
+    /// No texture the title wrote could stand for it.
+    Nothing,
+    /// More than one size as good as another: which one is the frame's is not
+    /// known, and a wrong image is worse than a black one.
+    Competing(Vec<(u32, u32)>),
+}
+
+/// What the operations since the last present named.
+struct Window {
+    /// Named as a target since the last present.
+    written: Vec<usize>,
+    /// Read as a shader resource since the last present.
+    sampled: Vec<usize>,
+    /// Named as a target in the present before the last one.
+    before: Vec<usize>,
+}
+
+static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+
+fn window() -> std::sync::MutexGuard<'static, Option<Window>> {
+    WINDOW.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn entries(window: &mut Option<Window>) -> &mut Window {
+    window.get_or_insert_with(|| Window {
+        written: Vec::new(),
+        sampled: Vec::new(),
+        before: Vec::new(),
+    })
+}
+
+/// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=0` turns it off).
+fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_none_or(|v| v != "0"))
+}
+
+/// A draw, dispatch, copy, resolve or clear named `this` as a target.
+pub(crate) fn note_target(this: This) {
+    if this.is_null() || !on() {
+        return;
+    }
+    let mut window = window();
+    let written = &mut entries(&mut window).written;
+    if !written.contains(&(this as usize)) {
+        written.push(this as usize);
+    }
+}
+
+/// A shader read `this` as a resource.
+pub(crate) fn note_sampled(this: This) {
+    if this.is_null() || !on() {
+        return;
+    }
+    let mut window = window();
+    let sampled = &mut entries(&mut window).sampled;
+    if !sampled.contains(&(this as usize)) {
+        sampled.push(this as usize);
+    }
+}
+
+/// Takes what the operations since the last present named, for the present of
+/// `presented`: whether it was written, and the other targets it named.
+#[cfg(windows)]
+pub(crate) fn take(presented: This) -> Since {
+    let mut window = window();
+    let Some(window) = window.as_mut() else {
+        return Since {
+            written: true,
+            targets: Vec::new(),
+        };
+    };
+    let key = presented as usize;
+    let before = std::mem::take(&mut window.before);
+    let written = !on() || window.written.contains(&key) || before.contains(&key);
+    let mut targets = Vec::new();
+    if !written {
+        for &at in &window.written {
+            if at != key
+                && let Some(target) = target(at, &window.sampled)
+            {
+                targets.push(target);
+            }
+        }
+    }
+    // This window's targets are the next present's "before": two textures a
+    // title alternates carry a frame written one present ago.
+    window.before = std::mem::take(&mut window.written);
+    window.sampled.clear();
+    Since { written, targets }
+}
+
+/// The shape of the title texture at `at`, if it has a host copy: every path
+/// that names a texture as a target makes one first, so this makes none.
+#[cfg(windows)]
+fn target(at: usize, sampled: &[usize]) -> Option<Target> {
+    let texture = crate::resource::host_resource(at as This)?;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    Some(Target {
+        key: at,
+        width: d.Width as u32,
+        height: d.Height,
+        format: d.Format.0,
+        flags: d.Flags.0 as u32,
+        sample_count: d.SampleDesc.Count,
+        dimension: d.Dimension.0 as u32,
+        sampled: sampled.contains(&at),
+    })
+}
+
+/// The target of `since` to show instead of the frame of `size`, or why the
+/// frame is shown as it is. `presentable` is the present pass's own test of a
+/// target: it names a format the pass can read.
+pub(crate) fn pick(
+    size: (u32, u32),
+    since: &Since,
+    presentable: impl Fn(&Target) -> bool,
+) -> Result<usize, Why> {
+    if since.written {
+        return Err(Why::Written);
+    }
+    if size.0 == 0 || size.1 == 0 {
+        return Err(Why::Nothing);
+    }
+    let shape = f64::from(size.0) / f64::from(size.1);
+    let shaped: Vec<usize> = (0..since.targets.len())
+        .filter(|&i| {
+            let t = &since.targets[i];
+            t.width > 0
+                && t.height > 0
+                && t.dimension == TEXTURE_2D
+                && presentable(t)
+                && (f64::from(t.width) / f64::from(t.height) - shape).abs() <= shape * ASPECT_TOLERANCE
+        })
+        .collect();
+    if shaped.is_empty() {
+        return Err(Why::Nothing);
+    }
+    // A target a shader read is the frame's own source; failing that, the
+    // largest of the frame's shape.
+    let read: Vec<usize> = shaped
+        .iter()
+        .copied()
+        .filter(|&i| since.targets[i].sampled)
+        .collect();
+    let tier = if read.is_empty() { &shaped } else { &read };
+    let area = |i: usize| u64::from(since.targets[i].width) * u64::from(since.targets[i].height);
+    let largest = tier.iter().copied().map(area).max().unwrap_or(0);
+    let floor = largest - largest * AREA_TOLERANCE / 100;
+    let near: Vec<usize> = tier.iter().copied().filter(|&i| area(i) >= floor).collect();
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for &i in &near {
+        let shape = (since.targets[i].width, since.targets[i].height);
+        if !sizes.contains(&shape) {
+            sizes.push(shape);
+        }
+    }
+    if sizes.len() > 1 {
+        return Err(Why::Competing(sizes));
+    }
+    near.iter()
+        .copied()
+        .max_by_key(|&i| area(i))
+        .ok_or(Why::Nothing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Since, Target, Why, pick};
+
+    /// A written 16:9 texture of `width` x `height`, read by a shader or not.
+    fn target(key: usize, width: u32, height: u32, sampled: bool) -> Target {
+        Target {
+            key,
+            width,
+            height,
+            format: 28,
+            flags: 0,
+            sample_count: 1,
+            dimension: super::TEXTURE_2D,
+            sampled,
+        }
+    }
+
+    fn since(written: bool, targets: Vec<Target>) -> Since {
+        Since { written, targets }
+    }
+
+    /// The series-s frame: the presented 1920x1080 texture was written by
+    /// nothing, and the world exists at 1280x720.
+    #[test]
+    fn an_untouched_frame_shows_the_one_target_it_wrote() {
+        let targets = vec![target(0x10, 1280, 720, false)];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+    }
+
+    /// A frame the title wrote is the frame: series-x's two draws leave it
+    /// alone, and nothing about that present changes.
+    #[test]
+    fn a_written_frame_is_shown_as_it_is() {
+        let targets = vec![target(0x10, 1280, 720, false)];
+        assert_eq!(
+            pick((1920, 1080), &since(true, targets), |_| true),
+            Err(Why::Written)
+        );
+    }
+
+    /// Two sizes as good as each other: neither is the frame's, so the frame
+    /// stays black rather than showing the wrong picture.
+    #[test]
+    fn two_competing_sizes_are_no_frame() {
+        // Read by shaders as well, and 1280x722 is within a percent of
+        // 1280x720's area: the tie is what refuses the guess.
+        let targets = vec![target(0x10, 1280, 720, true), target(0x20, 1280, 722, true)];
+        assert_eq!(
+            pick((1920, 1080), &since(false, targets), |_| true),
+            Err(Why::Competing(vec![(1280, 720), (1280, 722)]))
+        );
+    }
+
+    /// A target a shader read is the frame's source, even when another target
+    /// of the frame's shape is larger.
+    #[test]
+    fn a_sampled_target_is_the_frames_source() {
+        // The write-hiding pair of the console's upsample: 4x4 tiles of the
+        // frame, and the frame itself, read by the pass that would have shown
+        // it.
+        let targets = vec![target(0x10, 1280, 720, true), target(0x20, 1920, 1080, false)];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+    }
+
+    /// A bloom chain's levels are the frame's shape at a quarter of its size:
+    /// the largest is the frame's, and it is not a tie.
+    #[test]
+    fn the_largest_of_the_frames_shape_wins() {
+        let targets = vec![
+            target(0x10, 320, 180, false),
+            target(0x20, 1280, 720, false),
+            target(0x30, 640, 360, false),
+        ];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(1));
+    }
+
+    /// Another shape is another picture: a shadow atlas or a 4:3 probe of the
+    /// scene is never the frame.
+    #[test]
+    fn another_shape_is_no_frame() {
+        let targets = vec![target(0x10, 1024, 1024, false), target(0x20, 1440, 1080, false)];
+        assert_eq!(
+            pick((1920, 1080), &since(false, targets), |_| true),
+            Err(Why::Nothing)
+        );
+    }
+
+    /// 1088 lines for 1080 is the same shape (scanout padding), and one such
+    /// target alone is shown.
+    #[test]
+    fn padding_of_a_few_lines_is_the_same_shape() {
+        let targets = vec![target(0x10, 1920, 1088, false)];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+    }
+
+    /// A target the pass cannot read (an integer or shader-unreadable format)
+    /// is no frame.
+    #[test]
+    fn a_target_the_pass_cannot_read_is_no_frame() {
+        let targets = vec![target(0x10, 1280, 720, false)];
+        assert_eq!(
+            pick((1920, 1080), &since(false, targets), |_| false),
+            Err(Why::Nothing)
+        );
+    }
+
+    /// A texture of one mip that is a depth buffer or another dimension is not
+    /// a frame, however it is sized.
+    #[test]
+    fn only_a_texture2d_is_a_frame() {
+        let mut depth = target(0x10, 1280, 720, false);
+        depth.dimension = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![depth]), |_| true),
+            Err(Why::Nothing)
+        );
+    }
+}

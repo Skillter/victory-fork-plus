@@ -127,6 +127,14 @@
   The pass's view of the frame names the frame's own format unless the frame is
   typeless (`host::frame_view`): a `_UNORM` view of a typed `_UNORM_SRGB`
   resource is one D3D12 refuses in silence.
+- A frame nothing wrote since the last present is not shown as it is: the
+  present shows the target the title did write instead (`present::pick`), at
+  that target's size, format and tracked state, so the same pass letterboxes it
+  as a frame. Only the largest target of the frame's shape (3 %) that the pass
+  can read may stand for it, a target a shader also read first, and nothing when
+  two sizes are within 1 % of each other's area: a wrong image is worse than a
+  black one. `present::note_target`/`note_sampled` record what the draw, copy,
+  resolve and clear paths name; `VICTORY_PRESENT_FALLBACK=0` turns this off.
 - The pipelines folder keeps the live library and one older generation.
   `library::prune` drops a `.tmp` that no save finished and any generation
   unread for 30 days, and never the file this run opened or mapped.

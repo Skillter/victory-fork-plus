@@ -8141,13 +8141,77 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    ///
+    /// `since` is what the operations since the last present named
+    /// ([`crate::present`]): when none of them wrote `texture`, the target it
+    /// did write is shown in its place, by the same pass, at its own size and
+    /// format.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        since: &crate::present::Since,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
+        let mut desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
+        // What is shown: the frame itself, or, when nothing wrote it since the
+        // last present, the frame's own source that something did write
+        // (`crate::present`). Everything below reads the size, the format and
+        // the state of whichever it is, so the fallback is shown exactly as a
+        // frame of its size would be.
+        let mut picture = texture;
+        let mut picture_state = state;
+        let mut picture_this = None;
+        match crate::present::pick((desc.Width as u32, desc.Height), since, |t| {
+            const DEPTH: u32 = 0x2;
+            const DENY_SHADER_RESOURCE: u32 = 0x8;
+            t.sample_count <= 1
+                && t.flags & (DEPTH | DENY_SHADER_RESOURCE) == 0
+                && frame_view(DXGI_FORMAT(t.format), format).is_some()
+        }) {
+            Ok(index) => {
+                if let Some(target) = since.targets.get(index)
+                    && let Some(texture) = crate::resource::host_resource(target.this())
+                {
+                    // SAFETY: a live host texture.
+                    desc = unsafe { texture.GetDesc() };
+                    // The state it is in now: the pass reads it, and the list
+                    // puts it back, as it would for a frame.
+                    let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+                    picture_state = crate::resource::host_transition(target.this(), read)
+                        .map_or(read, |(_, before)| before);
+                    picture = texture;
+                    picture_this = Some(target.this());
+                    victory_core::logging::warn_once("present.fallback", || {
+                        format!(
+                            "presented frame was not written; showing the {}x{} frame it did \
+                             write (VICTORY_PRESENT_FALLBACK=0 turns this off)",
+                            desc.Width, desc.Height
+                        )
+                    });
+                }
+            }
+            Err(crate::present::Why::Competing(sizes)) => {
+                // Once: the sizes that were as good as each other, and the
+                // black frame left rather than a guess between them.
+                victory_core::logging::warn_once("present.fallback.competing", || {
+                    let sizes: Vec<String> =
+                        sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
+                    format!(
+                        "presented frame was not written and {} targets are as good as each \
+                         other ({}): none is shown",
+                        sizes.len(),
+                        sizes.join(", ")
+                    )
+                });
+            }
+            Err(crate::present::Why::Written) | Err(crate::present::Why::Nothing) => {}
+        }
         let size = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
@@ -8225,7 +8289,7 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        let state = D3D12_RESOURCE_STATES(picture_state as i32);
         // A draw reads the frame as a pixel shader resource; a copy wants it as
         // a copy source.
         let (source, target) = match show {
@@ -8265,7 +8329,7 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            move_to(list, texture, state, source);
+            move_to(list, picture, state, source);
             list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)]);
             match (show, drawn) {
                 (Show::Drawn(rect), Some((pass, pipeline, view))) => record_present_pass(
@@ -8274,23 +8338,23 @@ impl Host {
                     pass,
                     &pipeline,
                     PresentDraw {
-                        frame: texture,
+                        frame: picture,
                         back: &back,
                         view,
                         rect,
                     },
                 ),
                 // SAFETY: a source texture and a back buffer of one size.
-                _ => list.CopyResource(&back, texture),
+                _ => list.CopyResource(&back, picture),
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     // A copy wants the frame as a copy source; the pass reads it
                     // as a pixel shader resource.
-                    move_to(list, texture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    let read = crate::capture::read_back(&self.device, list, texture);
-                    move_to(list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
+                    move_to(list, picture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    let read = crate::capture::read_back(&self.device, list, picture);
+                    move_to(list, picture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
                     read
                 })
                 .flatten();
@@ -8299,14 +8363,20 @@ impl Host {
                 None
             } else {
                 // As the capture: a copy wants the frame as a copy source.
-                move_to(list, texture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                let probe = crate::capture::probe(&self.device, list, texture);
-                move_to(list, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
+                move_to(list, picture, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                let probe = crate::capture::probe(&self.device, list, picture);
+                move_to(list, picture, D3D12_RESOURCE_STATE_COPY_SOURCE, source);
                 probe
             };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            move_to(list, texture, source, state);
+            move_to(list, picture, source, state);
+            if let Some(this) = picture_this {
+                // The shown target, not the frame: the state it is tracked in
+                // is again the one the pass found it in, as `queue::present`
+                // puts the frame's back.
+                crate::resource::host_transition(this, picture_state);
+            }
             // SAFETY: a live back buffer of the swap chain.
             list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             copy.close();

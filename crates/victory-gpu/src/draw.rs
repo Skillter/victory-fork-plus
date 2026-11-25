@@ -1170,6 +1170,9 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            // A target the title named: what a present of another texture
+            // shows instead (`crate::present`).
+            crate::present::note_target(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -1180,6 +1183,7 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            crate::present::note_target(record.resource);
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -3738,6 +3742,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // Sampled: counts the hit that admits a texture seen again and
             // again to the protected set (`crate::resource::note_sampled`).
             crate::resource::note_sampled(*resource as This);
+            crate::present::note_sampled(*resource as This);
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -3775,6 +3780,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            // A shader writes it: a target, as a render target is
+            // (`crate::present`).
+            crate::present::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
