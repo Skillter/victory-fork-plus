@@ -1419,6 +1419,11 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_SPLIT`: the segments of draws this list recorded,
+    /// a GPU timestamp each, and where they are read back
+    /// (`crate::gpusplit`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) split: Mutex<crate::gpusplit::Split>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2767,6 +2772,13 @@ fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
         if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+            return 0;
+        }
+        // Split timings are read after each submission's wait: a submission
+        // sent ahead has none yet, and the card's clock would then hold two
+        // lists' segments at once.
+        #[cfg(feature = "diagnostics")]
+        if crate::gpusplit::on() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -4595,6 +4607,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                split: Mutex::default(),
             })
         }
     }
@@ -6191,9 +6205,11 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`, or
+        // `VICTORY_GPU_SPLIT`, whose segments are read back after each
+        // group's wait).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() || crate::gpusplit::on() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -6229,6 +6245,14 @@ impl Host {
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
+            #[cfg(feature = "diagnostics")]
+            if crate::gpusplit::on()
+                && let Some(run) = runs.get(i)
+            {
+                // SAFETY: a plain query on a live queue.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(100_000_000);
+                crate::gpusplit::harvest(run, frequency);
+            }
             #[cfg(feature = "diagnostics")]
             if timing() {
                 // SAFETY: a plain query.
@@ -6593,6 +6617,8 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
+        crate::gpusplit::close(self);
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -6621,6 +6647,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.split.lock().unwrap_or_else(|e| e.into_inner()).clear_window();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);

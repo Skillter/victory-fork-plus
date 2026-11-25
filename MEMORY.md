@@ -451,6 +451,36 @@ as one windowed run and nothing is drawn into the presented frame — black at
 scene at 4.0 fps (`run-20261125-141510.log`). Until the window path draws what
 it records, it stays opt-in.
 
+No existing log splits the card's time by draw class, and one is worth reading
+before the next guess: the per-command timing (`copystat`'s "the card's time by
+what ran" and "the card's time by command") and the drop reasons' diagnostics
+wording exist only in `feature = "diagnostics"` builds, and
+`run-20261125-173920.log` is a release one — no `victory_gpu::copystat` line in
+its 13,360. What that run does say about the card, a frame at 528.8 ms with
+`nothing of ours queued` 88.1 ms: it is busy ~440.7 ms for 5,043 draws, **87 µs
+a draw**, against the menu's ~2 µs at 34 times the draw count of a card 2 %
+busy. `on the GPU` 268.6 ms is only what the submitting thread waited for (it
+stood still 325.1 ms); the rest of the 440 ms runs in lists already queued, so
+no wait can name it. The counts a draw carries are all a release log offers,
+and none prices a class: `dispatches 1.04`, `indirect runs 1.03`, `our
+indirect clamps 1.03`, `barriers 5.26` a draw, and 13,442 mesh groups a frame
+(largest group asked 519 of 65,535) over the 817 dispatch-family commands of
+frame 1,024 — 16 groups a dispatch.
+`VICTORY_GPU_SPLIT=1` measures it (diagnostics builds; `crate::gpusplit`): one
+`EndQuery(TIMESTAMP)` in front of every run of commands sharing a kind and a
+host pipeline — graphics draws, mesh dispatches, indirect runs, compute
+dispatches, our clamp dispatches — the stamps read back after each submission's
+fence (`gpusplit::harvest`) and printed beside `commands per draw` every 5 s as
+`where the card's time went: mesh dispatches [mesh <hash> pixel <hash>] 900
+draws 120.0 ms a frame (133.3 µs a draw)`, heaviest first, twelve groups. A
+segment runs from a group's first command to the next group's first, so the
+state between two groups is charged to the earlier one (`shortcut:` in that
+module); our own compare and hash passes are lists nothing waits for, so they
+stay outside it and are read from `host`'s "our passes over copies in the card's
+memory". `host::late_stage` stands still while the switch is on, as it does for
+`VICTORY_GPU_TIMING`, so 87 µs a draw is not compared with a run that has it
+off: compare two runs that both have it on.
+
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run

@@ -30,6 +30,8 @@ mod fault;
 pub mod fence;
 #[cfg(windows)]
 mod flow;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpusplit;
 pub mod frame;
 #[cfg(windows)]
 mod host;
