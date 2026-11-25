@@ -1837,25 +1837,28 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (on by default; `VICTORY_CARD_REHASH_RUNS=0` makes a pass per range
+/// sent up).
 ///
-/// These passes are ours, they run on the card before every submission's
-/// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
-/// ranges a frame: 514 such passes. The same pieces are hashed either way;
-/// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// A pass walks its 64 KiB pieces 16 bytes at a time, 4,096 steps one after
+/// the other, so it takes the time of one piece however few its pieces are:
+/// run 20261125-055341 sent up ranges that made 246 passes over 1,118
+/// pieces, and the ranges lie next to one another (they are views of the
+/// same title heap). Joined, the same pieces are hashed, plus the pieces
+/// between ranges that touch: those are hashed to what the card holds now,
+/// and the compare that reads them runs in queue order before this pass, so
+/// a write it must flag is flagged first. A piece hashed when it need not be
+/// costs a fetch that finds nothing, and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
-/// hashed, and compare passes after the lists.
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// hashed, and compare passes after the lists; then the ranges and pieces a
+/// pass would have taken without [`rehash_runs`] joining them.
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -2235,8 +2238,9 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
-/// copies' pieces, microseconds of landing in all.
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// copies' pieces, microseconds of landing in all, and of the fetches'
+/// waiting the part the card spent running work sent before the fetch.
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
@@ -2887,21 +2891,23 @@ fn relay_hand_back(back: &[Declared]) {
     if work.is_empty() {
         return;
     }
-    #[cfg(feature = "diagnostics")]
     let scanning = std::time::Instant::now();
     // Looked through without a lock: a piece that changes meanwhile (a
     // later flight writing, the title's bytes going in) is found now or by
     // that flight's landing, and the merge looks again under the lock.
     let found = crate::shadow::find_all(&work);
+    crate::flow::took(crate::flow::Site::Compared, work.iter().map(|(_, from, to)| to - from).sum(), scanning);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
+        let merging = std::time::Instant::now();
         let mut written = 0;
         for (at, n) in found {
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        crate::flow::took(crate::flow::Site::PutBack, written, merging);
         #[cfg(feature = "diagnostics")]
         crate::copystat::compared(*from, to - from, written);
         let _ = (from, to);
@@ -2968,12 +2974,14 @@ fn late_line(frames: f64) {
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
-             fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
+             fetches of card copies' pieces (of them {:.1} ms while the card finished work sent before the fetch, the rest \
+             the fetch's own copies), and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
              \"settles\" above are waits of other threads for it)",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
+            r[5] / 1000.0,
             r[4] / 1000.0,
         );
     }
@@ -3562,6 +3570,8 @@ impl Host {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
+                        CARD_PASSES[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        CARD_PASSES[4].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
@@ -3805,12 +3815,16 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                // A signal before the fetch: when it completes, everything
+                // sent before the fetch has run, and the time until it did
+                // is the waiting behind that work, not the fetch's own.
+                self.queue.Signal(&fence, sent * 2 - 1)?;
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                fence.SetEventOnCompletion(sent, event)?;
+                self.queue.Signal(&fence, sent * 2)?;
+                fence.SetEventOnCompletion(sent * 2 - 1, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
@@ -3819,8 +3833,22 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
-        let us = waiting.elapsed().as_micros() as u64;
+        let drained = waiting.elapsed();
+        // The fetch's own run: what the card takes for the copies, once the
+        // work sent before it is done (nothing if it had run by the time
+        // the signal before it completed).
+        let running = std::time::Instant::now();
+        // SAFETY: this thread's fence and event.
+        let waited = unsafe { fence.SetEventOnCompletion(sent * 2, event) }
+            .map(|()| unsafe { WaitForSingleObject(event, INFINITE) });
+        if let Err(e) = waited {
+            fail(format_args!("the fetch of what shaders wrote to the card's memory could not be waited for ({e}, VICTORY_RELAY=1)"));
+        }
+        let own = running.elapsed();
+        let us = (drained + own).as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        RELAY_STATS[5].fetch_add(drained.as_micros() as u64, Ordering::Relaxed);
+        crate::flow::put(crate::flow::Site::Fetched, total as usize, own.as_nanos() as u64);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -5619,7 +5647,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    let begun = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::flow::took(crate::flow::Site::IntoTitle, len, begun);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -5630,7 +5660,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    let begun = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::flow::took(crate::flow::Site::IntoTitle, len, begun);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -6598,12 +6630,15 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
+        crate::flow::line(frames);
         {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, ranges, range_pieces] =
+                [0, 1, 2, 3, 4].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up, where {ranges:.0} ranges of {range_pieces:.0} pieces were sent up (VICTORY_CARD_REHASH_RUNS \
+                     joins ranges that touch into one pass: {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }

@@ -111,6 +111,11 @@
 - `capture` and `copystat` are compiled only with
   `feature = "diagnostics"`. `VICTORY_GPU_TIMING` forces `late_stage` to 0;
   `VICTORY_D3D12_DRED` names the faulting command.
+- `flow` counts in every build, and logs after each frame line: which call
+  site moved how many bytes between title memory and ours, in how long, and
+  at what rate. `copystat` names the ranges and the memory kinds behind them.
+  A new copy path adds its bytes there, or the frame line's `copies` and
+  `copying back` stay unattributed.
 - Most `shortcut:` comments live here. Read the one next to the code you
   touch; it states what the approximation costs.
 
