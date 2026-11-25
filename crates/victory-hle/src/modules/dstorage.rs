@@ -1348,19 +1348,28 @@ fn read_unbuffered(
     if sector_aligned(out.as_ptr() as usize) {
         return read_span(&direct.file, offset, out);
     }
-    if out.len() > SCRATCH_KEEP {
-        // Larger than a worker keeps between requests: this one gets its own.
-        let mut own = vec![0; out.len()];
-        read_span(&direct.file, offset, &mut own)?;
-        out.copy_from_slice(&own);
-        return Ok(());
-    }
-    if copy.len() < out.len() {
-        copy.resize(out.len(), 0);
-    }
-    read_span(&direct.file, offset, &mut copy[..out.len()])?;
-    out.copy_from_slice(&copy[..out.len()]);
+    // The handle leaves the file cache out, so the kernel reads straight into
+    // the buffer: that buffer has to start on a sector boundary, which a
+    // `Vec<u8>`'s own pointer is not. Take an aligned window of one that is
+    // a sector larger than asked, kept between requests.
+    let buffer = aligned_in(copy, out.len());
+    read_span(&direct.file, offset, buffer)?;
+    out.copy_from_slice(buffer);
     Ok(())
+}
+
+/// The first `len` bytes of an address in `copy` that is on a sector
+/// boundary: `copy` grows to hold `len` plus one sector of slack, so the
+/// window always exists.
+fn aligned_in(copy: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if copy.len() < len + SECTOR {
+        copy.resize(len + SECTOR, 0);
+    }
+    let start = copy.as_ptr().align_offset(SECTOR);
+    // Every offset is a valid byte address, so the only failure a `Vec`
+    // can hit is a length it cannot hold, which the resize above prevents.
+    debug_assert!(start < SECTOR);
+    &mut copy[start..start + len]
 }
 
 /// Fills `out` from `offset` in one handle, a call at a time. A short read is
@@ -2115,6 +2124,24 @@ mod tests {
             .open(&path)
             .expect("this volume takes unbuffered reads");
         (dir, Direct { file })
+    }
+
+    #[test]
+    fn the_copy_for_an_unaligned_destination_starts_on_a_sector() {
+        // The unbuffered handle reads straight into the buffer, so the buffer
+        // must start on a sector boundary — a `Vec`'s own pointer need not.
+        // Lengths either side of the kept-scratch size exercise both the reuse
+        // and the growth path.
+        let mut copy = Vec::new();
+        for len in [1, SECTOR, SECTOR + 1, SCRATCH_KEEP, SCRATCH_KEEP + 1] {
+            let window = aligned_in(&mut copy, len);
+            assert_eq!(window.len(), len);
+            assert_eq!(
+                window.as_ptr() as usize % SECTOR,
+                0,
+                "a {len}-byte copy must start on a sector"
+            );
+        }
     }
 
     #[test]
