@@ -1862,6 +1862,21 @@ impl State {
         self.root_values.clear();
     }
 
+    /// The clamp recorded for an indirect run of `records` records replaced
+    /// what the list held of the pipeline and the compute root signature:
+    /// `crate::indirect` sets its compute pipeline through `SetPipelineState`
+    /// (which a dispatch reads) and a root signature of its own, so `bind`
+    /// sets both again. A clamp of no record records no command at all, and a
+    /// record whose window another run already clamped (`Window`) records no
+    /// clamp, so in both cases the list keeps what it has and `bind` spares
+    /// the pipeline it would otherwise set again.
+    fn forget_clamped(&mut self, records: u32) {
+        if records > 0 {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
@@ -3558,8 +3573,10 @@ impl State {
                     );
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                // The clamp set its own compute pipeline and root signature;
+                // `bind` sets both again. A run whose record a window already
+                // holds records no clamp, and takes nothing from the list.
+                self.forget_clamped(records);
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -4552,6 +4569,26 @@ mod tests {
         // A new host list has none of them.
         values.clear();
         assert!(values.again(0x2000_0000, true, 1, &[0x10, 0x20, 0x30, 0x50]));
+    }
+
+    /// A run whose record a window already holds records no clamp, so the
+    /// pipeline the list holds stands: the next draw spares it instead of
+    /// setting it again. A clamp of records does replace it.
+    #[test]
+    fn a_record_a_window_holds_leaves_the_lists_pipeline_set() {
+        let mut state = State::default();
+        state.host_pipeline = 0x5150;
+        state.host_roots = [0x51, 0x52];
+        // A clamp of no record records no command: nothing to forget.
+        state.forget_clamped(0);
+        assert_eq!(state.host_pipeline, 0x5150, "the pipeline the list holds stands");
+        assert_eq!(state.host_roots, [0x51, 0x52], "no root signature was replaced either");
+        // A clamp of records set its compute pipeline and compute root
+        // signature of its own; the graphics root signature is untouched (a
+        // pipeline change does not clear one).
+        state.forget_clamped(16);
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0x51, 0]);
     }
 
     /// The draw-buffer views a list holds are compared field by field: the
