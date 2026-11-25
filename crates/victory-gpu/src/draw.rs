@@ -1170,9 +1170,6 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
-            // A target the title named: what a present of another texture
-            // shows instead (`crate::present`).
-            crate::present::note_target(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -1183,7 +1180,6 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
-            crate::present::note_target(record.resource);
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1521,7 +1517,14 @@ impl State {
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
+        // A draw that runs renders into these, which is what a present reads as
+        // "the frame was written" (`crate::present`): binding a target this
+        // draw never reaches is not a write.
+        for &t in &self.targets {
+            crate::present::note_target(t as This);
+        }
         if self.depth != 0 {
+            crate::present::note_target(self.depth as This);
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:

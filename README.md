@@ -238,7 +238,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_PRESENT_FALLBACK=0` | a present whose frame nothing wrote since the last present (an upscale whose compute programs do not translate yet) shows the target the title did write instead of a black window: the largest target of the frame's shape, in the same letterboxed pass, logged once. On by default; `0` presents the frame as it is |
+| `VICTORY_PRESENT_FALLBACK=0` | a present whose frame nothing rendered into since the last present (an upscale whose compute programs do not translate yet; a clear of it is not a frame) shows the target the title did write instead of a black window: the largest target of the frame's shape, in the same letterboxed pass, logged once. On by default; `0` presents the frame as it is |
 | `VICTORY_PIPELINE_DUMP=<path>` | write the pipeline calls the device does not implement to that file, whole; `E_NOTIMPL` is still returned |
 | `VICTORY_CALLSITE_PROBE=1` | with either unknown pipeline creation (slots `0x1c8`, `0x218`), dump the title's code at the return address and the argument's bytes either side of it, once per slot; still `E_NOTIMPL` |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
