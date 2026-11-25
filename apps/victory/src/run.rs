@@ -18,15 +18,24 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    // The commit is baked into this crate only, and the window caption is drawn
+    // by `victory-gpu`: hand it over before anything can draw one.
+    victory_core::report::set_build(env!("VICTORY_COMMIT"), env!("VICTORY_COMMIT_SHORT"));
     let cfg = victory_core::Config::load()?;
     // Logging starts here, after the config has named the data directory
     // the log belongs in and before anything worth reading happens. A data
     // directory that cannot hold it (asset policy, permissions) leaves the
     // run on stderr rather than refusing to start it.
-    match cfg.data_subdir("logs") {
-        Ok(dir) => victory_core::logging::init_run("info", &dir),
-        Err(_) => victory_core::logging::init("info"),
-    }
+    let logs = match cfg.data_subdir("logs") {
+        Ok(dir) => {
+            victory_core::logging::init_run("info", &dir);
+            Some(dir)
+        }
+        Err(_) => {
+            victory_core::logging::init("info");
+            None
+        }
+    };
     // The run's clock: the shutdown summary states how long the title ran,
     // and this is the first moment the log can mark as its start.
     victory_hle::modules::lifecycle::note_run_start();
@@ -35,7 +44,7 @@ pub fn run(
     // Every way out of this function that returns writes the footer; the ways
     // that end the process from inside the HLE cannot, and keep the `run
     // summary:` line of `crates/victory-hle/src/modules/lifecycle.rs`.
-    let mut footer = Footer::new(started, &cfg);
+    let mut footer = Footer::new(started, begun, console, logs, &cfg);
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -182,7 +191,10 @@ fn emit_header(cfg: &victory_core::Config, header: &Header<'_>) {
     let program = format!("victory {}", env!("CARGO_PKG_VERSION"));
     let run = victory_core::report::RunHeader {
         program,
-        build: env!("VICTORY_BUILD").to_owned(),
+        build: env!("VICTORY_COMMIT_SHORT").to_owned(),
+        commit: env!("VICTORY_COMMIT").to_owned(),
+        branch: env!("VICTORY_BRANCH").to_owned(),
+        dirty: env!("VICTORY_DIRTY").to_owned(),
         started_utc: victory_core::logging::utc_text(header.begun),
         started_local: victory_core::logging::local_text(),
         filter: victory_core::logging::filter_text().to_owned(),
@@ -195,15 +207,20 @@ fn emit_header(cfg: &victory_core::Config, header: &Header<'_>) {
         title_id: header.title_id,
         manifest: header.manifest,
         storage_mb: header.storage_mb,
-        console: match header.console {
-            Console::SeriesX => "series-x".to_owned(),
-            Console::SeriesS => "series-s".to_owned(),
-        },
+        console: console_name(header.console).to_owned(),
         cache_dir: cfg.cache_dir.clone(),
         data_dir: cfg.data_dir.clone(),
         env: victory_env(),
     };
     victory_core::logging::emit("INFO", &run.render());
+}
+
+/// The console the header, the footer and the history row name.
+fn console_name(console: Console) -> &'static str {
+    match console {
+        Console::SeriesX => "series-x",
+        Console::SeriesS => "series-s",
+    }
 }
 
 /// Every `VICTORY_*` variable that is set, as the user set it.
@@ -231,6 +248,15 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// The mean of one observed metric over the run, in the unit its name carries.
+///
+/// `None` when nothing measured it, so the history row leaves the column empty
+/// instead of stating a zero that would average into the next run.
+fn mean(meter: &victory_core::meter::Snapshot, name: &str) -> Option<f64> {
+    let metric = meter.metrics.iter().find(|metric| metric.name == name)?;
+    (metric.count > 0).then(|| metric.sum as f64 / metric.count as f64)
+}
+
 /// Writes the `STOP` block on every way out of [`run`], and installs the
 /// renderer the paths that end the process from inside the HLE use.
 ///
@@ -244,8 +270,13 @@ fn dir_size(path: &Path) -> u64 {
 ///
 /// The frame figures are the two metrics the presentation path records:
 /// `frames_n`, counted once per presented frame by `victory_gpu::queue::present`,
-/// and `frame_ms`, observed once per frame. A run that never drew has neither
-/// and prints no fps.
+/// and `frame_ms`, observed once per frame by `victory_gpu::host::Meter::frame`.
+/// A run that never drew has neither and prints no fps.
+///
+/// It also writes the run's row of `<log_dir>/runs.tsv`
+/// ([`victory_core::report::append_run`]) on the same path, from the same
+/// figures: a log is a megabyte per run and a year of them cannot be read
+/// across, while one row per run answers "did this commit get slower".
 struct Footer {
     started: std::time::Instant,
     reason: String,
@@ -256,8 +287,15 @@ struct Footer {
 static TITLE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Footer {
-    fn new(started: std::time::Instant, cfg: &victory_core::Config) -> Self {
+    fn new(
+        started: std::time::Instant,
+        begun: std::time::SystemTime,
+        console: Console,
+        logs: Option<std::path::PathBuf>,
+        cfg: &victory_core::Config,
+    ) -> Self {
         let (cache_dir, data_dir) = (cfg.cache_dir.clone(), cfg.data_dir.clone());
+        let console = console_name(console);
         victory_core::report::set_footer_hook(Box::new(move |reason, duration| {
             let mut footer = victory_core::report::RunFooter::from_counters(reason, duration);
             let title = format!("{:08X}", TITLE_ID.load(std::sync::atomic::Ordering::Relaxed));
@@ -271,6 +309,39 @@ impl Footer {
                 ("storage".to_owned(), dir_size(&data_dir.join(&title).join("storage"))),
                 ("temp".to_owned(), dir_size(&data_dir.join(&title).join("temp"))),
             ];
+            // The history row: the same figures the block states, stamped with
+            // the commit and the minute the run ended. Written before the block
+            // is emitted, so a run that dies writing the footer has still left
+            // its row, and a row that cannot be written is a warning, never a
+            // failed run.
+            let record = victory_core::report::RunRecord {
+                started_utc: victory_core::logging::utc_text(begun),
+                ended_utc: victory_core::logging::utc_text(std::time::SystemTime::now()),
+                commit: env!("VICTORY_COMMIT").to_owned(),
+                branch: env!("VICTORY_BRANCH").to_owned(),
+                dirty: env!("VICTORY_DIRTY").to_owned(),
+                console: console.to_owned(),
+                duration,
+                frames: footer.frames,
+                // The worst frame the meter saw, and the two figures only its
+                // five-second line prints: the mean is read from the totals.
+                worst_frame_ms: footer.worst_frame_ms,
+                draws_mean: mean(&footer.meter, "draws_frame"),
+                gpu_wait_ms: mean(&footer.meter, "gpu_wait_us").map(|us| us / 1_000.0),
+                reason: reason.to_owned(),
+                log: victory_core::logging::current_log_file().map(Path::to_path_buf),
+            };
+            if let Some(dir) = &logs
+                && let Err(error) = victory_core::report::append_run(
+                    &dir.join(victory_core::report::RUNS_FILE),
+                    &record,
+                )
+            {
+                victory_core::logging::emit(
+                    "WARN",
+                    &format!("run history left out of {}: {error}", dir.display()),
+                );
+            }
             footer.render()
         }));
         Self {

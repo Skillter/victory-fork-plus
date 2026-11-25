@@ -53,6 +53,18 @@
   declared stays closed until both have merged it. The card copies' fetch is
   always issued and merged by the landing that made it, after the copies in
   the PC's memory: the card runs it while that thread merges its own.
+- That fetch goes to the tail of the direct queue, so it waits behind every
+  list already sent: 502.8 ms a frame of the landing thread's wait, 499.3 ms of
+  it while the card finished work sent before the fetch. With
+  `VICTORY_READBACK_SLOTS=1` (off by default, unmeasured) each landing's fetch
+  copies into a slot of its own on the copy queue instead
+  (`Host::relay_fetch_slot`, `host::SlotRing`), which waits only for that
+  flight's fence; the ring holds `host::READBACK_SLOTS` flights and a fetch with
+  every slot held falls back to the shared buffer's tail. The trade is a torn
+  read: a later flight, or an upload on the direct queue, may write a piece
+  while the copy reads it, and that merge stands until the later flight's own
+  fetch merges over it (a range a later send put up is skipped,
+  `Shadow::card_merge_relay`).
 - `VICTORY_CARD_BUFFERS*` adds a card-side copy and finds writes with a
   compute hash per piece; `VICTORY_INPLACE*` places a buffer in an
   `OpenExistingHeapFromFileMapping` heap. Both are off by default.
@@ -221,6 +233,13 @@
   at what rate. `copystat` names the ranges and the memory kinds behind them.
   A new copy path adds its bytes there, or the frame line's `copies` and
   `copying back` stay unattributed.
+- `host::Meter::frame` is ticked at the top of `Host::present`, ahead of every
+  gate that returns without drawing (`client_size`, `fit`, no back buffer), so
+  the 5 s line and the caption count the frames the title spent, not the frames
+  that reached the card; a gate that returns every frame of a run says so
+  (`present.no-client-area`). `frame_ms` is the gap between presents, which is
+  the footer's `fps_worst`; `draws_frame` and `gpu_wait_us` are the two figures
+  a `runs.tsv` row keeps per run.
 - The title's buffer copies are deferred steps, run at submission in runs
   whose destinations carry on (`host::copy_run`): a run shares one flush
   before it, one opening of the guards over all it writes, one
