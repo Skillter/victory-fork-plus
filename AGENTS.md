@@ -52,7 +52,8 @@ target\release\victory.exe run <title.exe> --execute
 - **Never** edit `crates/victory-formats/src/bcpack-tables.bin` or its
   allowlist entry in `xtask/src/policy.rs`; it is the one documented
   exception.
-- **Never** rewrite measurements in `MEMORY.md`; append a dated section.
+- **Never** rewrite a `MEMORY.md` measurement without evidence; correct the
+  wrong line in place and say where you saw it.
 - **Ask first** before `cargo clean`, adding a dependency, changing the
   encoded layout of `HostShader`, disabling a lint, or widening the title-DLL
   rule in `apps/victory/src/run.rs` (tried before; black-screened).
@@ -75,6 +76,15 @@ target\release\victory.exe run <title.exe> --execute
 - Tests assert properties, not snapshots. Differential and GPU tests compare
   against a Rust reference or a second compiler.
 - Durable docs cite `path::symbol`; chat and commits may cite `path:line`.
+
+## Docs
+
+- Dense Markdown: one fact per line, no preamble, no filler, no restatement.
+- Adding prose must delete or shorten prose, unless it records a new measured
+  fact or a new rule.
+- No fact twice: state it once, point at it.
+- `MEMORY.md` = measurements, `AGENTS.md` = rules, `README.md` = user surface.
+- No changelogs, no "we now", no dates in `AGENTS.md`.
 
 ## Architecture in brief
 

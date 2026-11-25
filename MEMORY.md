@@ -2,9 +2,12 @@
 
 Handoff notes for maintainers returning to this tree. Measurements were taken
 on the reference rig (Windows 10 19045, AMD RX 6800 XT gfx1030, driver
-2.0.353) at 4K unless stated; other hardware will differ. The preparation in
-§2 is what makes the world render at all on Windows 10. Windows 11 already
-ships a new enough D3D12 core, so the redistributed one is optional there.
+2.0.353) at 4K unless stated; other hardware will differ. Claims marked
+*(re-measured)* come from a later session on a different machine and name the
+file each one was observed in, because the figures depend on the card and the
+driver. The preparation in §2 is what makes the world render at
+all on Windows 10. Windows 11 already ships a new enough D3D12 core, so the
+redistributed one is optional there.
 
 Placeholders used below: `<repo>` is this checkout, `<game-folder>` is the
 title package (outside the repository, read-only by preference), `<data-dir>`
@@ -23,13 +26,18 @@ menus but its world submits, then renders dark. Work here; keep an upstream
 checkout only as a reference for what the fork changed (the fork keeps
 upstream's history).
 
-All derived state lives in `<data-dir>`:
+Two directories hold all derived state, both outside `<repo>`: `<cache-dir>`
+(`VICTORY_CACHE_DIR`, default `%LOCALAPPDATA%\victory\cache`) and `<data-dir>`
+(`VICTORY_DATA_DIR`, default `%LOCALAPPDATA%\victory\data`).
 
-    fork-cache/           shader cache, pipeline library, mapped images
-    data/<title-id>/      saves, settings, crashes.log
-    agility/              unpacked Agility SDK, if you keep one
-    capture/              captured frames
-    world*/               frame dumps from earlier sessions
+    <cache-dir>/shaders/     translated shaders, keyed by this build's hash
+    <cache-dir>/pipelines/   host-pipelines.bin, early-pipelines.txt
+    <cache-dir>/images/      prepared copies of the title's images
+    <data-dir>/data/<title-id>/  saves, settings, crashes.log, temp
+    <data-dir>/logs/         run.log from `victory run`, if no VICTORY_LOG_FILE
+    <data-dir>/capture/      captured frames
+    <data-dir>/world*/       frame dumps from earlier sessions
+    <data-dir>/agility/      unpacked Agility SDK, if you keep one there
 
 The game folder is read-only by preference. Nothing should ever need to write
 there: the title sees the package as `G:` and its writable storage as `Z:`/`T:`
@@ -120,14 +128,27 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 | `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as `RELAY`; assume the same risk |
 | `VICTORY_WIDE_BACK=1` | snapshot compares spread across cores | safe; sold as part of the fast config |
 | `VICTORY_CARD_BUFFERS=0` | disables the card-side buffer shadow copies | **did not change the cutscene ghosting** |
-| `VICTORY_DISPLAY_MODE=WxH` | display size reported to the title | **useless for resolution**, see §5 |
-| `--console series-s` | title targets 1080p | **blackscreens**, see §5 |
+| `VICTORY_DISPLAY_MODE=WxH` | display size reported to the title | **useless for resolution**, see §6 |
+| `--console series-s` | title targets 1080p | renders at 1920x1080; the black screen on record is unverified against this tree, see §6 |
 | `VICTORY_MESH_GROUPS=n` | caps mesh dispatch groups | upstream tree only, not present here; default 65535; added while chasing the upstream TDR |
 | `VICTORY_SHADER_LOOP_LIMIT=n` | bounds translated loops | did not stop the upstream TDR |
 | `VICTORY_D3D12_DRED=1` | on device loss, name the faulting command | how the upstream TDR was identified |
 | `VICTORY_CAPTURE=<dir>` / `VICTORY_CAPTURE_FRAMES=` / `VICTORY_DUMP_TARGETS=1` | save presented frames / every render target | diagnostics builds only |
 | `VICTORY_D3D12_WARP=1` | software adapter; wild accesses become AVs, no driver reset | diagnostics builds only; slow |
 | `VICTORY_GPU_TIMING=1` | per-list timing on the card | forces `late_stage()` to 0 |
+| `VICTORY_LOG_FILE=<path>` | log goes to that file as well as stderr | `0` turns the file off; see below |
+
+Log destination. `VICTORY_LOG_FILE=<path>` writes the log to that file in
+addition to stderr. `VICTORY_LOG_FILE=0` (or `off`) disables the file copy, so
+the log is stderr only. When the variable is unset, `victory run` logs to
+`<data-dir>/logs/run.log`, truncated at the start of each run, and every other
+command logs to stderr only. If the data directory cannot hold the file (asset
+policy, permissions), the run falls back to stderr instead of refusing to
+start. A capture that must survive a closed window is therefore
+`VICTORY_LOG_FILE=<path> target\release\victory.exe run ...`; a relative value
+is relative to the working directory, so do not pass a bare name from inside
+`<repo>`. The default path is under `<data-dir>` because nothing may be written
+inside `<repo>`.
 
 Diagnostics build (needed for capture, keys, WARP, GPU timing):
 
@@ -144,10 +165,17 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
   sun flares, floating motes, correct single-line subtitles. Frames were
   captured to `<data-dir>/world/`.
 - **The world renders** with working controls, HUD and pause menu.
-- Pipeline library accumulates across sessions —
-  `fork-cache/pipelines/host-pipelines.bin` went 97 KB → 231 KB → 320 KB — so
-  each session drops fewer draws. `dropped N (0 being made)` means the backlog
-  is drained; `M being made` means compilation is the limit that frame.
+- Pipeline library accumulates across sessions, so each session drops fewer
+  draws. *(re-measured)* after one session
+  `<cache-dir>/pipelines/host-pipelines.bin` was **232,858,822 bytes (222 MiB)**,
+  with **2,853** names in `early-pipelines.txt` beside it. The
+  `97 KB → 231 KB → 320 KB` progression quoted by earlier notes was an
+  early-session figure, taken while most pipeline creation still failed; it is
+  not reproducible, so expect a few hundred MiB, not a few hundred KB. The blob
+  is rewritten whole on every save and is coupled to the driver, so a driver
+  update discards it and the next run rebuilds from empty.
+  `dropped N (0 being made)` means the backlog is drained; `M being made` means
+  compilation is the limit that frame.
 - With the library warm: `dropped ~350-400 without a host pipeline (0 being made)`.
 
 ---
@@ -214,36 +242,64 @@ draws (the doubled subtitles are two *different* strings, which is temporal
 blending, not a repeated frame). **Fix 5.2 first and re-check this** — it may be
 the same root cause.
 
+**Also missing, in one line:** variable-rate shading is not implemented
+anywhere — there is no shading-rate code in `crates/victory-gpu` or
+`crates/victory-hle` — so a title that asks for it silently gets full rate.
+`settings.xml` carries a `vrsEnabled` key (§6), which is the only place the
+request is visible today.
+
 ---
 
 # 6. Dead ends — do not retry these
 
 - **`--console series-s`.** It genuinely renders at 1920x1080 (confirmed:
   `title window fitted to the screen width=1920 height=1080`, `presenting ...
-  1920x1080`) and that is the only 4x pixel win found. But the Series S path
-  needs the title's late-loaded `amd_fidelityfx_upscaler_xbox.dll`, and it
-  black-screens:
-
-      refused dll="amd_fidelityfx_upscaler_xbox.dll"
-
-  Cause: `apps/victory/src/run.rs` builds
-  `wanted = |dll| title_dll(host, dll) && !image_named(dll)`, and `title_dll`
-  is false for anything the host policy does not explicitly deny, so
-  `victory_loader::windows::map_dll` maps nothing (it returns early unless
-  `wanted(&name)` and the file exists). The kernel then refuses it too
-  (`victory_hle::modules::kernel`, "a host DLL outside the host policy").
+  1920x1080`) and that is still the only 4x pixel win found. Earlier notes here
+  blamed a black screen on the title's upscaler being refused and quoted
+  `refused dll="amd_fidelityfx_upscaler_xbox.dll"`. **That line exists nowhere
+  in the current tree** — `git log -S'refused dll'` finds the string only in
+  this file. What the tree does today is `apps/victory/src/run.rs::LateDlls`,
+  documented as handling *the title's upscaler behind its FidelityFX loader*:
+  every `LoadLibrary` the title makes goes through it, so a `LoadLibrary` of the
+  upscaler is mapped like any other title DLL. Its filter is
+  `wanted = |dll| title_dll(&host, dll) && image_named(dll).is_none()`, and
+  `apps/victory/src/run.rs::title_dll` is true for every DLL the host policy does
+  not allow through and no HLE module serves — so the upscaler qualifies. The
+  Series S black screen is therefore **unverified against the current tree**:
+  re-test it before treating it as a dead end.
   **Do not fix it by mapping every DLL beside the exe**: the game folder also
   holds `msvcp140.dll`, `vccorlib140.dll`, `libHttpClient.GDK.dll` and friends,
   and mapping the title's copies of those instead of the host's is a much larger
-  risk than the feature is worth. If this is attempted, allow *that one name*
-  explicitly, and only in the `LoadLibrary` path.
+  risk than the feature is worth (it was tried and black-screened, see below).
 - **`VICTORY_DISPLAY_MODE=1920x1080`.** Accepted and reported, no effect: the
   title creates its 3840x2160 window *before* it queries the display (sample
   run: window 21:41:55, `display mode reported` 21:41:59).
   `victory_gpu::dxgi::modes()` already returns `display_size()`; the title
   ignores the mode list.
-- **In-game resolution setting.** Does not exist. `settings.xml` has no
-  resolution key and no ray-tracing key.
+- **In-game resolution setting.** Earlier notes called this a dead end; it
+  exists. They claimed `settings.xml` had no resolution key and no ray-tracing
+  key, and that was wrong. *(re-measured)*
+  `<data-dir>/data/<title-id>/storage/settings/settings.xml` is readable text
+  and carries, among others, `resolutionFullscreen` (`3840x2160`),
+  `frameRateLimit` (`30`), `vSync`, `hdr`, `fsrQuality`,
+  `graphicsQualityPreset`, `rtDynamicShadows` (**`true` by default**),
+  `rtLODLightShadows` (`false`), `ssroSampleCount` (`2`),
+  `shadowAlphaTintedShadows`, `shadowParticleShadows`, `anisotropicFiltering`
+  (`0`), `mapMSAA` and `vrsEnabled`. The title rewrites the file during a run,
+  so edit it before starting one; the RT keys are requests the fork does not
+  answer yet (§5.3). **UNTESTED:** copy the file, set `resolutionFullscreen` to
+  `1920x1080`, and compare the frame time — 4x fewer pixels for one key. Nobody
+  has run that experiment.
+- **`fsrQuality` is not by itself upscaled rendering.** *(re-measured)* the
+  settings request `fsrQuality`, but `<cache-dir>/images` held no
+  `amd_fidelityfx_upscaler_xbox.dll` (786,432 bytes) — only its 13,312-byte
+  loader shim — so the 4x path was not taken and the frame ran at the native
+  3840x2160. That is an observation, not a conclusion: the upscaler may never
+  have been requested, or may have been requested and failed to map.
+  **Hypothesis to test:** capture a run's log and grep it for `title dll` —
+  `apps/victory/src/run.rs` prints one line per title DLL it maps, with
+  `(loaded by the title)` for a `LoadLibrary`. No
+  `amd_fidelityfx_upscaler_xbox.dll` line means the title never asked for it.
 - **`VICTORY_SHADER_LOOP_LIMIT`** as a TDR fix (upstream). Did not stop it.
 - **`VICTORY_MESH_GROUPS`** as a TDR fix (upstream). Did not stop it; the
   failing command moved to a 1x1x1 compute dispatch with one thread.
@@ -265,9 +321,14 @@ Sample run clock:
               world: 2.1 fps, 473 ms/frame
 
 Saves and settings live under `<data-dir>/data/<title-id>/`
-(`saves\0009000000000001\...\Player~<hash>\v3\{0,1,manifest}` and
-`SettingsProfileSettings~<hash>\v1\...`). The settings blob is binary;
-resolution is not greppable in it.
+(`saves\0009000000000001\...\Player~<hash>\v5\{0,1,manifest}`,
+`SettingsProfileSettings~<hash>\v2\...`). *(re-measured)* the version folder is
+part of the title's format and was **v5** (`Player~<hash>`), **v2**
+(`SettingsProfileSettings~<hash>`) and **v1** (`SARC0015~<hash>`) on the session
+that measured it; do not hardcode those numbers, read the directory. Save blobs
+are binary, but the settings themselves are readable text in
+`storage/settings/settings.xml` (§6), so resolution and quality **are**
+greppable there.
 
 ---
 
