@@ -332,18 +332,52 @@ struct Window {
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
+/// The window a draw asking for `offset` of a copy takes, given the last one
+/// (its `base` offset, its `records`, their `step`) when the title still walks
+/// the same buffer: the step it walks by and how many records to clamp ahead
+/// of the draws that will read them. A walk not recognised takes the title's
+/// own `stride` and `max`, one record clamped as without a window. `left` is
+/// the bytes from `offset` to the copy's end.
+fn ahead(
+    last: Option<(u64, u32, u32)>,
+    offset: u64,
+    left: u64,
+    stride: u32,
+    max: u32,
+) -> (u32, u32) {
+    let Some((base, records, was)) = last else {
+        return (stride, max);
+    };
+    let last_at = base + u64::from(records - 1) * u64::from(was);
+    let step = offset.saturating_sub(last_at);
+    let walks = step >= u64::from(stride)
+        && step <= 256
+        && step % 4 == 0
+        && (records == 1 || step == u64::from(was));
+    if !walks {
+        return (stride, max);
+    }
+    let fit = (left / step).min(WINDOW_MOST) as u32;
+    let next = if records == 1 { 16 } else { records * 2 };
+    (step as u32, next.min(fit).max(1))
+}
+
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (on; `VICTORY_INDIRECT_WINDOW=0`
+/// turns it off).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
 /// each our clamp ran as a compute dispatch of its own between two waits,
 /// so the card went from drawing to compute and back for every record. In
 /// the timing run of the lit scene (run 79) a shadow draw of next to
-/// nothing cost 14-16 microseconds, 4,126 records a frame.
+/// nothing cost 14-16 microseconds, 4,126 records a frame; the world scene
+/// of 2026-11-25 09:40 lists `our indirect clamps 1.03` beside `indirect
+/// runs 1.03` per draw, some 4,300 of each a frame where the frame line
+/// reads 4,486 draws and 76.5 ms on the GPU (`run-20261125-094023.log`): a
+/// dispatch and two barrier pairs for every record drawn.
 ///
-/// With the switch, when a draw asks for a record a short step after the
+/// With it, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
@@ -352,6 +386,12 @@ const WINDOW_MOST: u64 = 64;
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
+///
+/// Its ordering: the window's bytes reach the host copy at the list's
+/// submission, never when the window is made (`Shadow::refresh` defers), so
+/// a write the title's CPU side makes while the list is recorded is in it;
+/// and every command that can write those bytes on the GPU ends the window,
+/// so no draw reads a record a later command of the list has rewritten.
 ///
 /// The step is the one the title is seen to take, not the stride its
 /// command signature names: it draws one record a call, for which the
@@ -374,7 +414,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What a fresh table's records last mixed to, the dynamic slot they
@@ -3485,23 +3525,12 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
-                    }
-                    _ => (stride, max),
-                };
+                let last = self
+                    .window
+                    .as_ref()
+                    .filter(|w| windowed && same(w))
+                    .map(|w| (w.base, w.records, w.step));
+                let (step, records) = ahead(last, offset, args.left(arguments), stride, max);
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
@@ -3824,6 +3853,44 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window of records clamped ahead of their draws: a title walking
+    /// one argument buffer a record a call opens with 16, doubles to
+    /// [`WINDOW_MOST`] at most, and ends the moment the walk stops being the
+    /// one seen (a step that differs from the window's, one shorter than the
+    /// named stride, past 256 bytes, or not a multiple of four), where one
+    /// record is clamped as without a window.
+    #[test]
+    fn an_indirect_walk_widens_by_doubling_and_ends_when_the_step_changes() {
+        const LEFT: u64 = 1 << 20;
+        // No window yet: the title's own stride and count.
+        assert_eq!(ahead(None, 0x1000, LEFT, 12, 1), (12, 1));
+        // A record 32 bytes after a one-record window's record: 16 ahead.
+        let one = Some((0x1000, 1, 12));
+        assert_eq!(ahead(one, 0x1000 + 32, LEFT, 12, 1), (32, 16));
+        // The 16 records drawn, the next 32 after the last of them: 32.
+        let window = Some((0x1000, 16, 32));
+        assert_eq!(ahead(window, 0x1000 + 16 * 32, LEFT, 12, 1), (32, 32));
+        // Then 64, and no further.
+        let window = Some((0x1000, 32, 32));
+        assert_eq!(ahead(window, 0x1000 + 32 * 32, LEFT, 12, 1), (32, 64));
+        let window = Some((0x1000, 64, 32));
+        assert_eq!(ahead(window, 0x1000 + 64 * 32, LEFT, 12, 1), (32, 64));
+        // A window never reaches past the copy: 100 bytes left, 32 apart, 3.
+        assert_eq!(ahead(one, 0x1000 + 32, 100, 12, 1), (32, 3));
+        // Nothing left after the record: a window of the one record.
+        assert_eq!(ahead(one, 0x1000 + 32, 16, 12, 1), (32, 1));
+        // A step other than the window's ends it (16 where it walked 32).
+        let window = Some((0x1000, 16, 32));
+        assert_eq!(ahead(window, 0x1000 + 16 * 32 - 16, LEFT, 12, 1), (12, 1));
+        // As do one shorter than the named stride, one not a multiple of
+        // four, and one past 256 bytes.
+        assert_eq!(ahead(one, 0x1000 + 8, LEFT, 12, 1), (12, 1));
+        assert_eq!(ahead(one, 0x1000 + 34, LEFT, 12, 1), (12, 1));
+        assert_eq!(ahead(one, 0x1000 + 260, LEFT, 12, 1), (12, 1));
+        // A title that moves backwards (or does not move) ends it too.
+        assert_eq!(ahead(window, 0x1000, LEFT, 12, 1), (12, 1));
+    }
 
     /// The registry revision the tests of the fresh-table cache ask under:
     /// one of their own, so whatever the other tests do to
