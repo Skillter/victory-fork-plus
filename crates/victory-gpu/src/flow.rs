@@ -42,7 +42,7 @@ pub(crate) enum Site {
     /// `Shadow::relay_merge`, `Shadow::card_merge`).
     PutBack,
     /// Pieces fetched from copies in the card's memory to ours
-    /// (`Host::relay_card_back`): the bytes, and the fetch's own run on the
+    /// (`Host::relay_fetch_merge`): the bytes, and the fetch's own run on the
     /// card (not the waiting behind work sent before it).
     Fetched,
 }

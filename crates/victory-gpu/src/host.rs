@@ -2422,11 +2422,149 @@ enum Late {
     Signal(usize, u64),
 }
 
+/// The title memory the flights in the air, and the flights whose merge is
+/// held back ([`lazy_merge`]), may write, per declaration: each range with
+/// the submissions that declared it and have not merged it yet.
+///
+/// A range two flights declared stays held after the first of them merges
+/// (`merged` is per submission): it is closed to refreshes until the last
+/// does, as `shadow::Flights` keeps it. A held range is what [`blocked_by`]
+/// tests, and what a settle waits to be gone.
+#[derive(Default)]
+struct Held {
+    /// Each declared range, with the submissions that declared it and have
+    /// not merged it.
+    ranges: Vec<((usize, usize), Vec<u64>)>,
+    /// The union of `ranges`, in order and joined: what is tested.
+    joined: Vec<(usize, usize)>,
+}
+
+impl Held {
+    const fn new() -> Held {
+        Held { ranges: Vec::new(), joined: Vec::new() }
+    }
+
+    /// Submission `number` declares `ranges` (each once): each is held for
+    /// it, however many times the submission declares it.
+    fn declare(&mut self, ranges: impl IntoIterator<Item = (usize, usize)>, number: u64) {
+        let mut any = false;
+        for range in ranges {
+            if range.0 >= range.1 {
+                continue;
+            }
+            match self.ranges.iter_mut().find(|(r, _)| *r == range) {
+                Some((_, held)) => {
+                    if !held.contains(&number) {
+                        held.push(number);
+                    }
+                }
+                None => self.ranges.push((range, vec![number])),
+            }
+            any = true;
+        }
+        if any {
+            self.rejoin();
+        }
+    }
+
+    /// Submission `number`'s shaders' writes are in title memory: the
+    /// ranges no other submission still holds are free again, and the ones
+    /// it still holds are not.
+    fn merged(&mut self, number: u64) {
+        if !self.ranges.iter().any(|(_, held)| held.contains(&number)) {
+            return;
+        }
+        self.ranges.retain_mut(|(_, held)| {
+            held.retain(|&n| n != number);
+            !held.is_empty()
+        });
+        self.rejoin();
+    }
+
+    /// Whether a range that no submission merged yet touches `[from, to)`.
+    fn touches(&self, from: usize, to: usize) -> bool {
+        touches(&self.joined, from, to)
+    }
+
+    /// The held ranges, in order and joined: [`blocked_by`]'s argument.
+    fn joined(&self) -> &[(usize, usize)] {
+        &self.joined
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.joined.clear();
+    }
+
+    fn rejoin(&mut self) {
+        let all: Vec<(usize, usize)> = self.ranges.iter().map(|(range, _)| *range).collect();
+        self.joined.clear();
+        join_ranges(&mut self.joined, all);
+    }
+}
+
+/// A flight whose shaders' writes are in copies in the PC's memory and not
+/// in title memory yet, and that told the title nothing when it landed
+/// ([`lazy_merge`]): merged at the first point that reads those bytes, at
+/// the next landing, or at the next settle, whichever comes first.
+struct HeldBack {
+    /// Its number among the submissions started (what [`Held::merged`] and
+    /// `Shadow::copy_back_done` end).
+    number: u64,
+    /// The ranges its shaders may write, per copy, as declared.
+    back: Vec<Declared>,
+}
+
+/// Whether what a flight's shaders wrote in a copy in the PC's memory is
+/// merged at the first point that reads it rather than when it lands
+/// (`VICTORY_LAZY_MERGE=1`; off by default).
+///
+/// A flight that tells the title nothing when it lands (no bottom-of-pipe
+/// write, no fence signal behind it) leaves bytes in title memory that only
+/// a later submission's preparation, a present, a fence or a refresh can
+/// observe ([`late`]'s points). Until one of them does, the merge is work
+/// on the landing thread that no one is waiting for, and the landing is
+/// what the submitting thread waits for ([`relay_wait`]): holding it back
+/// lands the flight sooner and lets the merge run beside the card, or in
+/// the next landing with the flights after it.
+///
+/// Off unless the card copies' fetch runs on a thread of its own
+/// ([`relay`]: without it the merging thread is the submitting one and
+/// holding a merge back only moves it), and never together with a pinned
+/// `VICTORY_LATE_WAIT`, whose runs this must not change.
+fn lazy_merge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LAZY_MERGE").is_some_and(|v| v != "0")
+            && relay()
+            && std::env::var_os("VICTORY_LATE_WAIT").is_none()
+    })
+}
+
+/// Whether a landing holds a flight's merge back ([`lazy_merge`]): it wrote
+/// something in a copy in the PC's memory, and the items after it in this
+/// landing tell the title nothing (`Late::Write`, `Late::Signal`), which
+/// would put its bytes in the title's hands unwritten.
+fn holds_back(wrote: bool, after: &[Late]) -> bool {
+    wrote && !after.iter().any(|item| matches!(item, Late::Write(..) | Late::Signal(..)))
+}
+
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
-    written: Vec<(usize, usize)>,
+    /// The title memory the flights' shaders may write, and the flights
+    /// that have not merged theirs yet (`Held`).
+    held: Held,
+    /// With [`lazy_merge`]: the flights that landed and told nobody, whose
+    /// shaders' writes title memory does not hold yet.
+    deferred: Vec<HeldBack>,
+    /// Threads waiting in [`Host::settle`]: a landing holds nothing back
+    /// while one is, a settle being one of the points the title must see
+    /// title memory at.
+    settles: usize,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2452,7 +2590,9 @@ unsafe impl Send for Line {}
 
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
-    written: Vec::new(),
+    held: Held::new(),
+    deferred: Vec::new(),
+    settles: 0,
     lists: 0,
     target: 0,
     settling: false,
@@ -2492,13 +2632,17 @@ const WHY_FENCE: usize = 10;
 /// and it is worth a wait for the card.
 pub(crate) const WHY_DYNAMIC: usize = 18;
 
+/// With [`lazy_merge`]: flights a landing did not merge, by index in
+/// [`LATE_STATS`].
+const DEFERRED: usize = 19;
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
+/// copy, a fill of upload memory, a texture), and the merges held back
+/// ([`DEFERRED`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2543,28 +2687,28 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let held = {
         let line = line();
-        if line.written.is_empty() {
+        if line.held.is_empty() {
             return None;
         }
-        line.written.clone()
+        line.held.joined().to_vec()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&held, runs, true)
 }
 
-/// [`late_blocked`] against `written`, the title memory flights' shaders
-/// may write (in order, joined); `count` whether the kind of read is
+/// [`late_blocked`] against `held`, the title memory flights' shaders may
+/// write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if written.is_empty() {
+fn blocked_by(held: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    if held.is_empty() {
         return None;
     }
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if touches(held, src, src + len) || touches(held, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2572,7 +2716,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if touches(held, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2581,7 +2725,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
+                    if touches(held, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2594,7 +2738,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 // from work that writes host memory only).
                 Step::Rectangles(work) => {
                     let (at, len) = work.source();
-                    if touches(written, at, at + len) {
+                    if touches(held, at, at + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2676,7 +2820,7 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if line.line.is_empty() && line.in_hand.is_empty() {
             return false;
         }
-        let mut unsure = touches(&line.written, address, address + bytes);
+        let mut unsure = line.held.touches(address, address + bytes);
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
             Late::Write(at, what, n) => Some((at, what, n)),
@@ -2855,6 +2999,26 @@ struct RelayFetch {
     buffer: Option<(ID3D12Resource, usize, u64)>,
 }
 
+/// A fetch of card copies' pieces sent to the card and not waited for yet
+/// ([`Host::relay_card_fetch`]): what it will merge, where it lands, and
+/// the signals its waits are for.
+struct FetchRun {
+    /// The piece of each copy, its offsets in that copy, and where its
+    /// bytes come down.
+    pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+    /// The mapping of the memory the pieces come down to.
+    data: usize,
+    /// Bytes fetched.
+    total: u64,
+    /// The fetch's number on [`RelayFetch::fence`] (values `2n-1` and `2n`).
+    sent: u64,
+    /// The queue's count when the fetch was sent: a send to a card copy
+    /// made after it is not named by what the fetch brings.
+    after: u64,
+    /// The copies the fetch was made in.
+    runs: usize,
+}
+
 /// The thread that lands flights ([`relay`]): as soon as the card has run
 /// the first flights of the line it takes them, with what follows them,
 /// and does what they left to do ([`Host::relay_land`]); else it waits for
@@ -2968,6 +3132,55 @@ fn relay_hand_back(back: &[Declared]) {
     }
 }
 
+/// Merges what a landing held back ([`lazy_merge`], [`HeldBack`]): what the
+/// shaders of flights that landed and told nobody wrote in copies in the
+/// PC's memory, which title memory does not hold yet.
+///
+/// Called at the first point that must see those bytes (a preparation that
+/// reads them, a `Map`, a refresh that would write over them), at every
+/// settle, and at the start of every landing. Merges all of them: each is
+/// about to be read, or the landing is about to tell the title its flight
+/// is done. The entries are taken out of the line first, so exactly one
+/// thread merges each.
+fn drain_deferred() -> usize {
+    let entries = {
+        let mut line = line();
+        std::mem::take(&mut line.deferred)
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut back: Vec<Declared> = Vec::new();
+    for entry in &entries {
+        for (shadow, ranges) in &entry.back {
+            match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                Some((_, all)) => {
+                    for range in ranges {
+                        if !all.contains(range) {
+                            all.push(*range);
+                        }
+                    }
+                }
+                None => back.push((shadow.clone(), ranges.clone())),
+            }
+        }
+    }
+    relay_hand_back(&back);
+    for entry in &entries {
+        for (shadow, ranges) in &entry.back {
+            shadow.copy_back_done(ranges);
+        }
+    }
+    {
+        let mut line = line();
+        for entry in &entries {
+            line.held.merged(entry.number);
+        }
+    }
+    LINE_LANDED.notify_all();
+    entries.len()
+}
+
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
@@ -3039,6 +3252,14 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
     }
+    if lazy_merge() {
+        tracing::info!(
+            "merges held back per frame (VICTORY_LAZY_MERGE=1): {:.1} flights landed and told nobody, \
+             whose shaders' writes in card copies go into title memory at the first read, present, \
+             fence or landing after them",
+            s[DEFERRED]
+        );
+    }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -3098,6 +3319,79 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// A range a flight declared is held until that flight's merge, however
+    /// many times it declares it; the ranges of two flights join without
+    /// touching, and merging one number leaves the other's as they were.
+    #[test]
+    fn a_flight_holds_its_ranges_until_it_merges() {
+        use super::Held;
+        let mut held = Held::new();
+        held.declare([(100, 200), (100, 200)], 1);
+        held.declare([(160, 300)], 2);
+        assert_eq!(held.joined(), [(100, 300)]);
+        held.merged(1);
+        assert_eq!(held.joined(), [(160, 300)]);
+        assert!(held.touches(150, 170));
+        assert!(!held.touches(100, 120));
+        // A number that declared nothing ends nothing.
+        held.merged(9);
+        assert_eq!(held.joined(), [(160, 300)]);
+        held.merged(2);
+        assert!(held.is_empty());
+        assert!(held.joined().is_empty());
+    }
+
+    /// A range two flights declared stays held after the first of them
+    /// merges, and is free only when the last does: a refresh may not write
+    /// over what the second flight's shaders wrote.
+    #[test]
+    fn a_range_two_flights_declared_stays_held_until_both_merge() {
+        use super::Held;
+        let mut held = Held::new();
+        held.declare([(100, 200)], 1);
+        held.declare([(100, 200)], 2);
+        assert!(held.touches(150, 160));
+        held.merged(1);
+        assert!(held.touches(150, 160), "the second flight still holds it");
+        assert_eq!(held.joined(), [(100, 200)]);
+        held.merged(2);
+        assert!(!held.touches(150, 160));
+        assert!(held.is_empty());
+    }
+
+    /// A settle — a present, a fence the title blocks on, a read — merges
+    /// what a landing held back: its flight's ranges are free afterwards,
+    /// and a second one finds nothing left to merge. The entry is taken out
+    /// of the line once, so no other thread merges the same flight.
+    #[test]
+    fn a_settle_drains_what_a_landing_held_back() {
+        use super::{HeldBack, drain_deferred, line};
+        {
+            let mut guard = line();
+            guard.held.declare([(4096, 8192)], 7);
+            guard.deferred.push(HeldBack { number: 7, back: Vec::new() });
+        }
+        assert!(line().held.touches(5000, 6000), "held while its merge waits");
+        assert_eq!(drain_deferred(), 1);
+        assert!(line().deferred.is_empty());
+        assert!(!line().held.touches(5000, 6000), "free after the merge");
+        assert_eq!(drain_deferred(), 0);
+    }
+
+    /// A landing holds a flight's merge back only when the flight wrote
+    /// something in a copy in the PC's memory and the line after it in the
+    /// same landing tells the title nothing: a bottom-of-pipe write or a
+    /// fence signal behind it puts its bytes in the title's hands, and what
+    /// the title does after that may read them.
+    #[test]
+    fn a_merge_is_held_back_only_when_the_title_is_told_nothing() {
+        use super::{Late, holds_back};
+        assert!(holds_back(true, &[]));
+        assert!(!holds_back(false, &[]));
+        assert!(!holds_back(true, &[Late::Signal(0, 1)]));
+        assert!(!holds_back(true, &[Late::Signal(0, 1), Late::Signal(0, 2)]));
     }
 }
 
@@ -3951,7 +4245,7 @@ impl Host {
         }
     }
 
-    /// The relay's own list, fence, event for [`Host::relay_card_back`].
+    /// The relay's own list, fence, event for [`Host::relay_card_fetch`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         // SAFETY: plain objects of our own.
@@ -3978,7 +4272,7 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    fn relay_card_fetch(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) -> Option<FetchRun> {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -4040,7 +4334,7 @@ impl Host {
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-            return;
+            return None;
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
@@ -4056,8 +4350,7 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let waiting = std::time::Instant::now();
+        let ((allocator, list), fence, sent) = (f.list.clone(), f.fence.clone(), f.sent);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -4084,8 +4377,6 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent * 2)?;
-                fence.SetEventOnCompletion(sent * 2 - 1, event)?;
-                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -4093,6 +4384,30 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        Some(FetchRun { pieces, data, total, sent, after, runs: runs.len() })
+    }
+
+    /// [`Host::relay_card_fetch`]'s wait: the card is waited for, and what
+    /// shaders wrote in the fetched pieces goes into title memory
+    /// (`Shadow::card_merge_relay`). Runs after the copies in the PC's
+    /// memory are merged, so the card runs the fetch while the landing
+    /// thread has work of its own.
+    fn relay_fetch_merge(&self, run: FetchRun, fetch: &Option<RelayFetch>) {
+        let FetchRun { pieces, data, total, sent, after, runs } = run;
+        let Some(fetched) = fetch.as_ref() else {
+            return;
+        };
+        let (fence, event) = (fetched.fence.clone(), fetched.event);
+        // SAFETY: this thread's fence and event, and the two signals the
+        // waits are for were sent by `relay_card_fetch`.
+        //
+        // Each wait is timed on its own: between the two, this thread has
+        // merged copies of its own, which is not time the card kept it.
+        let waiting = std::time::Instant::now();
+        if let Err(e) = unsafe { fence.SetEventOnCompletion(sent * 2 - 1, event) } {
+            fail(format_args!("what shaders wrote to the card's memory could not be waited for ({e}, VICTORY_RELAY=1)"));
+        }
+        unsafe { WaitForSingleObject(event, INFINITE) };
         let drained = waiting.elapsed();
         // The fetch's own run: what the card takes for the copies, once the
         // work sent before it is done (nothing if it had run by the time
@@ -4115,7 +4430,7 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
-            CARD_STATS[7].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            CARD_STATS[7].fetch_add(runs as u64, Ordering::Relaxed);
         }
         let mut title = Vec::new();
         let mut written = 0;
@@ -4130,6 +4445,52 @@ impl Host {
         crate::shadow::relay_fetched(after);
     }
 
+    /// [`relay`], on the thread that lands flights: what their shaders
+    /// wrote in copies in the PC's memory goes into title memory
+    /// (`relay_hand_back`), then their ranges are done with, each by its
+    /// own number: a range another flight in the air declared too stays
+    /// closed to refreshes. `run` is the card copies' fetch this landing
+    /// made, if any: it is waited for between the two, so the card runs it
+    /// while this thread compares and merges the others.
+    fn merge_flights(&self, flights: &[&Flight], run: Option<FetchRun>, fetch: &Option<RelayFetch>) {
+        if flights.is_empty() {
+            // The fetch was sent all the same, and its list must not be
+            // reset until it has run.
+            if let Some(run) = run {
+                self.relay_fetch_merge(run, fetch);
+            }
+            return;
+        }
+        let mut back: Vec<Declared> = Vec::new();
+        for flight in flights {
+            for (shadow, ranges) in &flight.back {
+                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, all)) => {
+                        for range in ranges {
+                            if !all.contains(range) {
+                                all.push(*range);
+                            }
+                        }
+                    }
+                    None => back.push((shadow.clone(), ranges.clone())),
+                }
+            }
+        }
+        relay_hand_back(&back);
+        if let Some(run) = run {
+            self.relay_fetch_merge(run, fetch);
+        }
+        for flight in flights {
+            for (shadow, ranges) in &flight.back {
+                shadow.copy_back_done(ranges);
+            }
+        }
+        let mut line = line();
+        for flight in flights {
+            line.held.merged(flight.number);
+        }
+    }
+
     /// [`relay`], on the thread that lands flights: `items` are the first
     /// things of the line, flights the card has run and what follows them.
     /// What their shaders wrote goes into title memory (copies in the
@@ -4138,8 +4499,17 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
+    ///
+    /// With [`lazy_merge`], a flight whose landing tells the title nothing
+    /// (no bottom-of-pipe write, no fence signal after it in this landing)
+    /// keeps its ranges held and is merged later ([`drain_deferred`]): the
+    /// copies in the PC's memory are the ones that wait.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // What an earlier landing held back is merged first: this is one of
+        // the points a read, a present or a fence comes by, and the items
+        // of this landing may tell the title its writes are there.
+        drain_deferred();
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -4161,29 +4531,49 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
-                let mut back: Vec<Declared> = Vec::new();
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                // The fetch goes to the queue first and is waited for
+                // after the copies in the PC's memory are merged: the card
+                // runs it while this thread compares and merges its own.
+                let run = self.relay_card_fetch(&plans, fetch);
+                // The flights this landing does not merge ([`lazy_merge`]):
+                // those the line after them in this landing tells the title
+                // nothing about. They keep their ranges held, so no refresh
+                // writes over what their shaders wrote before it is in
+                // title memory.
+                let mut held_back: Vec<u64> = Vec::new();
+                if lazy_merge() {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Late::Run(flight) = item
+                            && holds_back(!flight.back.is_empty(), &items[i + 1..])
+                        {
+                            held_back.push(flight.number);
                         }
                     }
                 }
-                relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
+                let (merging, later): (Vec<&Flight>, Vec<&Flight>) =
+                    flights.iter().partition(|f| !held_back.contains(&f.number));
+                self.merge_flights(&merging, run, fetch);
+                // What this landing does not merge, pushed now or merged
+                // now: `settles` is read and the entries are pushed in one
+                // lock section, so a settle is either counted there (and
+                // its flights are merged here) or drains them itself.
+                let hold = {
+                    let mut line = line();
+                    if line.settles > 0 {
+                        false
+                    } else {
+                        for flight in &later {
+                            line.deferred.push(HeldBack {
+                                number: flight.number,
+                                back: flight.back.clone(),
+                            });
+                        }
+                        LATE_STATS[DEFERRED].fetch_add(later.len() as u64, Ordering::Relaxed);
+                        true
                     }
+                };
+                if !hold {
+                    self.merge_flights(&later, None, fetch);
                 }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4219,7 +4609,6 @@ impl Host {
             let mut line = line();
             let Line {
                 line: items,
-                written,
                 lists,
                 settling,
                 poke,
@@ -4229,17 +4618,16 @@ impl Host {
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
-            // What is still in the air, from the flights that are.
-            written.clear();
+            // What is still in the air, from the flights that are. What
+            // they declared is held already (`Held`), each by its number,
+            // and what this landing merged is not (`Held::merged`); what
+            // it held back is, until its own merge (`Line::deferred`).
             *lists = 0;
-            let mut ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                 }
             }
-            join_ranges(written, ranges);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -4433,8 +4821,8 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, held, lists: flying, target, .. } = &mut *line;
+            held.declare(sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()), sent.number);
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4477,8 +4865,8 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, held, lists: flying, target, .. } = &mut *line;
+            held.declare(sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()), number);
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4521,7 +4909,22 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
+            //
+            // Counted before anything is looked at: a landing that would
+            // hold a merge back ([`lazy_merge`]) merges it instead when it
+            // sees this, and one that has held it back already has left it
+            // in the line for this to drain, so either order ends with the
+            // bytes in title memory before the wait below is done.
+            {
+                let mut line = line();
+                line.settles += 1;
+            }
+            drain_deferred();
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            {
+                let mut line = line();
+                line.settles -= 1;
+            }
             return;
         }
         let was_working = working(true);
@@ -4534,7 +4937,7 @@ impl Host {
                     break;
                 }
                 line.settling = true;
-                line.written.clear();
+                line.held.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -4672,9 +5075,28 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                // What an earlier landing held back ([`lazy_merge`]) is
+                // merged here, on this thread, because this is the read that
+                // must see it. Then only the flights still in the air are
+                // waited for, and only until the ones that may write what is
+                // read have landed: their copy-back's end, not the card's
+                // other work.
+                //
+                // Announced before the entries are looked at, as a settle
+                // is: a landing that would hold a merge back merges it
+                // instead while this waits, and one that has already done so
+                // has left it in the line for the drain below, so this
+                // cannot wait for bytes no one is going to merge.
+                {
+                    let mut line = line();
+                    line.settles += 1;
+                }
+                drain_deferred();
+                relay_wait(why, |line| blocked_by(line.held.joined(), runs, false).is_none());
+                {
+                    let mut line = line();
+                    line.settles -= 1;
+                }
             } else {
                 self.settle(&mut submitted, why);
             }
