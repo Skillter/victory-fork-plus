@@ -410,6 +410,82 @@ fn depth1(depth: &D3D12_DEPTH_STENCIL_DESC, bounds: bool) -> D3D12_DEPTH_STENCIL
     }
 }
 
+/// Whether a render-target format holds integers, on which D3D12 refuses
+/// blend and logic-op state outright (`E_INVALIDARG` for the whole
+/// description): every `_UINT` and `_SINT` format, eight, sixteen and
+/// thirty-two bits wide, and the packed `R10G10B10A2_UINT`. A typeless
+/// format is not one: the view the title makes of it is.
+fn integer_target(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// Clears the blend and logic-op state of every used render target whose
+/// format is an integer one, and gives back the slots it cleared with their
+/// formats (empty: nothing changed, the description stands as the title gave
+/// it).
+///
+/// An integer target cannot blend, so this is not a picture change but the
+/// only description D3D12 accepts. With `IndependentBlendEnable` off, slot 0
+/// is every target's state: it expands into slots 1..8 first, so the slots
+/// that do not hold integers keep exactly the state they had, and
+/// `IndependentBlendEnable` stays on after, which is what makes per-slot
+/// state valid at all. Nothing else of the description is touched.
+fn clear_integer_blending(
+    blend: &mut D3D12_BLEND_DESC,
+    formats: &[DXGI_FORMAT; 8],
+    targets: u32,
+) -> Vec<(usize, DXGI_FORMAT)> {
+    let used = targets.min(8) as usize;
+    let shared = !blend.IndependentBlendEnable.as_bool();
+    // The slots that would blend or run a logic op on an integer target:
+    // with shared blending that is slot 0's state, on each of them.
+    let clear: Vec<(usize, DXGI_FORMAT)> = formats[..used]
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(slot, format)| {
+            let rt = blend.RenderTarget[if shared { 0 } else { *slot }];
+            integer_target(*format)
+                && (rt.BlendEnable.as_bool() || rt.LogicOpEnable.as_bool())
+        })
+        .collect();
+    if clear.is_empty() {
+        return clear;
+    }
+    if shared {
+        blend.RenderTarget = [blend.RenderTarget[0]; 8];
+        blend.IndependentBlendEnable = true.into();
+    }
+    for &(slot, _) in &clear {
+        blend.RenderTarget[slot].BlendEnable = false.into();
+        blend.RenderTarget[slot].LogicOpEnable = false.into();
+    }
+    clear
+}
+
 /// The blend state as D3D12 validates it: per render target, whether it
 /// blends and what it writes.
 fn blend_writes(blend: &D3D12_BLEND_DESC, targets: u32) -> String {
@@ -826,6 +902,7 @@ fn log_mesh_refusal(
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    blend: &D3D12_BLEND_DESC,
     depth: &D3D12_DEPTH_STENCIL_DESC,
     shaders: &[Arc<Shader>],
 ) {
@@ -856,7 +933,7 @@ fn log_mesh_refusal(
         quality = g.samples.Quality,
         sample_mask = format_args!("{:#x}", g.sample_mask),
         topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
-        blend = blend_writes(&g.blend, g.targets.NumRenderTargets),
+        blend = blend_writes(blend, g.targets.NumRenderTargets),
         node_mask = 0,
         flags = 0,
         container = %facts.text,
@@ -1283,6 +1360,23 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        // An integer render target cannot blend, and D3D12 refuses a whole
+        // description that says one does: clear those slots before the first
+        // attempt, for the graphics description and the mesh stream alike.
+        // The state line and the library name keep the title's own state:
+        // what is cleared is a function of the formats, so a name never
+        // stands for two descriptions.
+        let mut blend = g.blend;
+        let cleared =
+            clear_integer_blending(&mut blend, &g.targets.RTFormats, g.targets.NumRenderTargets);
+        if !cleared.is_empty() {
+            tracing::warn!(
+                ?shaders,
+                slots = ?cleared.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+                formats = ?cleared.iter().map(|(_, format)| *format).collect::<Vec<_>>(),
+                "blend and logic-op state cleared on integer render targets: D3D12 refuses it there"
+            );
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -1304,13 +1398,15 @@ impl HostPipeline {
                 )
             };
             let attempt = |depth: (D3D12_DEPTH_STENCIL_DESC, bool), name: &str| {
-                mesh_pipeline(&host.device, &root, code(0), code(1), g, depth, name)
+                let (depth, bounds) = depth;
+                let made = (blend, depth, bounds);
+                mesh_pipeline(&host.device, &root, code(0), code(1), g, made, name)
             };
             let pso = match attempt((g.depth, depth_bounds), &mesh_name("")) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-                    log_mesh_refusal(code(0), code(1), g, &g.depth, shaders);
+                    log_mesh_refusal(code(0), code(1), g, &blend, &g.depth, shaders);
                     host.log_messages();
                     if !depth_without_attachment(&g.depth, g.depth_format) {
                         return None;
@@ -1371,7 +1467,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1637,14 +1733,16 @@ fn mesh_pipeline(
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
-    // `g`'s, or with the tests off when a retry has established that the
-    // description names no DSV format; and the bounds test of `g`'s, off
-    // with that retry: with no DSV format the bounds test has nothing to
-    // read either.
-    depth: (D3D12_DEPTH_STENCIL_DESC, bool),
+    // What a retry may change, and the one field D3D12 refuses outright on
+    // an integer target: `g`'s blend state with those slots cleared
+    // (`clear_integer_blending`), `g`'s depth state — the tests off when a
+    // retry has established that the description names no DSV format — and
+    // its bounds test bit, off with them since neither has anything to read
+    // then.
+    state: (D3D12_BLEND_DESC, D3D12_DEPTH_STENCIL_DESC, bool),
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let (depth, depth_bounds) = depth;
+    let (blend, depth, depth_bounds) = state;
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -1665,6 +1763,7 @@ fn mesh_pipeline(
         ms: D3D12_SHADER_BYTECODE,
         ps: D3D12_SHADER_BYTECODE,
         g: &GraphicsState,
+        blend: D3D12_BLEND_DESC,
         depth: Sub<D>,
     ) -> Stream<D> {
         use windows::core::Interface;
@@ -1672,7 +1771,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -1694,6 +1793,7 @@ fn mesh_pipeline(
             ms,
             ps,
             g,
+            blend,
             Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth1(&depth, true)),
         );
         stream_pipeline(device, &mut stream, name)
@@ -1703,6 +1803,7 @@ fn mesh_pipeline(
             ms,
             ps,
             g,
+            blend,
             Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, depth),
         );
         stream_pipeline(device, &mut stream, name)
@@ -1976,9 +2077,11 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, (g.depth, false), &name).expect("made");
+        let made = (g.blend, g.depth, false);
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, made, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, (g.depth, false), &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, made, &name)
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -2710,5 +2813,290 @@ mod tests {
             return;
         };
         assert_ne!(root.as_raw(), different.as_raw(), "another binding shape is another signature");
+    }
+
+    /// A target's blend state with every field set to something of its own,
+    /// so a test sees any field the helper changed that it should not have.
+    fn state(
+        blend: bool,
+        logic: bool,
+        src: D3D12_BLEND,
+        dst: D3D12_BLEND,
+        op: D3D12_BLEND_OP,
+        mask: u8,
+    ) -> D3D12_RENDER_TARGET_BLEND_DESC {
+        D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: blend.into(),
+            LogicOpEnable: logic.into(),
+            SrcBlend: src,
+            DestBlend: dst,
+            BlendOp: op,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_MAX,
+            LogicOp: D3D12_LOGIC_OP_COPY,
+            RenderTargetWriteMask: mask,
+        }
+    }
+
+    /// The state every field of a target holds, compared by field: the
+    /// padding between them is not state.
+    fn same_state(a: D3D12_RENDER_TARGET_BLEND_DESC, b: D3D12_RENDER_TARGET_BLEND_DESC) -> bool {
+        a.BlendEnable == b.BlendEnable
+            && a.LogicOpEnable == b.LogicOpEnable
+            && a.SrcBlend == b.SrcBlend
+            && a.DestBlend == b.DestBlend
+            && a.BlendOp == b.BlendOp
+            && a.SrcBlendAlpha == b.SrcBlendAlpha
+            && a.DestBlendAlpha == b.DestBlendAlpha
+            && a.BlendOpAlpha == b.BlendOpAlpha
+            && a.LogicOp == b.LogicOp
+            && a.RenderTargetWriteMask == b.RenderTargetWriteMask
+    }
+
+    /// Eight render-target formats, the ones past `used` unknown.
+    fn formats(used: &[DXGI_FORMAT]) -> [DXGI_FORMAT; 8] {
+        let mut all = [DXGI_FORMAT_UNKNOWN; 8];
+        all[..used.len()].copy_from_slice(used);
+        all
+    }
+
+    /// The state a title asks for most: a blend and a write mask.
+    fn blended(mask: u8) -> D3D12_RENDER_TARGET_BLEND_DESC {
+        state(
+            true,
+            false,
+            D3D12_BLEND_SRC_ALPHA,
+            D3D12_BLEND_INV_SRC_ALPHA,
+            D3D12_BLEND_OP_ADD,
+            mask,
+        )
+    }
+
+    /// An integer target cannot blend: its own slot loses the blend and the
+    /// logic op, keeps its write mask, and the slots D3D12 does not use keep
+    /// the state slot 0 held. A second pass has nothing left to do.
+    #[test]
+    fn an_integer_target_alone_loses_its_blend_state() {
+        let mut blend = D3D12_BLEND_DESC {
+            RenderTarget: [blended(0x7); 8],
+            ..Default::default()
+        };
+        let cleared = clear_integer_blending(&mut blend, &formats(&[DXGI_FORMAT_R8_UINT]), 1);
+        assert_eq!(cleared, [(0, DXGI_FORMAT_R8_UINT)]);
+        assert!(
+            blend.IndependentBlendEnable.as_bool(),
+            "per-slot state needs independent blending"
+        );
+        assert!(!blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!blend.RenderTarget[0].LogicOpEnable.as_bool());
+        assert_eq!(blend.RenderTarget[0].RenderTargetWriteMask, 0x7, "the target still writes");
+        assert_eq!(blend.RenderTarget[0].SrcBlend, D3D12_BLEND_SRC_ALPHA, "and nothing else moved");
+        assert!(blend.RenderTarget[1].BlendEnable.as_bool(), "an unused slot keeps slot 0's state");
+        assert!(
+            clear_integer_blending(&mut blend, &formats(&[DXGI_FORMAT_R8_UINT]), 1).is_empty(),
+            "a description already cleared has nothing left to change"
+        );
+    }
+
+    /// A float target beside an integer one: the expansion of slot 0 gives
+    /// the float slot exactly the state it had, so a blended read-modify-write
+    /// still blends, and the integer slot alone loses its blend.
+    #[test]
+    fn a_float_target_beside_an_integer_one_keeps_its_state_exactly() {
+        let float = state(
+            true,
+            false,
+            D3D12_BLEND_SRC_ALPHA,
+            D3D12_BLEND_INV_SRC_ALPHA,
+            D3D12_BLEND_OP_ADD,
+            0xb,
+        );
+        let mut blend = D3D12_BLEND_DESC {
+            RenderTarget: [float; 8],
+            ..Default::default()
+        };
+        let used = formats(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        let cleared = clear_integer_blending(&mut blend, &used, 3);
+        assert_eq!(cleared, [(2, DXGI_FORMAT_R8_UINT)]);
+        assert!(blend.IndependentBlendEnable.as_bool());
+        for slot in 0..8 {
+            if slot == 2 {
+                assert!(
+                    !blend.RenderTarget[slot].BlendEnable.as_bool(),
+                    "slot 2 is the integer one"
+                );
+                continue;
+            }
+            assert!(
+                same_state(blend.RenderTarget[slot], float),
+                "slot {slot} does not hold the state slot 0 held before the expansion"
+            );
+        }
+    }
+
+    /// Nothing integer in the used targets: not a field moves.
+    #[test]
+    fn a_description_without_an_integer_target_is_left_alone() {
+        let mut blend = D3D12_BLEND_DESC {
+            RenderTarget: [blended(0x3); 8],
+            ..Default::default()
+        };
+        let before = blend.RenderTarget;
+        let used = formats(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT]);
+        assert!(clear_integer_blending(&mut blend, &used, 2).is_empty());
+        assert!(
+            !blend.IndependentBlendEnable.as_bool(),
+            "shared blending stays as the title set it"
+        );
+        for (slot, held) in blend.RenderTarget.iter().enumerate() {
+            assert!(same_state(*held, before[slot]), "slot {slot} moved");
+        }
+    }
+
+    /// Both integer families in one description, with independent blending
+    /// already on: both slots are cleared and the float target keeps its own
+    /// state, which the expansion would have overwritten.
+    #[test]
+    fn a_uint_and_a_sint_in_one_description_are_both_cleared() {
+        let mut blend = D3D12_BLEND_DESC {
+            RenderTarget: [blended(0x7); 8],
+            IndependentBlendEnable: true.into(),
+            ..Default::default()
+        };
+        let used = formats(&[
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R16G16_SINT,
+            DXGI_FORMAT_R32_FLOAT,
+        ]);
+        let cleared = clear_integer_blending(&mut blend, &used, 3);
+        assert_eq!(
+            cleared,
+            [(0, DXGI_FORMAT_R32_UINT), (1, DXGI_FORMAT_R16G16_SINT)]
+        );
+        assert!(!blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!blend.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!blend.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(blend.RenderTarget[2].BlendEnable.as_bool(), "the float target still blends");
+        assert!(
+            blend.RenderTarget[3].BlendEnable.as_bool(),
+            "and nothing past the targets is touched"
+        );
+    }
+
+    /// An integer format past `NumRenderTargets` names no attachment, so it
+    /// is not a target and nothing of it is cleared.
+    #[test]
+    fn an_integer_format_past_the_target_count_is_not_touched() {
+        let mut blend = D3D12_BLEND_DESC {
+            RenderTarget: [blended(0x7); 8],
+            ..Default::default()
+        };
+        let used = formats(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        assert!(clear_integer_blending(&mut blend, &used, 2).is_empty());
+        assert!(!blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// The log's refused shape: three targets, the third
+    /// `DXGI_FORMAT_R8_UINT` with blend state, and a pixel shader that writes
+    /// all three. D3D12 answers `E_INVALIDARG` (0x80070057) for the title's
+    /// state — shared blending and independent alike — and takes the
+    /// description the helper clears.
+    #[test]
+    fn a_mesh_pipeline_with_an_integer_target_is_made() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        /// A pixel shader writing a float target, a colour target and an
+        /// integer one, as the title's refused pipeline does.
+        const PS_TARGETS: &str =
+            "struct O { float4 a : SV_Target0; float4 b : SV_Target1; uint c : SV_Target2; };
+            O main() { O o; o.a = 1; o.b = 1; o.c = 7; return o; }";
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS_TARGETS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        for shared in [true, false] {
+            // Blending on the float target and on the integer one: the
+            // integer slot alone is what the helper clears.
+            let mut as_asked = g.blend;
+            as_asked.IndependentBlendEnable = (!shared).into();
+            as_asked.RenderTarget[0] = blended(0xf);
+            as_asked.RenderTarget[2] = blended(0x1);
+            let mut blend = as_asked;
+            let cleared = clear_integer_blending(
+                &mut blend,
+                &g.targets.RTFormats,
+                g.targets.NumRenderTargets,
+            );
+            assert_eq!(cleared, [(2, DXGI_FORMAT_R8_UINT)]);
+            assert!(
+                blend.RenderTarget[0].BlendEnable.as_bool(),
+                "the float target still blends"
+            );
+            let name = super::super::library::name(
+                if shared { "mesh integer, shared" } else { "mesh integer, independent" },
+                &root_blob,
+                &[&ms, &ps],
+                &g.describe(),
+            );
+            let made = mesh_pipeline(
+                &host.device,
+                &root,
+                code(&ms),
+                code(&ps),
+                &g,
+                (as_asked, g.depth, false),
+                &name,
+            );
+            assert!(
+                made.is_err(),
+                "D3D12 was expected to refuse blend state on DXGI_FORMAT_R8_UINT"
+            );
+            let name = super::super::library::name(
+                if shared {
+                    "mesh integer, shared, cleared"
+                } else {
+                    "mesh integer, independent, cleared"
+                },
+                &root_blob,
+                &[&ms, &ps],
+                &g.describe(),
+            );
+            let made = mesh_pipeline(
+                &host.device,
+                &root,
+                code(&ms),
+                code(&ps),
+                &g,
+                (blend, g.depth, false),
+                &name,
+            );
+            made.expect("D3D12 takes a description whose integer target does not blend");
+        }
     }
 }

@@ -110,6 +110,12 @@
 
 - Host device: feature level 12_2, Agility SDK 1.614.1 when present, 12_0
   fallback. `d3d12_factory` and `ApplyToGlobalState` are both required.
+- An integer render target cannot blend, and D3D12 refuses a description that
+  says one does: `host::clear_integer_blending` clears the blend and logic-op
+  state of the integer slots (`*_UINT`/`*_SINT`, packed `R10G10B10A2_UINT`)
+  before the first attempt of both the graphics description and the mesh
+  stream, expanding slot 0 into all eight and keeping
+  `IndependentBlendEnable` on, so every other target keeps its state exactly.
 - Our root signatures are v1.1 and keep the heap-direct-index flags; the
   title's own go through the v1.0 serializer, which refuses them, so `root`
   drops exactly `0x400|0x800` there.
