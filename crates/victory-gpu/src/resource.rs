@@ -1155,6 +1155,16 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// How many distinct frames sampled it while its host copy was alive,
+    /// saturating at [`ADMIT_SATURATED`]: 0 never, 1 once, 2 or more often
+    /// ([`admit_step`]).
+    hits: std::sync::atomic::AtomicU8,
+    /// The first and last frames counted in `hits` (the last so that a
+    /// texture sampled twice in one frame counts once).
+    first: std::sync::atomic::AtomicU64,
+    last: std::sync::atomic::AtomicU64,
+    /// [`Admit`]: 0 unclassified, 1 probation, 2 protected from the sweep.
+    admit: std::sync::atomic::AtomicU8,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1354,6 +1364,70 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Frames within which a second sampling protects a texture from the sweep
+/// ([`admit_step`]): a texture the world shows every frame is sampled in
+/// two frames running, a streaming page touched once never is.
+const ADMIT_FRAMES: u64 = 64;
+
+/// `hits` saturates here: a 2-bit count, kept in an `AtomicU8` so that a
+/// texture sampled every frame costs no more than one that never is.
+const ADMIT_SATURATED: u8 = 3;
+
+/// The host copy is on probation: sampled once, so evictable if the card
+/// needs the room ([`admit_step`]).
+const PROBATION: u8 = 1;
+
+/// The host copy is protected from the sweep: sampled again within
+/// [`ADMIT_FRAMES`], so the world is showing it.
+const PROTECTED: u8 = 2;
+
+/// The state [`admit_step`] leaves after a frame `frame` sampled the
+/// texture, from the hits it had and the first and last frames counted:
+/// `hits` (saturating), the first frame of the window, and the admission
+/// ([`PROBATION`] or [`PROTECTED`]). A frame that samples it twice counts
+/// once; a first sample puts it on probation; a second inside
+/// [`ADMIT_FRAMES`] of the first protects it; a second too late starts the
+/// window again.
+///
+/// Frequency, not just recency: without this the sweep let a whole world
+/// set go to make room for streaming pages nothing showed twice.
+pub(crate) fn admit_step(hits: u8, first: u64, last: u64, frame: u64) -> (u8, u64, u8) {
+    if hits > 0 && frame == last {
+        return (hits, first, if hits >= PROTECTED { PROTECTED } else { PROBATION });
+    }
+    if hits == 0 {
+        (1, frame, PROBATION)
+    } else if hits == 1 {
+        if frame.saturating_sub(first) <= ADMIT_FRAMES {
+            (PROTECTED, first, PROTECTED)
+        } else {
+            (1, frame, PROBATION)
+        }
+    } else {
+        (hits.saturating_add(1).min(ADMIT_SATURATED), first, PROTECTED)
+    }
+}
+
+/// Whether a sweep may let the host copy of a texture go now: it was not
+/// asked for in the idle window, only its title texture holds it (no list,
+/// no slot), and it is not protected ([`PROTECTED`]).
+pub(crate) fn sweepable(idle: bool, strong: usize, references: u32, protected: bool) -> bool {
+    idle && strong == 1 && references == 1 && !protected
+}
+
+/// Whether a copy referenced by one descriptor slot only may be reclaimed
+/// ([`slot_only_idle`]): the slot's own reference does not veto this, and
+/// the caller marks the slot gone first, which leaves [`sweepable`] to take
+/// it.
+fn reclaimable_slot(idle: bool, strong: usize, references: u32, protected: bool) -> bool {
+    idle && strong == 1 && references == 2 && !protected
+}
+
+/// Frames a host copy must also be unasked for before a sweep may take it
+/// ([`long_ago`]'s frame count): a recent use is not enough to keep it, but
+/// a use in the last few frames is.
+const IDLE_FRAMES: u64 = 4;
+
 /// Bytes of host copies of textures the title fills that may always be
 /// made ([`room`]).
 #[cfg(windows)]
@@ -1408,7 +1482,7 @@ impl NoRoom {
             ),
             None => "the card does not say its budget".to_owned(),
         };
-        match self.rule {
+        let rule = match self.rule {
             Rule::Limit(limit) => format!(
                 "VICTORY_TEXTURE_BUDGET_MB allows {} MB of them and {filled} MB are alive; {card}",
                 limit >> 20
@@ -1423,7 +1497,17 @@ impl NoRoom {
                 FLOOR >> 20,
                 WITHOUT_BUDGET >> 20
             ),
-        }
+        };
+        // How far a sweep would get: what the idle copies nothing else
+        // holds would give back now. The refusal stands as it is; the line
+        // only says whether the sweep is the rule that must change.
+        let reclaimable = reclaimable_bytes();
+        let sweep = if reclaimable == 0 {
+            "a sweep would reclaim nothing now".to_owned()
+        } else {
+            format!("a sweep could let go {} MB now", reclaimable >> 20)
+        };
+        format!("{rule}; {sweep}")
     }
 }
 
@@ -1518,7 +1602,6 @@ fn room_percent() -> u64 {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1537,12 +1620,18 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+            // A texture the world samples again and again is not swept to
+            // make room for streaming pages nothing shows twice.
+            let protected = r.host.admit.load(Relaxed) == PROTECTED;
+            let take = made.as_ref().is_some_and(|(host, _)| {
+                sweepable(
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+                    std::sync::Arc::strong_count(host),
+                    crate::host::references(&host.texture),
+                    protected,
+                )
             });
-            if idle {
+            if take {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -1572,6 +1661,168 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// A shader sampled title texture `this` this frame (`draw.rs` `readable`):
+/// counts the hit once per frame and promotes a texture seen again within
+/// [`ADMIT_FRAMES`] from probation to protected, so the sweep leaves it
+/// ([`let_go_idle`]). Buffers and host-written copies are not counted: the
+/// title's memory is not their source.
+#[cfg(windows)]
+pub(crate) fn note_sampled(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return;
+    }
+    let r = resource(this);
+    // Buffers only: a texture's copy is what the sweep manages. Every frame
+    // this runs for every sampled texture, so it takes no lock (the
+    // host-written set is a mutex) and only touches the two atomics.
+    if !fills(&r.desc) {
+        return;
+    }
+    let frame = crate::frame::current();
+    let (hits, first, last) = (
+        r.host.hits.load(Relaxed),
+        r.host.first.load(Relaxed),
+        r.host.last.load(Relaxed),
+    );
+    if hits > 0 && frame == last {
+        return;
+    }
+    let (hits, first, admit) = admit_step(hits, first, last, frame);
+    r.host.hits.store(hits, Relaxed);
+    r.host.first.store(first, Relaxed);
+    r.host.last.store(frame, Relaxed);
+    r.host.admit.store(admit, Relaxed);
+}
+
+/// Whether title texture `this`'s host copy is held only by the resource
+/// and one descriptor slot, and is idle: the reclaim path
+/// ([`let_go_for_room`]) may take it once its slot is marked gone
+/// (`descriptor::host::texture_slot_gone`). Protected copies are not
+/// offered.
+#[cfg(windows)]
+pub(crate) fn slot_only_idle(this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if !fills(&r.desc) || crate::texture::host_wrote(this as usize) {
+        return false;
+    }
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let protected = r.host.admit.load(Relaxed) == PROTECTED;
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().is_some_and(|(host, _)| {
+        reclaimable_slot(
+            crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+            std::sync::Arc::strong_count(host),
+            crate::host::references(&host.texture),
+            protected,
+        )
+    })
+}
+
+/// Lets go of the host copy of title texture `this` after its slot was
+/// marked gone (`descriptor::host::texture_slot_gone`), if nothing holds it
+/// any more and it is idle: the reclaim path a full card's refusal takes
+/// ([`slot_only_idle`]). Returns its bytes when taken.
+#[cfg(windows)]
+pub(crate) fn let_go_for_room(this: This) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if !fills(&r.desc) || crate::texture::host_wrote(this as usize) {
+        return None;
+    }
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let protected = r.host.admit.load(Relaxed) == PROTECTED;
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let take = made.as_ref().is_some_and(|(host, _)| {
+            sweepable(
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+                std::sync::Arc::strong_count(host),
+                crate::host::references(&host.texture),
+                protected,
+            )
+        });
+        if take {
+            // Under the lock: the next use must not find the staging state
+            // of the texture let go (it says "uploaded").
+            crate::texture::unstage(this);
+            made.take()
+        } else {
+            None
+        }
+    }?;
+    r.host.gone.store(true, Relaxed);
+    KINDS[2].fetch_add(1, Relaxed);
+    KINDS[3].fetch_add(gone.0.bytes, Relaxed);
+    let bytes = gone.0.bytes;
+    crate::host::retire(gone.0);
+    Some(bytes)
+}
+
+/// Bytes of host copies a sweep ([`let_go_idle`]) would let go now: how far
+/// a run of the sweep would get, for the refusal line ([`NoRoom::why`]).
+/// Asks what the sweep asks, so it is asked only when a rule refused and
+/// the line is due, not every pass.
+#[cfg(windows)]
+fn reclaimable_bytes() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let mut bytes = 0;
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let protected = r.host.admit.load(Relaxed) == PROTECTED;
+        if let Some((host, _)) = made.as_ref()
+            && sweepable(
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+                std::sync::Arc::strong_count(host),
+                crate::host::references(&host.texture),
+                protected,
+            )
+        {
+            bytes += host.bytes;
+        }
+    }
+    bytes
+}
+
+/// For the admission line: host copies of textures the title fills that are
+/// protected from the sweep and on probation, and their bytes
+/// (`[protected, protected bytes, probation, probation bytes]`).
+#[cfg(windows)]
+pub(crate) fn admission() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = [0u64; 4];
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        let admit = r.host.admit.load(Relaxed);
+        if admit == 0 {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref() {
+            let slot = if admit == PROTECTED { 0 } else { 2 };
+            out[slot] += 1;
+            out[slot + 1] += host.bytes;
+        }
+    }
+    out
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -1881,6 +2132,10 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            hits: std::sync::atomic::AtomicU8::new(0),
+            first: std::sync::atomic::AtomicU64::new(0),
+            last: std::sync::atomic::AtomicU64::new(0),
+            admit: std::sync::atomic::AtomicU8::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2157,23 +2412,45 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// The key a texture placed at `address` is stored under: its resource
+/// description, blanked where the title leaves filler (`texture_at`).
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+fn placed_key(desc: &[u32; 14]) -> [u32; 14] {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut key = *desc;
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
     // them each got a resource and a host copy of their own, on a card
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
-    let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
+    key
+}
+
+/// The resource of a texture placed at `address` with resource description
+/// `desc` (as words), if one was made ([`texture_at`] makes it); never makes
+/// one. For the reclaim path, which must not allocate while the card is
+/// full.
+#[cfg(windows)]
+pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let key = placed_key(desc);
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, key))
+        .map(|&r| r as This)
+}
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let raw = *desc;
+    let key = placed_key(desc);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -3585,5 +3862,59 @@ float4 lit() : SV_Target { return 1.0; }
         let text = unsaid.why();
         assert!(text.contains("does not say its budget"), "{text}");
         assert!(text.contains("4096 MB is all they may hold"), "{text}");
+    }
+
+    /// Frequency admission: a texture sampled once is on probation and the
+    /// sweep may take it; sampled again inside the frame window it is
+    /// protected; a second sample too late starts the window again; two
+    /// samples in one frame count once; the count saturates.
+    #[test]
+    fn one_sample_is_probation_and_two_in_the_window_protect() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 10);
+        assert_eq!((hits, first, admit), (1, 10, PROBATION));
+        // The same frame again: still one hit on probation.
+        assert_eq!(admit_step(hits, first, 10, 10), (1, 10, PROBATION));
+        // The next frame, inside the window: protected.
+        let (hits, first, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, first, admit), (PROTECTED, 10, PROTECTED));
+        // Later samples stay protected and saturate.
+        let (hits, _, admit) = admit_step(hits, first, 11, 12);
+        assert_eq!((hits, admit), (ADMIT_SATURATED, PROTECTED));
+        let mut last = 12;
+        for frame in 13..40 {
+            let (h, _, a) = admit_step(hits, first, last, frame);
+            assert_eq!((h, a), (ADMIT_SATURATED, PROTECTED));
+            last = frame;
+        }
+    }
+
+    /// A second sample outside the window does not protect: the window
+    /// starts again at the later frame, still on probation.
+    #[test]
+    fn a_second_sample_outside_the_window_restarts_on_probation() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 0);
+        assert_eq!((hits, first, admit), (1, 0, PROBATION));
+        let late = ADMIT_FRAMES + 1;
+        assert_eq!(admit_step(hits, first, 0, late), (1, late, PROBATION));
+        // And the frame just inside the window would have protected it.
+        assert_eq!(admit_step(1, 0, 0, ADMIT_FRAMES), (PROTECTED, 0, PROTECTED));
+    }
+
+    /// A copy a descriptor slot shows is not swept (its reference is 2, not
+    /// 1); the reclaim path may take it once the slot is marked gone
+    /// (`texture_slot_gone`, which leaves the sweep's reference of 1), and a
+    /// protected copy is taken by neither.
+    #[test]
+    fn a_slot_reference_vetoes_the_sweep_but_not_the_reclaim() {
+        assert!(sweepable(true, 1, 1, false), "idle, only the resource holds it");
+        assert!(!sweepable(false, 1, 1, false), "used this pass: never taken");
+        assert!(!sweepable(true, 2, 1, false), "a list holds it: never taken");
+        assert!(!sweepable(true, 1, 2, false), "a slot holds it: the sweep does not take it");
+        assert!(reclaimable_slot(true, 1, 2, false), "a slot alone holds it: reclaim may");
+        assert!(!reclaimable_slot(false, 1, 2, false), "used this pass: never taken");
+        assert!(!reclaimable_slot(true, 1, 3, false), "a list too: never taken");
+        assert!(!reclaimable_slot(true, 1, 2, true), "protected: never taken");
+        // The slot marked gone leaves the sweep's reference of 1.
+        assert!(sweepable(true, 1, 1, false), "reclaimed after `texture_slot_gone`");
     }
 }
