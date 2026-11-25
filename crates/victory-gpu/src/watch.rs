@@ -54,11 +54,21 @@ thread_local! {
 /// other cannot tell a big asking from many small ones.
 static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of the asking: microseconds finding the run a range lies in
+/// ([`run_of`]), and microseconds in the kernel's call itself.
+static RUN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KERNEL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The askings made and the kernel pages they walked since the last call.
-pub(crate) fn take_askings() -> (u64, u64) {
+/// The askings made since the last call, the kernel pages they walked, and
+/// the microseconds of finding their runs and of the kernel's calls.
+pub(crate) fn take_askings() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    (MADE.swap(0, Relaxed), WALKED.swap(0, Relaxed))
+    (
+        MADE.swap(0, Relaxed),
+        WALKED.swap(0, Relaxed),
+        RUN_US.swap(0, Relaxed),
+        KERNEL_US.swap(0, Relaxed),
+    )
 }
 
 struct Journal {
@@ -257,9 +267,6 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// the standing asking. Nothing if the range is not write-watched memory of
 /// one reservation, or that run is covered already.
 fn ask_run(j: &mut Journal, start: usize, end: usize) {
-    if run_of(start, end).is_none() {
-        return;
-    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     if covered(j, first, last).is_some() {
         return;
@@ -268,8 +275,18 @@ fn ask_run(j: &mut Journal, start: usize, end: usize) {
     // page tables of what it is asked about, page by page, so asking about
     // a gigabyte run to learn of a megabyte's ranges cost a second a frame
     // (run 94: 1,150 ms asking, 300,000 pages, for 0.1 MB of copies).
+    // The kernel answers about a range that starts mid-allocation, so the
+    // run is only looked for when it does not (run 95: finding it asked the
+    // kernel for the regions around the range, 256 each way, 350 ms a
+    // frame, and the call itself was 0.0 ms).
     if ask_writes(j, start, end, j.ahead_asked) {
         j.ahead.push((first, last));
+        return;
+    }
+    if let Some((run_start, run_end)) = run_of(start, end)
+        && ask_writes(j, run_start, run_end, j.ahead_asked)
+    {
+        j.ahead.push((run_start / PAGE, run_end.div_ceil(PAGE)));
     }
 }
 
@@ -306,7 +323,6 @@ fn ask_kernel(j: &mut Journal, start: usize, end: usize, now: u64) -> bool {
     }
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -319,6 +335,10 @@ fn ask_kernel(j: &mut Journal, start: usize, end: usize, now: u64) -> bool {
             &mut granularity,
         )
     } != 0;
+    KERNEL_US.fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if failed {
         return false;
     }
@@ -341,12 +361,17 @@ fn ask_kernel(j: &mut Journal, start: usize, end: usize, now: u64) -> bool {
 /// memory that is not committed, nothing at all, or a range that reaches out
 /// of its run.
 ///
-/// Asked of the kernel each time a range needs it, and nothing of it kept: a
-/// run's bounds are worth a `VirtualQuery` (some 2 microseconds) beside the
-/// asking they save, and anything kept would have to learn of every free and
+/// Asked of the kernel only when an asking about the range itself is refused
+/// (a range that reaches past the committed memory of its reservation), and
+/// nothing of it kept: anything kept would have to learn of every free and
 /// every commit that put other memory there, which only the titles know.
 fn run_of(start: usize, end: usize) -> Option<(usize, usize)> {
+    let started = std::time::Instant::now();
     let (run_start, run_end) = run_at(start);
+    RUN_US.fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     (start >= run_start && end <= run_end && run_start < run_end).then_some((run_start, run_end))
 }
 
@@ -445,11 +470,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     // The kernel answers about one reservation at a time: ask it, once, for
     // the whole run this range lies in, and answer from the table.
-    if run_of(start, end).is_some() {
+    {
         j.asked += 1;
         let now = j.asked;
-        // The range, not its run (see `ask_run`).
-        if ask_writes(j, start, end, now) {
+        // The range, not its run (see `ask_run`), and its run only when the
+        // kernel will not answer about the range as given.
+        if ask_writes(j, start, end, now)
+            || run_of(start, end).is_some_and(|(a, b)| ask_writes(j, a, b, now))
+        {
             return Some((now, pages(j, first, last)));
         }
     }
@@ -1239,13 +1267,43 @@ mod tests {
         let at = w.at + 2048 * KERNEL_PAGE;
         take_askings();
         ask_once(&[(at, at + PAGE)]);
-        let (made, walked) = take_askings();
+        let (made, walked, _, _) = take_askings();
         ask_once_end();
         assert_eq!(made, 1, "one asking for one range");
         assert_eq!(
             walked,
             (PAGE / KERNEL_PAGE) as u64,
             "a page of the range, not the 4,096 of its reservation"
+        );
+    }
+
+    /// The kernel answers about a range that starts in the middle of its
+    /// allocation, not only about one that starts at the allocation's base:
+    /// finding the base asks the kernel for the run of every page around
+    /// the range (256 regions each way), which took 350 ms a frame (run 95).
+    #[test]
+    fn a_range_not_at_its_regions_base_is_answered() {
+        let _one_at_a_time = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let w = Watched::new(64);
+        let at = w.at + 8 * KERNEL_PAGE;
+        // SAFETY: inside the allocation, committed.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 7, KERNEL_PAGE) };
+        let mut j = Journal {
+            asked: 1,
+            written: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        assert!(
+            ask_writes(&mut j, at, at + 2 * KERNEL_PAGE, 1),
+            "a range inside a write-watched allocation, not at its base"
+        );
+        assert_eq!(
+            j.written.get(&(at / KERNEL_PAGE)).copied(),
+            Some(1),
+            "the page written in the range, reported by that asking"
         );
     }
 
