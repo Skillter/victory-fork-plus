@@ -399,8 +399,13 @@ fn ahead(
 }
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (on; `VICTORY_INDIRECT_WINDOW=0`
-/// turns it off).
+/// buffer are clamped a window at a time (off; `VICTORY_INDIRECT_WINDOW=1`
+/// asks for it).
+///
+/// Off because a window records the draws of a run without drawing them:
+/// the world with windows on presented a frame nothing had drawn into
+/// (`run-20261125-140122.log`, 4.8 fps but black), and with them off the
+/// same build showed the scene (`run-20261125-141510.log`, 4.0 fps).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -453,7 +458,7 @@ fn ahead(
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_INDIRECT_WINDOW").as_deref(), Ok("1") | Ok("on")))
 }
 
 /// What a fresh table's records last mixed to, the dynamic slot they
@@ -917,7 +922,8 @@ pub(crate) enum Windowed {
     /// cut, whose scratch buffer is another or holds the old bytes.
     List,
     /// A run that cannot be windowed: its shaders store, so what it would
-    /// hold is not sound; or no window at all (`VICTORY_INDIRECT_WINDOW=0`).
+    /// hold is not sound; or no window at all (the default:
+    /// `VICTORY_INDIRECT_WINDOW=1` asks for one).
     Off,
 }
 

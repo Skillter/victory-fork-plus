@@ -376,10 +376,10 @@ preparing, 96 → 168 ms, 205 ms a frame (`run-20261125-101119.log`); measured
 25 Nov.
 
 The argument clamp is not a lever either: with the indirect window off
-(`VICTORY_INDIRECT_WINDOW=0`, `indirect.rs::record_clamp_as` once a record) the
-world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the GPU and 1.04 clamps a
-draw; with the window on, 4,423 draws at 217.6 ms and 0.52 clamps a draw
-(`run-20261125-123322.log` against `-114852.log`) — doubling the clamps did not
+(`indirect.rs::record_clamp_as` once a record; the default since the window
+cost the picture) the world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the
+GPU and 1.04 clamps a draw; with the window on, 4,423 draws at 217.6 ms and
+0.52 clamps a draw (`run-20261125-123322.log` against `-114852.log`) — doubling the clamps did not
 slow the frame, and the 45 ms between the two runs (21 % of the frame, world
 state and machine load included) is larger than anything the clamp
 contributes. A clamp emits 5–6 barrier records (`argument clamp: N clamped and
@@ -389,6 +389,13 @@ to check: `VICTORY_CLAMP=off` crashed the title in the loading scene after
 2 min 36 s with `0xC0000005` and no frame line (`run-20261125-115523.log`), so
 the arguments there are genuinely malformed and the clamp is load-bearing.
 Measured 25 Nov.
+
+Indirect windows are off by default (`VICTORY_INDIRECT_WINDOW=1` asks for one)
+because they cost the picture: with windows on the world's draws are recorded
+as one windowed run and nothing is drawn into the presented frame — black at
+4.8 fps (`run-20261125-140122.log`); with them off the same build shows the
+scene at 4.0 fps (`run-20261125-141510.log`). Until the window path draws what
+it records, it stays opt-in.
 
 ## 5.2 Missing content — clothes and materials
 
