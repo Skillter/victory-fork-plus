@@ -2448,6 +2448,43 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+    /// A texture the title rewrites for ever is looked at a bounded number
+    /// of times: the look that finds a change resumes the schedule where it
+    /// was (`draw.rs` `heap_textures`), so the fifth look ends it.
+    #[test]
+    fn a_texture_looked_at_again_does_not_come_back_for_ever() {
+        // `draw.rs` `RECHECK_FRAMES`, copied: the pass there owns it.
+        const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let write = q.due(1, 100)[0].1;
+        let (at, len, print) = (0x1000u64, 0x100u64, 1u64);
+        let mut frame = 1;
+        q.recheck(7, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+        let mut looks = 0;
+        loop {
+            let (a, l, p, seen, _) = q.checked(7).expect("no look left in the queue");
+            assert_eq!((a, l, p), (at, len, print));
+            looks += 1;
+            assert!(looks <= RECHECK_FRAMES.len(), "looked at {looks} times");
+            // Memory changed again: the schedule resumes after this look.
+            let after = seen.saturating_add(1);
+            match RECHECK_FRAMES.get(usize::from(after)) {
+                Some(wait) => {
+                    frame += wait;
+                    q.recheck(7, write, frame, (at, len), print, after, frame);
+                }
+                None => {
+                    q.done(7, write);
+                    break;
+                }
+            }
+        }
+        assert_eq!(looks, RECHECK_FRAMES.len());
+        assert!(q.checked(7).is_none());
+        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 7));
+    }
+
     /// A view written over memory that older views describe otherwise
     /// makes those stale; views of the same span are one texture's.
     #[test]
