@@ -337,14 +337,20 @@ fn translate(
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        return t.fail("not a DXBC container".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    // A program is in the `DXIL` part, or, in a container without one, the
+    // `FSPX` package of them in `ACCC` (`victory_shader::fspx`).
+    let Some(code_part) = container
+        .part(FourCC::DXIL)
+        .or_else(|| container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
+        return t.fail("no DXIL or ACCC part (SM5 or older)".into(), example);
     };
     // `~`: the hash of the code alone; containers that differ only around
     // it are translated once, the others listed as duplicates of it.
-    let code = blake3::hash(dxil);
+    let code = blake3::hash(code_part);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
@@ -372,7 +378,13 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    // The same choice `victory_shader::emit::translate` makes: the `DXIL`
+    // part's `XDAT` table, or the `FSPX` package of a console compute shader.
+    let programs = match container.part(FourCC::DXIL) {
+        Some(dxil) => native_programs(dxil.data),
+        None => victory_shader::fspx::programs(code_part, &container),
+    };
+    let programs = match programs {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
