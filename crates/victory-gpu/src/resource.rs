@@ -1288,6 +1288,22 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    if !same {
+        // Two textures over one address that do not match: the console reads
+        // the one through the other, and the host does not.
+        static SAID: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let at = r.data() as u64;
+        if !said.contains(&at) {
+            said.push(at);
+            tracing::info!(
+                address = format_args!("{at:#x}"),
+                ours = ?r.desc,
+                other = ?o.desc,
+                "two textures hold one address and are not the same shape"
+            );
+        }
+    }
     same.then_some(other)
 }
 
@@ -2216,6 +2232,52 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+/// Diagnostics: what lives in `this`'s memory besides it. `alias_of` looks
+/// only at an equal address and the same shape, so a texture the title
+/// presents and a texture it renders to that differ in height (1080 over
+/// 1088, scanout padding) or in format are two textures here and the same
+/// memory there.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn overlaps(this: This) -> String {
+    let Some((start, d)) = texture_memory(this) else {
+        return String::from("not a texture");
+    };
+    let at = start as u64;
+    let end = at.saturating_add(footprint(&d).map_or(0, |f| f.size).max(1));
+    let written = TARGETS_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&at);
+    let mut said = vec![format!(
+        "itself {at:#x} {}x{} f{} mips {} layers {} flags {:#x} {}",
+        d.width,
+        d.height,
+        d.format,
+        d.mip_levels,
+        d.depth_or_array_size,
+        d.flags,
+        if written { "host rendered" } else { "from its memory" }
+    )];
+    for other in textures().iter().copied() {
+        let other = other as This;
+        if other == this {
+            continue;
+        }
+        let Some((p, o)) = texture_memory(other) else {
+            continue;
+        };
+        let os = p as u64;
+        let oend = os.saturating_add(footprint(&o).map_or(0, |f| f.size).max(1));
+        if os < end && at < oend {
+            said.push(format!(
+                "{os:#x} {}x{} f{} mips {} layers {} flags {:#x}",
+                o.width, o.height, o.format, o.mip_levels, o.depth_or_array_size, o.flags
+            ));
+        }
+    }
+    said.join("; ")
 }
 
 /// A buffer's host memory and size; `None` for textures.

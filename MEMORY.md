@@ -219,6 +219,25 @@ failed to create with `0x80070057`. `VICTORY_DISPLAY_MODE=1920x1080` and
 `resolutionFullscreen` 1920x1080 in `settings.xml` change nothing on series-x:
 the title sizes its targets from the console model, not from either.
 
+*(re-measured, `run-20261125-092842.log`)* series-s now reaches the world with
+**no failed texture create and no device removal**: `R9G9B9E5` (console format
+67) has neither `RENDER_TARGET` nor `TYPED_UNORDERED_ACCESS_VIEW` support on
+this card (`support1=0x8013f0`) and stands in as `R16G16B16A16_FLOAT`
+(`resource.rs::target_format`), and a clear value is passed only to a
+`ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` description
+(`resource.rs::takes_clear_value`), which every `0x80070057` create was guilty
+of. What a removal is now says so once: `host.rs::note_removal` logs
+`the host device was removed` with `GetDeviceRemovedReason()` — the 07:39 run
+died of `0x887A0001` (`DXGI_ERROR_INVALID_CALL`), not a TDR. The world then
+runs at **5.1 fps / 197.7 ms/frame, 4517 draws/frame, 1920x1080** and the
+window is **black**: the title draws only into 1280x720 targets (0 of 12,071
+operations at frame 3318 name a 1920-wide resource) and never writes the
+1920x1080 f28 texture it presents. Series-x draws 2560x1440 and then four
+draws into 3840x2160, so its upscale is graphics; series-s's is FidelityFX
+compute (29 `FFX FSR4` lines, series-s only) and 20 of its 26 compute shaders
+do not translate (`converter shader.dxil v1: malformed shader: no DXIL part`),
+so the upscale never runs and the presented texture stays as created.
+
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 
     168 ms preparing (62 ms copies / 158 MB up, 5 ms textures)
@@ -371,8 +390,10 @@ request is visible today.
   `wanted = |dll| title_dll(&host, dll) && image_named(dll).is_none()`, and
   `apps/victory/src/run.rs::title_dll` is true for every DLL the host policy does
   not allow through and no HLE module serves — so the upscaler qualifies. The
-  Series S black screen is therefore **unverified against the current tree**:
-  re-test it before treating it as a dead end.
+  *(re-tested)* the black screen is not the refused DLL: the upscaler is
+  mapped, and series-s draws the world at 1280x720 and never writes the
+  1920x1080 texture it presents, because the FidelityFX compute upscale that
+  would bridge them does not translate (§5.1).
   **Do not fix it by mapping every DLL beside the exe**: the game folder also
   holds `msvcp140.dll`, `vccorlib140.dll`, `libHttpClient.GDK.dll` and friends,
   and mapping the title's copies of those instead of the host's is a much larger

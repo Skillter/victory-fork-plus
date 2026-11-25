@@ -801,7 +801,7 @@ extern "system" fn present(
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(all(windows, feature = "diagnostics"))]
-    note_planes(frame, planes, plane_parameters);
+    note_planes(frame, planes, plane_parameters, _parameters);
     commands_line();
     // The run's frame count, for the `STOP` block: a count of a static, so a
     // path that ends the process elsewhere still has it.
@@ -871,7 +871,7 @@ extern "system" fn present(
 /// the first. Our window shows the first plane's first resource, so a frame
 /// whose other planes hold the scene reads as black here.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn note_planes(frame: u64, planes: u32, parameters: *const Plane) {
+fn note_planes(frame: u64, planes: u32, parameters: *const Plane, more: *const u8) {
     if !frame.is_power_of_two() || parameters.is_null() || planes == 0 {
         return;
     }
@@ -883,17 +883,38 @@ fn note_planes(frame: u64, planes: u32, parameters: *const Plane) {
         if plane.count > 0 && !plane.resources.is_null() {
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            if let Some(host) = crate::resource::host_resource(resource) {
-                // SAFETY: a live resource.
-                let d = unsafe { host.GetDesc() };
-                first = format!("{}x{} f{}", d.Width, d.Height, d.Format.0);
-            }
+            first = crate::resource::overlaps(resource);
         }
         said.push(format!("{i}: {first} of {}", plane.count));
     }
+    // The plane description's own words and the present's parameters, as
+    // the console hands them over: neither names a source rectangle nor a
+    // scaling mode (all eight words of the parameters are zero), so a title
+    // that renders below the frame size and expects the console's scaler to
+    // bridge the two says nothing about it here.
+    let raw: Vec<String> = if parameters.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: each plane description is plain numbers; the first
+        // two are read, as the present itself reads only the first.
+        unsafe { std::slice::from_raw_parts(parameters.cast::<u32>(), planes.len().min(2) * 5) }
+            .chunks(5)
+            .map(|w| w.iter().map(|v| format!("{v:08x}")).collect::<Vec<_>>().join(","))
+            .collect()
+    };
+    let tail = if more.is_null() {
+        String::from("no parameters")
+    } else {
+        // SAFETY: the title passes what its own present takes; read the
+        // first words only, as plain numbers.
+        let words = unsafe { std::slice::from_raw_parts(more, 8) };
+        words.iter().map(|v| format!("{v:08x}")).collect::<Vec<_>>().join(",")
+    };
     tracing::info!(
         frame,
         planes = %said.join(", "),
+        raw = %raw.join(" | "),
+        tail,
         "what the present names"
     );
 }
