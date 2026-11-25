@@ -659,6 +659,72 @@ fn create_device(
     }
 }
 
+/// What `VICTORY_BACKGROUND_PROCESSING` asks of the runtime's background work
+/// (`create`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Background {
+    /// The driver's background compilation and measurements are off.
+    Off,
+    /// The runtime's own default: background work as it sees fit.
+    Normal,
+    /// Intrusive measurements, committed when the mode returns.
+    Measure,
+}
+
+impl Background {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "normal" | "on" | "1" => Some(Self::Normal),
+            "measure" => Some(Self::Measure),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Normal => "normal",
+            Self::Measure => "measure",
+        }
+    }
+
+    /// The mode, and what the runtime does with the measurements it takes.
+    fn mode(self) -> (D3D12_BACKGROUND_PROCESSING_MODE, D3D12_MEASUREMENTS_ACTION) {
+        match self {
+            Self::Off => (
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
+            ),
+            Self::Normal => (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
+            ),
+            Self::Measure => (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS,
+                D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+            ),
+        }
+    }
+}
+
+/// `VICTORY_BACKGROUND_PROCESSING`, default `off`: nothing named is `off`,
+/// and text that names no mode is refused to `off` rather than obeyed.
+fn background_processing(named: Option<&str>) -> Background {
+    match named.and_then(Background::parse) {
+        Some(asked) => asked,
+        None => {
+            if let Some(text) = named {
+                tracing::warn!(
+                    value = %text,
+                    "VICTORY_BACKGROUND_PROCESSING: off, normal or measure; off is used"
+                );
+            }
+            Background::Off
+        }
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -742,24 +808,41 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
-        // driver compiling shaders again on the "D3D Background Thread"s,
-        // for minutes after pipelines were made or loaded) is switched off.
-        // An experiment: while those threads ran, the same shot took
-        // 1,000-1,200 ms a frame, and 830-950 ms from the moment they
-        // stopped (run 54, 08:32:01 to 08:32:06). Left as it is by default:
-        // whether the card is slower with the shaders it then keeps is not
-        // known.
-        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0")
-            && let Ok(device6) = device.cast::<ID3D12Device6>()
-        {
-            let set = device6.SetBackgroundProcessingMode(
-                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
-                D3D12_MEASUREMENTS_ACTION_KEEP_ALL,
-                None,
-                None,
+        // `VICTORY_BACKGROUND_PROCESSING=off|normal|measure`: what the runtime
+        // may do behind the title's back. The driver compiles shaders again on
+        // its "D3D Background Thread"s for minutes after pipelines were made
+        // or loaded, and while those threads run the same shot took
+        // 1,000-1,200 ms a frame against 830-950 ms from the moment they
+        // stopped (run 54, 08:32:01 to 08:32:06). `off` is the default.
+        //
+        // The runtime answers a mode it does not have, so the feature query
+        // decides whether the switch was really there; without
+        // `BackgroundProcessingSupported` the call is a benign no-op.
+        if let Ok(device6) = device.cast::<ID3D12Device6>() {
+            // `VICTORY_D3D12_BACKGROUND=0`, the older spelling, asks for
+            // what is now the default and needs no reading of its own.
+            let named = std::env::var("VICTORY_BACKGROUND_PROCESSING").ok();
+            let asked = background_processing(named.as_deref());
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+            let supported = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS6,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.BackgroundProcessingSupported.as_bool();
+            let (mode, measurements) = asked.mode();
+            let accepted = supported
+                && device6
+                    .SetBackgroundProcessingMode(mode, measurements, None, None)
+                    .is_ok();
+            tracing::info!(
+                asked = asked.name(),
+                accepted,
+                BackgroundProcessingSupported = supported,
+                "background processing mode (measure is for a menu or a loading screen, not a scene)"
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
@@ -841,6 +924,46 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The switch has three spellings, unknown text is refused to `off`
+    /// rather than obeyed, nothing named is `off`, and only `measure` lets
+    /// the runtime commit its measurements.
+    #[test]
+    fn background_processing_names_one_of_three_modes() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        use super::{Background, background_processing};
+        assert_eq!(Background::parse("off"), Some(Background::Off));
+        assert_eq!(Background::parse(" Normal "), Some(Background::Normal));
+        assert_eq!(Background::parse("MEASURE"), Some(Background::Measure));
+        assert_eq!(Background::parse("0"), Some(Background::Off));
+        assert_eq!(Background::parse("sometimes"), None);
+        assert_eq!(background_processing(None), Background::Off);
+        assert_eq!(background_processing(Some("measure")), Background::Measure);
+        assert_eq!(background_processing(Some("normal")), Background::Normal);
+        assert_eq!(background_processing(Some("typo")), Background::Off);
+        assert_eq!(
+            Background::Off.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL
+            )
+        );
+        assert_eq!(
+            Background::Normal.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                D3D12_MEASUREMENTS_ACTION_KEEP_ALL
+            )
+        );
+        assert_eq!(
+            Background::Measure.mode(),
+            (
+                D3D12_BACKGROUND_PROCESSING_MODE_ALLOW_INTRUSIVE_MEASUREMENTS,
+                D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS
+            )
+        );
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
