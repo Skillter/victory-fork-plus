@@ -1,5 +1,11 @@
-//! The two records a run leaves behind: `RUN` at the start and `STOP` at the
-//! end.
+//! The records a run leaves behind: `RUN` at the start, `STOP` at the end, and
+//! one row of `runs.tsv` for every run that ever ended.
+//!
+//! The log is the detail and the history file is the series: a log is a
+//! megabyte of tracing per run, so a directory of them cannot be read across
+//! runs. `<log_dir>/runs.tsv` is one line per run - the commit, the frame
+//! rate, the worst window - which is what answers "did this commit make it
+//! slower" months later without opening a single log.
 //!
 //! Two runs of the same binary could not be compared, because the log never
 //! said which switches were in effect, which build was running or where the
@@ -11,8 +17,9 @@
 //! Every line starts with its marker, so `grep '^RUN '` is the whole header
 //! even when the terminal wrapped it and `grep '^STOP '` is the whole footer.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -28,8 +35,17 @@ pub const STOP: &str = "STOP";
 pub struct RunHeader {
     /// Binary name and version, e.g. `victory 0.1.0`.
     pub program: String,
-    /// `VICTORY_BUILD` from `apps/victory/build.rs`: commit, plus `+dirty`.
+    /// `VICTORY_COMMIT_SHORT`: the eight characters of the commit, as
+    /// `apps/victory/build.rs` read them.
     pub build: String,
+    /// `VICTORY_COMMIT`: the whole hash, so a log and a `git log` agree
+    /// without widening the eight.
+    pub commit: String,
+    /// `VICTORY_BRANCH`: the branch the build was made on, or `detached`.
+    pub branch: String,
+    /// `VICTORY_DIRTY`: whether the tree differed from the commit, or
+    /// `unknown` when git could not be asked.
+    pub dirty: String,
     /// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
     pub started_utc: String,
     /// Local wall clock, same shape without the zone.
@@ -75,7 +91,10 @@ impl RunHeader {
             "run start_utc={} start_local={}",
             self.started_utc, self.started_local
         ));
-        line(format!("bin name={} build={}", self.program, self.build));
+        line(format!(
+            "bin name={} build={} commit={} branch={} dirty={}",
+            self.program, self.build, self.commit, self.branch, self.dirty
+        ));
         line(format!(
             "log filter={} cap={} file={}",
             self.filter,
@@ -268,6 +287,158 @@ fn quote(text: &str) -> String {
     out
 }
 
+/// The name of the history file, in the directory the logs are written to.
+pub const RUNS_FILE: &str = "runs.tsv";
+
+/// The first line of [`RUNS_FILE`], written once when the file is made.
+///
+/// Tab separated, one row per run, nothing quoted: the only free text is the
+/// end reason, and [`field`] flattens it, so a reader always gets sixteen
+/// columns. An empty column is a fact nothing measured - a run that never drew
+/// has no frame rate, and a `0` there would average into the next one.
+pub const RUNS_HEADER: &str = "start_utc\tend_utc\tcommit\tbranch\tdirty\tconsole\tframes\t\
+secs\tfps_mean\tms_mean\tfps_worst\tms_worst\tdraws_mean\tgpu_wait_ms_mean\tend_reason\tlog";
+
+/// One row of [`RUNS_FILE`]: what one run came to, in the shape a script or a
+/// spreadsheet reads back months later without the log it came from.
+#[derive(Clone, Debug)]
+pub struct RunRecord {
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, as the header states it.
+    pub started_utc: String,
+    /// The same shape, at the moment the run ended.
+    pub ended_utc: String,
+    /// The whole commit hash; the row does not shorten it.
+    pub commit: String,
+    pub branch: String,
+    /// `true`, `false`, or `unknown`.
+    pub dirty: String,
+    /// `series-x` or `series-s`.
+    pub console: String,
+    pub duration: Duration,
+    /// Frames presented, as the layer counted them.
+    pub frames: u64,
+    /// The worst frame of the run, as the meter recorded it.
+    pub worst_frame_ms: Option<u64>,
+    /// Draws a presented frame made, averaged over the run's windows.
+    pub draws_mean: Option<f64>,
+    /// Time a presented frame waited for the card, in milliseconds.
+    pub gpu_wait_ms: Option<f64>,
+    /// Free text, the same one the `STOP` block names.
+    pub reason: String,
+    pub log: Option<PathBuf>,
+}
+
+impl RunRecord {
+    /// The row, ending with a newline.
+    pub fn line(&self) -> String {
+        let secs = self.duration.as_secs_f64();
+        // The same arithmetic the `STOP` line prints, so a row and the log it
+        // points at cannot disagree: nothing measured prints nothing.
+        let fps_mean = (self.frames > 0 && secs > 0.0).then(|| self.frames as f64 / secs);
+        let ms_mean = fps_mean.map(|fps| 1_000.0 / fps);
+        let ms_worst = self.worst_frame_ms.filter(|ms| *ms > 0);
+        let fps_worst = ms_worst.map(|ms| 1_000.0 / ms as f64);
+        let fields = [
+            field(&self.started_utc),
+            field(&self.ended_utc),
+            field(&self.commit),
+            field(&self.branch),
+            field(&self.dirty),
+            field(&self.console),
+            self.frames.to_string(),
+            tenth(Some(secs)),
+            tenth(fps_mean),
+            tenth(ms_mean),
+            tenth(fps_worst),
+            ms_worst.map_or_else(String::new, |ms| ms.to_string()),
+            tenth(self.draws_mean),
+            tenth(self.gpu_wait_ms),
+            field(&self.reason),
+            self.log
+                .as_ref()
+                .map_or_else(String::new, |path| field(&path.display().to_string())),
+        ];
+        let mut out = fields.join("\t");
+        out.push('\n');
+        out
+    }
+
+    /// The row split back into the columns [`RUNS_HEADER`] names.
+    pub fn columns(&self) -> Vec<String> {
+        let line = self.line();
+        line.trim_end_matches('\n').split('\t').map(str::to_owned).collect()
+    }
+}
+
+/// One decimal, or nothing when nothing measured it.
+fn tenth(value: Option<f64>) -> String {
+    value.map_or_else(String::new, |value| format!("{value:.1}"))
+}
+
+/// A field of a tab-separated row: the characters that would end the field or
+/// the row become spaces, so a row is always one line of [`RUNS_HEADER`]'s
+/// columns.
+fn field(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+/// Appends `record` to the history file at `path`, making the file and its
+/// header when they are not there.
+///
+/// One open, one [`Write::write_all`], one close, in append mode: a run killed
+/// in the middle of this call can leave half of its own row, and cannot lose a
+/// row an earlier run wrote, because append never seeks over what is there and
+/// never truncates. The caller logs a warning instead of failing the run - a
+/// history file is worth less than the run it describes.
+///
+/// The path is checked by [`crate::policy::ensure_outside_repo`] first: this is
+/// written next to the logs, which the same rule already keeps out of the tree.
+pub fn append_run(path: &Path, record: &RunRecord) -> std::io::Result<()> {
+    crate::policy::ensure_outside_repo(path).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+    })?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // The header once: a file that holds bytes already carries it, and one a
+    // crash left empty gets it with this run's row.
+    let mut text = String::new();
+    if std::fs::metadata(path).map_or(true, |meta| meta.len() == 0) {
+        text.push_str(RUNS_HEADER);
+        text.push('\n');
+    }
+    text.push_str(&record.line());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// The commit the binary was built from, for the crates whose build script
+/// does not read git: `victory-gpu` draws the window caption, and `victory run`
+/// hands it these answers once, through [`set_build`].
+static COMMIT: OnceLock<String> = OnceLock::new();
+static COMMIT_SHORT: OnceLock<String> = OnceLock::new();
+
+/// Records the commit `apps/victory/build.rs` baked in. The first call wins.
+pub fn set_build(commit: &str, short: &str) {
+    let _ = COMMIT.set(commit.to_owned());
+    let _ = COMMIT_SHORT.set(short.to_owned());
+}
+
+/// The eight characters of the commit, or `unknown` before [`set_build`].
+pub fn commit_short() -> &'static str {
+    COMMIT_SHORT.get().map_or("unknown", String::as_str)
+}
+
+/// The whole commit hash, or `unknown` before [`set_build`].
+pub fn commit() -> &'static str {
+    COMMIT.get().map_or("unknown", String::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -278,7 +449,10 @@ mod tests {
     fn header() -> RunHeader {
         RunHeader {
             program: "victory 0.1.0".to_owned(),
-            build: "504b1c6+dirty".to_owned(),
+            build: "504b1c6d".to_owned(),
+            commit: "504b1c6d9e2f4a7c1b3d5e6f7a8b9c0d1e2f3a4b".to_owned(),
+            branch: "main".to_owned(),
+            dirty: "true".to_owned(),
             started_utc: "2026-11-25T06:12:50.123Z".to_owned(),
             started_local: "2026-11-25T07:12:50".to_owned(),
             filter: "victory_gpu=debug,info".to_owned(),
@@ -342,7 +516,8 @@ mod tests {
             header().render(),
             concat!(
                 "RUN run start_utc=2026-11-25T06:12:50.123Z start_local=2026-11-25T07:12:50\n",
-                "RUN bin name=victory 0.1.0 build=504b1c6+dirty\n",
+                "RUN bin name=victory 0.1.0 build=504b1c6d commit=504b1c6d9e2f4a7c1b3d5e6f7a8b9c0d1e2f3a4b ",
+                "branch=main dirty=true\n",
                 "RUN log filter=victory_gpu=debug,info cap=trace ",
                 "file=C:\\v\\data\\logs\\run-20261125-061250.log\n",
                 "RUN config file=(none)\n",
@@ -474,6 +649,121 @@ mod tests {
         );
         assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
         assert!(!text.contains("STOP cache "), "a directory is not walked: {text}");
+    }
+
+    fn record() -> RunRecord {
+        RunRecord {
+            started_utc: "2026-11-25T06:12:50.123Z".to_owned(),
+            ended_utc: "2026-11-25T06:13:02.456Z".to_owned(),
+            commit: "504b1c6d9e2f4a7c1b3d5e6f7a8b9c0d1e2f3a4b".to_owned(),
+            branch: "main".to_owned(),
+            dirty: "false".to_owned(),
+            console: "series-x".to_owned(),
+            duration: Duration::from_millis(12_333),
+            frames: 740,
+            worst_frame_ms: Some(81),
+            draws_mean: Some(1_706.44),
+            gpu_wait_ms: Some(4.5),
+            reason: "title exited with 0".to_owned(),
+            log: Some(PathBuf::from(r"C:\v\data\logs\run-20261125-061250.log")),
+        }
+    }
+
+    /// A directory to write a history file in: outside the tree, and never the
+    /// same one twice, because the tests share a process.
+    fn scratch(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "victory-report-{}-{name}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// The row is a wire format a script reads back, so its shape is the
+    /// contract: one line, one tab per column, nothing quoted.
+    #[test]
+    fn a_run_is_one_row_of_tab_separated_figures() {
+        assert_eq!(
+            record().line(),
+            "2026-11-25T06:12:50.123Z\t2026-11-25T06:13:02.456Z\t\
+             504b1c6d9e2f4a7c1b3d5e6f7a8b9c0d1e2f3a4b\tmain\tfalse\tseries-x\t740\t12.3\t\
+             60.0\t16.7\t12.3\t81\t1706.4\t4.5\ttitle exited with 0\t\
+             C:\\v\\data\\logs\\run-20261125-061250.log\n"
+        );
+    }
+
+    /// A run that never drew leaves those columns empty rather than zero: an
+    /// average over nothing is not a slow run, and `0` would read as one.
+    #[test]
+    fn nothing_measured_leaves_its_column_empty() {
+        let mut unmeasured = record();
+        unmeasured.frames = 0;
+        unmeasured.worst_frame_ms = None;
+        unmeasured.draws_mean = None;
+        unmeasured.gpu_wait_ms = None;
+        unmeasured.log = None;
+        let columns = unmeasured.columns();
+        assert_eq!(columns.len(), RUNS_HEADER.split('\t').count(), "{columns:?}");
+        assert_eq!(&columns[8..12], ["", "", "", ""], "{columns:?}");
+        assert_eq!(&columns[12..14], ["", ""], "{columns:?}");
+        assert_eq!(columns[15], "", "{columns:?}");
+    }
+
+    /// The free text cannot widen a row: a reason with a tab or a newline in it
+    /// would otherwise become columns of its own.
+    #[test]
+    fn a_reason_cannot_add_columns() {
+        let mut noisy = record();
+        noisy.reason = "error: \"no\"\there\nnow".to_owned();
+        let columns = noisy.columns();
+        assert_eq!(columns.len(), RUNS_HEADER.split('\t').count(), "{columns:?}");
+        assert_eq!(columns[14], "error: \"no\" here now");
+    }
+
+    /// One header, one row per run, and a run appending never loses a row an
+    /// earlier one wrote: the file is read back months later, after a crash.
+    #[test]
+    fn the_history_file_keeps_a_header_and_a_row_per_run() {
+        let path = scratch("history").join(RUNS_FILE);
+        append_run(&path, &record()).expect("the first run makes the file");
+        let first = std::fs::read_to_string(&path).expect("read the first row");
+        let mut second = record();
+        second.commit = "7668994b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f".to_owned();
+        second.frames = 5_344;
+        append_run(&path, &second).expect("the second run appends");
+        let text = std::fs::read_to_string(&path).expect("read both rows");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one header and two rows:\n{text}");
+        assert_eq!(lines[0], RUNS_HEADER, "the header is written once:\n{text}");
+        assert!(text.starts_with(&first), "the first row is untouched:\n{text}");
+        assert!(lines[2].contains("7668994b0c1d"), "{}", lines[2]);
+        assert!(lines[2].contains("\t5344\t"), "{}", lines[2]);
+        // Both rows are the same width, so a column read cannot shift.
+        for row in [lines[1], lines[2]] {
+            assert_eq!(row.split('\t').count(), lines[0].split('\t').count(), "{row}");
+        }
+    }
+
+    /// Rule #1: a file this crate writes is checked against the tree it was
+    /// built from, the same guard the logs go through.
+    #[test]
+    fn a_history_file_in_the_repository_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join(RUNS_FILE);
+        let refused = append_run(&inside, &record()).expect_err("the tree is not a log directory");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(!Path::new(env!("CARGO_MANIFEST_DIR")).join(RUNS_FILE).exists());
+    }
+
+    /// The caption is drawn by another crate, which has no build script of its
+    /// own that reads git: it asks here, and gets `unknown` before anyone has
+    /// said.
+    #[test]
+    fn the_build_is_readable_from_another_crate() {
+        set_build("504b1c6d9e2f", "504b1c6d");
+        assert_eq!(commit_short(), "504b1c6d");
+        assert_eq!(commit(), "504b1c6d9e2f");
     }
 
     #[test]

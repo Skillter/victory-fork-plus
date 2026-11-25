@@ -1178,6 +1178,25 @@ mod tests {
         assert_eq!(count("present.resize"), Some(2), "{totals:?}");
     }
 
+    /// Both windows of the meter divide the same count by the same clock, so a
+    /// run at 60 fps states 16.7 ms a frame in the caption and in the five
+    /// second line alike. The line came from a window that a run of presents
+    /// which never reached the card never closed at all (see
+    /// [`super::Meter::frame`]): the arithmetic was never what stopped it, and
+    /// this is what must not become the reason.
+    #[test]
+    fn a_frame_rate_is_one_arithmetic_for_both_windows() {
+        use super::rate;
+        let (fps, ms) = rate(300.0, std::time::Duration::from_secs(5));
+        assert!((fps - 60.0).abs() < 1e-9, "{fps}");
+        assert!((ms - 16.666_666).abs() < 1e-6, "{ms}");
+        // The one-second window of the same run states the same rate: the two
+        // figures are each other's reciprocal in every window.
+        let (fps, ms) = rate(60.0, std::time::Duration::from_secs(1));
+        assert!((fps - 60.0).abs() < 1e-9, "{fps}");
+        assert!((fps * ms - 1_000.0).abs() < 1e-9, "{fps} fps, {ms} ms");
+    }
+
     /// The shading rate switch names five states, case aside, and refuses
     /// anything else to `off`; a device whose query failed or that knows only
     /// tier 1 keeps 1x1, and `off` is 1x1 even on a tier-2 device.
@@ -8292,6 +8311,9 @@ struct Presenter {
 /// block; [`Meter::reported`] and [`Meter::reported_drawn`] are the frames
 /// and the draws of those seconds, which is what they are divided by.
 struct Meter {
+    /// When the last frame was counted: the frame time of this one is the gap
+    /// since, which is what `frame_ms` records.
+    last: std::time::Instant,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -8310,6 +8332,7 @@ impl Meter {
         let now = std::time::Instant::now();
         let drawn = crate::draw::drawn();
         Meter {
+            last: now,
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -8323,7 +8346,25 @@ impl Meter {
     }
 
     /// Counts a presented frame.
+    ///
+    /// Called for every present the layer is shown, at the top of
+    /// [`Host::present`] and not where a frame reaches the card: a present the
+    /// layer is shown and does not draw still costs the title a frame, and a
+    /// run whose presents all stopped short of the card printed no frame line
+    /// at all (2026-11-25 16:31: 5,344 frames, one line of this module in
+    /// fourteen minutes) because the meter was reached only after a present
+    /// that succeeded.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
+        // The frame time, for the footer's `fps_worst` and the history row: the
+        // gap since the last present, which is the rate the title was given.
+        // The first frame has no gap - it holds the whole of start-up - so it
+        // only sets the mark.
+        if self.frames > 0 {
+            victory_core::meter::meter()
+                .time("frame_ms", now.saturating_duration_since(self.last));
+        }
+        self.last = now;
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -8334,14 +8375,13 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = now.saturating_duration_since(self.since);
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
-        let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        let (fps, ms) = rate(frames, elapsed);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -8420,8 +8460,7 @@ impl Meter {
         let printed = self.logged.elapsed();
         if printed >= std::time::Duration::from_secs(5) {
             let frames = f64::from(self.reported);
-            let fps = frames / printed.as_secs_f64();
-            let ms = printed.as_secs_f64() * 1000.0 / frames;
+            let (fps, ms) = rate(frames, printed);
             let draws = (drawn - self.reported_drawn) as f64 / frames;
             (self.logged, self.reported, self.reported_drawn) =
                 (std::time::Instant::now(), 0, drawn);
@@ -8438,6 +8477,13 @@ impl Meter {
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
             });
+            // The two figures the history row keeps per run, over the same
+            // window and from the same swaps as the frame line below states
+            // them, so a row and the log it names cannot disagree: what a
+            // presented frame drew, and what it waited for the card.
+            let totals = victory_core::meter::meter();
+            totals.observe("draws_frame", draws.round() as u64);
+            totals.observe("gpu_wait_us", (gpu * 1000.0).round() as u64);
             let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
                 let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
                 PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -8646,7 +8692,10 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(
+            " | VIctory {} {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame",
+            victory_core::report::commit_short()
+        );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -8672,6 +8721,16 @@ impl Meter {
                 });
         });
     }
+}
+
+/// A frame rate over an elapsed window: frames a second, and milliseconds a
+/// frame, from the same count and the same clock.
+///
+/// Both windows of [`Meter::frame`] go through here, so the one-second caption
+/// and the five-second line cannot come to differ in what they divide.
+fn rate(frames: f64, elapsed: std::time::Duration) -> (f64, f64) {
+    let secs = elapsed.as_secs_f64();
+    (frames / secs, secs * 1_000.0 / frames)
 }
 
 impl Host {
@@ -8801,12 +8860,31 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // Every present the layer is shown drives the meter, whether or not
+        // this one is shown: the title spent a frame of its time either way, and
+        // the 5 s line and the caption are the only account of the ones that
+        // were not drawn. It is counted here, before the gates below, because
+        // each of them can return every frame of a run (`client_size`, `fit`,
+        // no back buffer), and the meter used to be ticked after them.
+        p.meter.frame(p.hwnd);
         // The window's client area is the one source of truth for the size: the
         // swap chain's buffers are its size and follow it when the window is
         // resized. A minimised (or closed) window has none, and a swap chain of
         // a size of zero is not one DXGI makes, so nothing is presented while it
         // has none.
-        let client = client_size(p.hwnd)?;
+        let Some(client) = client_size(p.hwnd) else {
+            // Said once: a run that showed nothing has a window with no client
+            // area, and this is the one line that names it rather than leaving
+            // the silence to be guessed at from a missing frame line.
+            victory_core::logging::warn_once("present.no-client-area", || {
+                format!(
+                    "the window of {}x{} has no client area (hidden, minimised or closed): \
+                     nothing is presented while it has none",
+                    size.0, size.1
+                )
+            });
+            return None;
+        };
         // What the run shows: the frame drawn into the largest part of the client
         // area with its own shape, bars round it ([`fit`]); one `CopyResource`
         // when the frame and the client area are one size; and, without the pass
@@ -8989,7 +9067,6 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
