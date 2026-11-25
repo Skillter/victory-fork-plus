@@ -219,6 +219,18 @@ failed to create with `0x80070057`. `VICTORY_DISPLAY_MODE=1920x1080` and
 `resolutionFullscreen` 1920x1080 in `settings.xml` change nothing on series-x:
 the title sizes its targets from the console model, not from either.
 
+*(re-measured, `run-20261125-135405.log`)* reading the FidelityFX package's
+programs (`61bb4d6`, `ACCC`/`FSPX` parts) makes the title take its upscale
+chain. Four of its compute programs still refuse (`a lane mask exchanged where
+not every lane runs`, `a lane mask holding lanes elsewhere read as data`, `a
+descriptor's address or format read as data`, `a 16-bit image atomic`), so the
+title **clears the frame it presents and never draws into it**: `present.
+fallback.cleared` 302 times in `run-20261125-132005.log`, and the window shows
+its overlays over black. Refusing the package again (`VICTORY_FSPX` off by
+default, `run-20261125-135405.log`) restores the path the title took before:
+`the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
+loading screen.
+
 *(re-measured, `run-20261125-092842.log`)* series-s now reaches the world with
 **no failed texture create and no device removal**: `R9G9B9E5` (console format
 67) has neither `RENDER_TARGET` nor `TYPED_UNORDERED_ACCESS_VIEW` support on
