@@ -29,6 +29,8 @@ pub mod device;
 #[allow(dead_code)]
 mod drvwatch;
 #[cfg(windows)]
+mod fpsbox;
+#[cfg(windows)]
 #[allow(dead_code)]
 mod spread;
 #[cfg(windows)]

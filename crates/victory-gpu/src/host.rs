@@ -8862,6 +8862,7 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let (fps, ms) = rate(frames, elapsed);
+        crate::fpsbox::set(fps);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9520,6 +9521,9 @@ impl Host {
                 // SAFETY: a source texture and a back buffer of one size.
                 _ => list.CopyResource(&back, picture),
             }
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, which the lines below read back).
+            crate::fpsbox::draw(self, list, &back, (chain.0, chain.1, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
