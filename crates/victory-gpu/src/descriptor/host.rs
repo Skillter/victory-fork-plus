@@ -946,7 +946,14 @@ impl DynamicList {
             .filter(|region| region.heap == id)
             .map_or(0, |region| region.end - region.first);
         let len = n.max(held.min(GROWTH));
-        let (first, len) = heap.reserve(len)?;
+        // Room for the table but not for the run it would like (other lists
+        // are holding slots): take its slots alone rather than refuse a table
+        // the ring could hold.
+        let (first, len) = match heap.reserve(len) {
+            Some(taken) => taken,
+            None if len > n => heap.reserve(n)?,
+            None => return None,
+        };
         // Next to the run the list already holds: grown in place, so that a
         // list that outgrows its run keeps one run.
         match self.regions.last_mut() {
@@ -2862,5 +2869,21 @@ mod tests {
         ring.give_back(8, 8);
         assert_eq!((ring.runs.as_slice(), ring.refused), (&[(8, 16)][..], u32::MAX));
         assert_eq!(ring.take(16), Some((8, 16)));
+    }
+
+    /// A list whose run cannot be had takes the table alone
+    /// (`DynamicList::alloc`): a refused table is a draw without its
+    /// descriptors.
+    #[test]
+    fn a_shortened_run_fits_where_the_wanted_one_does_not() {
+        let mut ring = Ring::new(64);
+        for at in 0..7u32 {
+            assert_eq!(ring.take(8), Some((at * 8, 8)));
+        }
+        // Eight slots free at the end of the ring, and no run of the sixteen
+        // a growing list would ask for.
+        assert_eq!((ring.free, ring.at), (8, 56));
+        assert_eq!(ring.take(16), None);
+        assert_eq!(ring.take(8), Some((56, 8)));
     }
 }
