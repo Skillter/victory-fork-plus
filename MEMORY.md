@@ -270,6 +270,11 @@ in 6.2 ms (18 GB/s), 25 MB snapshotted for shaders in 0.2 ms — the 72 ms is
 per-call work, not bytes. Writing into title memory is the slow direction:
 2.1 MB in 256 calls at 1.3 GB/s, a partial page's read-modify-write.
 
+Card windows are not the lever: `VICTORY_CARD_WINDOWS_MB=3072` gave 2.4 fps
+(410 ms, 261 ms on the GPU) against 3.6 fps (276 ms, 120 ms on the GPU) with
+the default of none, on 5,044 against 4,518 draws a frame
+(`run-20261125-063925.log` against `-062758.log`).
+
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run
