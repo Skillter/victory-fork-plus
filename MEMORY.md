@@ -429,6 +429,25 @@ before had completed and `still running` read 0 by construction. Up to
 `host::COPY_LISTS` batches may now be in the air at once, so that figure must
 be measured before it is quoted.
 
+The fetch's own queue is the untested lever: `host::Host::relay_fetch_slot`
+gives a landed flight's fetch a staging slot of its own and puts its copies on
+the copy queue behind that flight's fence, not behind the frame sent after it
+(`VICTORY_READBACK_SLOTS=1`, off by default — the parent's runs measured the
+wait, no run has measured this). Same pieces as the direct-queue fetch, so no
+extra DMA; the ring is `host::READBACK_SLOTS` (4) slots of
+`host::SLOT_GRANULE` (16 MiB) steps grown to the deepest flight's piece total,
+and a fetch that finds every slot held goes to the shared buffer's tail as
+before. Engaged, the log reads `readback slots per frame
+(VICTORY_READBACK_SLOTS=1): … fetches … went to a slot of the flight's own on the
+copy queue and … to the direct queue's tail …, where the landing thread waited
+… ms behind the copy queue's own work and … ms for the slot's copies`; the two
+waits there are what a run has to compare against the 499.3 ms of
+`run-20261125-161124.log`. The trade, recorded in the code as a `shortcut:`: a
+later flight, or an upload on the direct queue, may write a piece while this
+copy reads it; the merge skips ranges a later send put up and the flight that
+wrote the piece merges its own bytes later, but the title can see the torn part
+until then.
+
 The argument clamp is not a lever either: with the indirect window off
 (`indirect.rs::record_clamp_as` once a record; the default since the window
 cost the picture) the world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the
