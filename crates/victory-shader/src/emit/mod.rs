@@ -967,6 +967,86 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `v_cvt_f32_f64`: a console double in a register pair, rounded to a
+    /// float. Three compute shaders stopped at the opcode by name, all of
+    /// them feeding the result to `v_rcp_f32`.
+    #[test]
+    fn a_double_register_pair_rounds_to_a_float() {
+        // v_cvt_f32_f64 v2, v0: v0:v1 is the thread id, read as a double.
+        stores_v1(&[0x7E04_1F00]).unwrap();
+    }
+
+    /// `v_permlanex16_b32`: each lane reads the lane 16 away within its
+    /// 32-lane block, at the offset its half's selector names. One compute
+    /// shader's 64-lane max/min reduction stopped at the opcode by name.
+    #[test]
+    fn a_permutation_across_the_16_lane_halves_reads_the_other_half() {
+        // v_permlanex16_b32 v1, v0, 0, 0
+        stores_v1(&[0xD778_0001, 0x0201_0100]).unwrap();
+    }
+
+    /// A 16-bit interpolation pair: `v_interp_p2_f16` writes one half of its
+    /// destination and keeps the other, so both halves evaluate and the
+    /// export sees the pair's dword. Eight pixel shaders stopped at "the
+    /// first half of an interpolation", reported at the export that consumed
+    /// it, not at the interpolation: `io::tests` pins the recording of the
+    /// first half that fixed them, this pins the lowering.
+    #[test]
+    fn an_f16_interpolation_pair_keeps_its_first_half() {
+        let words = [
+            0x1006_00F0u32,             // v_mul_f32 v3, 0.5, v0
+            0xD742_000A, 0x0002_0600,   // v_interp_p1ll_f16 v10, v3, attr0.x
+            0xD75A_000B, 0x042A_0200,   // v_interp_p2_f16 v11, v1, attr0.x, v10
+            0xF800_180F, 0x0B0B_0B0B,   // exp mrt0, v11, v11, v11, v11 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half,
+        };
+        let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 15, false)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).unwrap();
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no

@@ -6998,6 +6998,17 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double in a register pair (`s[20:21]` in a real program),
+                // rounded to single. No console program computes with doubles:
+                // this only ever shortens one. The hardware rounds to nearest
+                // even here, which is DXIL's `fptrunc`.
+                let x = self.src64(inst, 0)?;
+                self.s.flags |= flags::DOUBLES;
+                let d = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f64);
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                float(self, r)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -7187,6 +7198,48 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_permlanex16_b32" => {
+                // Each lane takes the value of a lane in the *other* 16-lane
+                // group of its 32-lane row, at that group's 4-bit selector:
+                // `v_permlane16_b32` is the same without the crossing. The
+                // console pairs 0-15 with 16-31 and 32-47 with 48-63, so a
+                // host wave of 32 lanes holds both groups of every pair and
+                // the read stays inside it (a wave64 console wave cut in two
+                // needs no exchange here).
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                // Not `cross_lane`: its reads stay inside one 32-lane half,
+                // which is one host wave even when a console wave64 program
+                // runs in two (`console_lanes` in `lower`).
+                if self.s.mesh.is_some() {
+                    return Err("a cross-lane operation in a mesh shader");
+                }
+                if self.s.threads.is_none() {
+                    return Err("a cross-lane operation outside compute");
+                }
+                self.s.flags |= flags::WAVE_OPS;
+                let c = self.cur;
+                let m16 = self.s.m.i32(16);
+                let fifteen = self.s.m.i32(15);
+                let k31 = self.s.m.i32(!31);
+                let me = self.lane_index();
+                let upper = self.s.m.bin(c, Bin::And, me, m16);
+                let zero = self.s.m.i32(0);
+                let in_upper = self.s.m.cmp(c, pred::NE, upper, zero);
+                let sel = self.s.m.select(c, in_upper, hi, lo);
+                // The selector is 4 bits, so it cannot leave the group and
+                // `bound_ctrl` never applies.
+                let sel = self.s.m.bin(c, Bin::And, sel, fifteen);
+                // shortcut: `fi` (a source lane EXEC has cleared) is not
+                // modelled - the read returns that lane's value either way,
+                // which is `fi` set. Only wave operations under a divergence
+                // notice, and the console uses these with EXEC full.
+                let row = self.s.m.bin(c, Bin::And, me, k31);
+                let other = self.s.m.bin(c, Bin::Xor, upper, m16);
+                let at = self.s.m.bin(c, Bin::Or, row, other);
+                let at = self.s.m.bin(c, Bin::Or, at, sel);
+                let r = self.read_lane(a, at);
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

@@ -82,6 +82,9 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// A `double` in the module (`v_cvt_f32_f64`): the module's `Doubles`
+    /// flag and, through the mapping in `finish`, `SFI0`'s `0x1`.
+    pub const DOUBLES: u64 = 1 << 2;
 }
 
 pub(crate) struct Types {
@@ -89,6 +92,8 @@ pub(crate) struct Types {
     pub i1: Ty,
     pub i32: Ty,
     pub f32: Ty,
+    /// `v_cvt_f32_f64` only: nothing else may make a double.
+    pub f64: Ty,
     pub handle: Ty,
     pub props: Ty,
     pub bind: Ty,
@@ -170,6 +175,7 @@ impl Shader {
         let i8 = m.int(8);
         let i32 = m.int(32);
         let f32 = m.float();
+        let f64 = m.double();
         let i8p = m.ptr(i8);
         let handle = m.named_struct("dx.types.Handle", vec![i8p]);
         let props = m.named_struct("dx.types.ResourceProperties", vec![i32, i32]);
@@ -187,6 +193,7 @@ impl Shader {
                 i1,
                 i32,
                 f32,
+                f64,
                 handle,
                 props,
                 bind,
@@ -772,6 +779,11 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            // (`Doubles` is SFI0 bit 0 but ShaderFlags bit 2; dxil.dll
+            // compares both against the module.)
+            features |= 0x1;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }

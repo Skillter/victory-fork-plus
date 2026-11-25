@@ -1264,3 +1264,32 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_cvt_f32_f64`: the console keeps a double in a register pair and only
+/// ever rounds it to single. Three compute shaders stopped at the opcode by
+/// name. The hardware rounds to nearest even, which `fptrunc` is — and the
+/// module carries a `double` type for the pair, so this also proves that
+/// dxil.dll accepts one.
+#[test]
+fn v_cvt_f32_f64_rounds_a_register_pair_to_nearest() {
+    // v_cvt_f32_f64 v0, v1; `build_valu_cs` copies s0..s3 into v1..v4, so
+    // v1:v2 is the double: the low dword first.
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0000, 0x4010_0000, 0, 0], 0x4080_0000), // 4.0
+        ([0x0000_0000, 0xC004_0000, 0, 0], 0xC020_0000), // -2.5
+        // 1.0 + 2^-24 is halfway between 1.0 and the next single: to nearest
+        // even it rounds down, and 1.0 + 3*2^-24 rounds up.
+        ([0x1000_0000, 0x3FF0_0000, 0, 0], 0x3F80_0000),
+        ([0x1800_0000, 0x3FF0_0000, 0, 0], 0x3F80_0001),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_f64({:#010x}{:08x}) = {got:#010x}, want {want:#010x}",
+            inp[1], inp[0],
+        );
+    });
+}
