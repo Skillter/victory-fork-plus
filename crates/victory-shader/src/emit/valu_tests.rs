@@ -1591,3 +1591,145 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// SOP1 `s_mov_b32 sdst, src0` whose source is a special operand code
+/// (`vccz` 251, `execz` 252, `scc` 253): the low byte carries it.
+const fn s_mov_special(sdst: u8, special: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | special as u32
+}
+
+/// VOP3P `op vdst, src0, src1, src2`: `opsel` picks the half the low result
+/// reads, `opsel_hi` the high result's (bit 2 of `opsel_hi` lives in word 0).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u8, opsel_hi: u8) -> [u32; 2] {
+    [
+        0xCC00_0000
+            | (op as u32 & 0x7F) << 16
+            | (opsel as u32 & 7) << 11
+            | (opsel_hi as u32 & 4) << 10
+            | vdst as u32,
+        (opsel_hi as u32 & 3) << 27
+            | (src0 as u32 & 0x1FF)
+            | (src1 as u32 & 0x1FF) << 9
+            | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// GFX10's DOT rule: a byte of 0x80 in either operand of a pair contributes
+/// no product (it is not -128), so such a byte reads as an absent one.
+fn dot4c_reference(a: u32, b: u32, acc: i32) -> u32 {
+    let mut sum = acc;
+    for k in 0..4 {
+        let (xa, xb) = (a >> (8 * k) & 0xFF, b >> (8 * k) & 0xFF);
+        if xa == 0x80 || xb == 0x80 {
+            continue;
+        }
+        sum = sum.wrapping_add((xa as u8 as i8 as i32) * (xb as u8 as i8 as i32));
+    }
+    sum as u32
+}
+
+#[test]
+fn v_dot4c_i32_i8_adds_four_signed_byte_products_to_its_destination() {
+    // v_mov_b32 v0, v4 ; v_dot4c_i32_i8 v0, v1, v2 (VOP2 0x00d: the
+    // destination holds the accumulator)
+    let mut body = vec![vop1(0x001, 0, vgpr(4))];
+    body.push(vop2(0x00D, 0, vgpr(1), 2));
+    let shader = build_valu_cs(&body);
+    let cases: &[[u32; 4]] = &[
+        // 1 + 2*3 + 3*4 + 4*5 = 39
+        [0x0403_0201, 0x0504_0302, 0, 0],
+        // negative bytes: -1*1 + -2*2 + 0 + 0 = -5
+        [0x0000_FEFF, 0x0000_0201, 0, 0],
+        // 0x80 in the first operand is absent, not -128
+        [0x0302_0180, 0x0403_0201, 0, 0],
+        // 0x80 in the second operand, and in both
+        [0x03FF_FF01, 0x8002_0180, 0, 0],
+        // 127 * 127 * 4 saturates a byte but not the dword
+        [0x7F7F_7F7F, 0x7F7F_7F7F, 0, 0xFFFF_FFFF],
+        // the accumulator wraps as 32 bits
+        [0x7F7F_7F7F, 0x7F7F_7F7F, 0, 0x7FFF_FFFF],
+    ];
+    run_cases(&shader, cases, |backend, _, inp, got| {
+        let want = dot4c_reference(inp[0], inp[1], inp[3] as i32);
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot4c_i32_i8({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[3],
+        );
+    });
+}
+
+#[test]
+fn v_dot4_i32_i8_takes_its_accumulator_from_the_third_source() {
+    // v_dot4_i32_i8 v0, v1, v2, v3 (VOP3P 0x016: no destination accumulator)
+    let shader = build_valu_cs(&vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0));
+    let cases: &[[u32; 4]] = &[
+        [0x0403_0201, 0x0504_0302, 0x0000_0010, 0],
+        [0x8080_8080, 0x0504_0302, 0, 0],
+        [0x7F7F_7F7F, 0x7F7F_7F7F, 0xFFFF_FFF0, 0],
+    ];
+    run_cases(&shader, cases, |backend, _, inp, got| {
+        let want = dot4c_reference(inp[0], inp[1], inp[2] as i32);
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot4_i32_i8({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_pk_fmac_f16_adds_the_destination_half_by_half() {
+    // v_mov_b32 v0, v4 (the accumulator) ; v_pk_fmac_f16 v0, v1, v2 (VOP2
+    // 0x03c: two sources, so the destination half is the addend)
+    let mut body = vec![vop1(0x001, 0, vgpr(4))];
+    body.push(vop2(0x03C, 0, vgpr(1), 2));
+    let shader = build_valu_cs(&body);
+    // Every product and sum is exact in f16, so a single rounding (the
+    // console's) and the lowering's f32 FMad agree bit for bit; the double
+    // rounding of the f32 form is the same shortcut `v_fma_f16` takes.
+    let (one, two, three, m_one) = (0x3C00u32, 0x4000u32, 0x4200u32, 0xBC00u32);
+    let half = |lo: u32, hi: u32| lo | hi << 16;
+    let cases: &[[u32; 4]] = &[
+        // 1.5 * 2.0 - 1.0 = 2.0, in both halves
+        [half(0x3E00, 0x3E00), half(two, two), 0, half(m_one, m_one)],
+        // different halves: 1 * 3 + 1 = 4 low, 2 * 1 + 3 = 5 high
+        [half(one, two), half(three, one), 0, half(one, three)],
+        // zero times anything leaves the accumulator
+        [0, half(0x3E00, 0x3E00), 0, half(one, two)],
+    ];
+    let want = [half(two, two), half(0x4400, 0x4500), half(one, two)];
+    run_cases(&shader, cases, |backend, i, inp, got| {
+        assert_eq!(
+            got, want[i],
+            "{backend}: v_pk_fmac_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], inp[3], want[i],
+        );
+    });
+}
+
+#[test]
+fn vccz_lowers_to_whether_the_vcc_mask_is_empty() {
+    // v_cmp_eq_u32 s[106:107]=vcc, v1, s0 ; s_mov_b32 s4, vccz ;
+    // v_mov_b32 v0, s4
+    let mut body = Vec::new();
+    body.extend_from_slice(&vop3(0x0C2, 106, vgpr(1), vgpr(2), 0));
+    body.push(s_mov_special(4, 251));
+    body.push(vop1(0x001, 0, sgpr(4)));
+    let shader = build_valu_cs(&body);
+    // One thread: VCC holds lane 0's bit, so `vccz` is "the comparison was
+    // false".
+    let cases: &[[u32; 4]] = &[
+        [0, 0, 0, 0], // 0 == 0 is true, so VCC is not zero
+        [0, 1, 1, 0], // 0 == 1 is false, so VCC is zero
+        [5, 5, 0, 0], // 5 == 5 is true
+    ];
+    let want = [0, 1, 0];
+    run_cases(&shader, cases, |backend, i, inp, got| {
+        assert_eq!(
+            got, want[i],
+            "{backend}: vccz after v_cmp_eq_u32({}, {}) = {got}, want {}",
+            inp[0], inp[1], want[i],
+        );
+    });
+}

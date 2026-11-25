@@ -15,7 +15,8 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::gfx10::Encoding;
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -3148,6 +3149,22 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // The special operands read as their boolean value in the low
+            // bit: `scc`, and "that mask is zero" for `vccz`/`execz`.
+            Operand::Const(251) => {
+                let v = inst.read(Reg::S(VCC)).ok_or("an unread VCC")?;
+                self.mask_zero(v)
+            }
+            Operand::Const(252) => {
+                let v = inst.read(Reg::S(EXEC)).ok_or("an unread EXEC")?;
+                self.mask_zero(v)
+            }
+            Operand::Const(253) => {
+                let b = self.scc_in(inst)?;
+                let c = self.cur;
+                Ok(self.s.m.cast(c, Cast::ZExt, b, self.s.t.i32))
+            }
+            Operand::Const(254) => Err("the special operand m0"),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3736,6 +3753,33 @@ impl<'a> Lower<'a> {
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
         v
+    }
+
+    /// The console's `vccz`/`execz` as data: 1 when no lane of the console
+    /// wave has its bit of mask `v` (the register is zero), 0 otherwise.
+    /// Only where one host wave holds the console's lanes: with the console's
+    /// wave cut into host waves the lanes elsewhere answer too, and one wave
+    /// alone cannot see them.
+    fn mask_zero(&mut self, v: Value) -> Result<V, Why> {
+        let lo = self.x.st.highs.get(&v).copied().unwrap_or(v);
+        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if self.exchange.is_some() || self.halves.is_some() {
+            return Err("a wave-wide test (vccz, execz) of a mask in a split wave");
+        }
+        let made = self.def_block.get(&lo).copied();
+        let at = match made {
+            None => self.s.entry,
+            Some(b) if b == self.cur_ir => self.cur,
+            Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        let bit = self.boolean(m, at)?;
+        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+        let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
+        let z = self.s.m.i32(0);
+        let zero = self.s.m.cmp(at, pred::EQ, some, z);
+        Ok(self.s.m.cast(at, Cast::ZExt, zero, i32t))
     }
 
     /// The console's decision of the branch closing IR block `b`, which the wave takes
@@ -6858,6 +6902,28 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_dot4c_i32_i8" | "v_dot4_i32_i8" => {
+                // S2 + the dot product of four signed byte pairs, where a
+                // byte of 0x80 in either operand contributes nothing.
+                if v.neg != 0 || v.neg_hi != 0 || v.omod != 0 || v.clamp {
+                    return Err("modifiers on a dot product");
+                }
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                // The third source is the accumulator; the shorter form
+                // (no third source) adds to the destination, as `v_dot2c_f32_f16`
+                // and `v_fmac_f32` do.
+                let mut acc = if v.src.len() > 2 {
+                    s(self, 2)?
+                } else {
+                    self.dst_acc(inst)?
+                };
+                for k in 0..4 {
+                    let (xa, xb) = (self.dot_byte(c, a, k), self.dot_byte(c, b, k));
+                    let p = self.s.m.bin(c, Bin::Mul, xa, xb);
+                    acc = self.s.m.bin(c, Bin::Add, acc, p);
+                }
+                int(self, acc)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -8302,7 +8368,13 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        // A VOP2-encoded packed operation carries no half selectors: each
+        // half of the result reads its own half of every source.
+        let sel = if inst.machine.encoding == Encoding::Vop2 {
+            high
+        } else {
+            (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0
+        };
         let x = if float {
             self.f16_operand(inst, &op)?
         } else {
@@ -8319,6 +8391,59 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Half `high` of the destination VGPR as f32: the accumulator of a
+    /// packed instruction that names no third operand.
+    fn packed_acc(&mut self, inst: &Inst, high: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("an accumulator");
+        };
+        let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+        let c = self.cur;
+        let x = if high {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(c, Bin::LShr, x, k16)
+        } else {
+            x
+        };
+        let m = self.s.m.i32(0xFFFF);
+        let x = self.s.m.bin(c, Bin::And, x, m);
+        let f32t = self.s.t.f32;
+        Ok(self
+            .s
+            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]))
+    }
+
+    /// Byte `k` of `x`, sign-extended to 32 bits, and zeroed when it is
+    /// 0x80: GFX10's DOT instructions treat that byte as absent, so the
+    /// product is zero rather than `-128 * x`.
+    fn dot_byte(&mut self, c: usize, x: V, k: usize) -> V {
+        let sh = self.s.m.i32(8 * k as u32);
+        let x = self.s.m.bin(c, Bin::LShr, x, sh);
+        let k24 = self.s.m.i32(24);
+        let t = self.s.m.bin(c, Bin::Shl, x, k24);
+        let x = self.s.m.bin(c, Bin::AShr, t, k24);
+        let low = self.s.m.i32(0xFFFF_FF80);
+        let absent = self.s.m.cmp(c, pred::EQ, x, low);
+        let k0 = self.s.m.i32(0);
+        self.s.m.select(c, absent, k0, x)
+    }
+
+    /// The destination VGPR's own value as i32, the accumulator of the
+    /// instructions that name no third operand.
+    fn dst_acc(&mut self, inst: &Inst) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("an accumulator");
+        };
+        let x = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+        self.i32_of(x)
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
@@ -8328,10 +8453,13 @@ impl<'a> Lower<'a> {
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fmac_f16" => 2,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
-            _ => return Err("a packed 16-bit operation"),
+            _ => {
+                return Err("a packed 16-bit operation");
+            }
         };
         if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
             return Err("modifiers on a packed integer operation");
@@ -8356,6 +8484,18 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if float && op == "fmac_f16" {
+                // The accumulator of a packed FMAC is the destination's own
+                // half: a two-source packed instruction encodes no third
+                // operand, so `opsel[2]`/`opsel_hi[2]` select nothing.
+                let mut f = self.packed_acc(inst, high)?;
+                let neg = if high { v.neg_hi } else { v.neg };
+                if neg >> 2 & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    f = self.s.m.bin(c, Bin::Sub, z, f);
+                }
+                xs.push(f);
             }
             let r = if float {
                 let mut f = match op {
