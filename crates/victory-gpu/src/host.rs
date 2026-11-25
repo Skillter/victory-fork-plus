@@ -3984,7 +3984,6 @@ impl Host {
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -4011,12 +4010,31 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            pieces.push((r.shadow.clone(), lo, hi, 0));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+        }
+        // The pieces of one copy that touch or overlap are one copy on the
+        // card (`shadow::fetch_runs`), and each piece still merges where it
+        // lies: nothing is stored into the card's memory, and what a run
+        // reads past its pieces is never merged.
+        let who: Vec<(usize, usize, usize)> = pieces
+            .iter()
+            .map(|(shadow, lo, hi, _)| (std::sync::Arc::as_ptr(shadow) as usize, *lo, *hi))
+            .collect();
+        let (runs, at_of, total) = crate::shadow::fetch_runs(&who);
+        for (piece, at) in pieces.iter_mut().zip(at_of) {
+            piece.3 = at;
+        }
+        // Each copy's card side, by the identity the runs carry.
+        let mut sides: Vec<(usize, &ID3D12Resource)> = Vec::new();
+        for (shadow, _, _, _) in &pieces {
+            let id = std::sync::Arc::as_ptr(shadow) as usize;
+            if !sides.iter().any(|(k, _)| *k == id) {
+                sides.push((id, &shadow.buffer));
             }
         }
         if pieces.is_empty() {
@@ -4047,8 +4065,10 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for &(copy, lo, hi, at) in &runs {
+                    if let Some(from) = sides.iter().find(|(k, _)| *k == copy).map(|(_, b)| *b) {
+                        list.CopyBufferRegion(&buffer, at, from, lo as u64, (hi - lo) as u64);
+                    }
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4095,6 +4115,7 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            CARD_STATS[7].fetch_add(runs.len() as u64, Ordering::Relaxed);
         }
         let mut title = Vec::new();
         let mut written = 0;
@@ -4252,9 +4273,12 @@ impl Host {
         // run) wrote.
         let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
         // The pieces to fetch: the range, the offsets in its copy, and
-        // where the bytes come down.
+        // where the bytes come down. Pieces of one copy that touch or
+        // overlap are one copy on the card (`shadow::fetch_runs`), and each
+        // piece still merges where it lies: a piece the title wrote and the
+        // card did not keeps the title's value, and the bytes a run reaches
+        // past its pieces are read and never merged.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
                 if r.compared && differs[(r.at + p) as usize] == 0 {
@@ -4262,11 +4286,28 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                    pieces.push((i, lo, hi, 0));
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+        }
+        // What the runs name a copy by, and where each piece's bytes land.
+        let who: Vec<(usize, usize, usize)> = pieces
+            .iter()
+            .map(|&(i, lo, hi, _)| (std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo, hi))
+            .collect();
+        let (runs, at_of, total) = crate::shadow::fetch_runs(&who);
+        for (piece, at) in pieces.iter_mut().zip(at_of) {
+            piece.3 = at;
+        }
+        // Each copy's card side, by the identity the runs carry: two ranges
+        // of one copy name one buffer.
+        let mut sides: Vec<(usize, &ID3D12Resource)> = Vec::new();
+        for r in &plan.ranges {
+            let id = std::sync::Arc::as_ptr(&r.shadow) as usize;
+            if !sides.iter().any(|(k, _)| *k == id) {
+                sides.push((id, &r.shadow.buffer));
+            }
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -4285,8 +4326,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                    for &(copy, lo, hi, at) in &runs {
+                        if let Some(buffer) = sides.iter().find(|(k, _)| *k == copy).map(|(_, b)| *b) {
+                            list.CopyBufferRegion(fetched, at, buffer, lo as u64, (hi - lo) as u64);
+                        }
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -4310,6 +4353,7 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                CARD_STATS[7].fetch_add(runs.len() as u64, Ordering::Relaxed);
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
@@ -7148,15 +7192,16 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
-                    card[7],
-                    card[8] >> 20,
+                     ({:.1} MB) in {:.0} copies with {:.1} more waits for the card ({:.1} ms)",
+                    card[8],
                     card[9] >> 20,
+                    card[10] >> 20,
                     per_frame(0) / 1e6,
                     per_frame(1),
                     per_frame(2),
                     per_frame(3),
                     per_frame(4) / 1e6,
+                    per_frame(7),
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
