@@ -7049,9 +7049,17 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // An old value without a host value keeps 0 in the other
+                // half, as `write_half` and `low_half` keep it: the console
+                // compiler reuses a register whose other half nothing reads
+                // again. The title's deferred textured material writes the
+                // low half of the register a `v_interp_p1ll_f16` first half
+                // left (its second half wrote another), then reads that low
+                // half alone; refusing it dropped the material's draws
+                // (`PS_DeferredTextured_*`, 2026-11-25).
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
                 };
                 let h = self
                     .s
