@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -593,7 +594,13 @@ pub(crate) fn probe_view_limit() {
 /// cutscene (a frame asks for up to 16,000 tables while the frame before
 /// still holds its own; a draw refused its table read slots never made
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
-/// table past them is made afresh in these slots like any other.
+/// table past them is made afresh in these slots like any other. Growing
+/// past 2^18 is not open to us: a capped heap is made at the host's whole
+/// limit, so a bigger ring takes slots the title's own views need, and those
+/// would read null. Run 2026-11-25 04:38 ran 2^18 out all the same (4,359
+/// draws a frame lost their table, 256 host lists in the air): a refusal now
+/// waits for the flights that hold the rest of the ring before it counts
+/// (`make_room`).
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
@@ -702,6 +709,13 @@ impl HostHeap {
                 .collect(),
             placed: Mutex::default(),
         };
+        // The ring the 5 s line and a refusal name (`dynamic_line`), in every
+        // build: nothing else said a table was refused in a release run.
+        if h.dynamic > 0 {
+            DYN_SLOTS.fetch_add(u64::from(h.dynamic), Ordering::Relaxed);
+            DYN_FREE.fetch_add(u64::from(h.dynamic), Ordering::Relaxed);
+            DYN_RINGS.fetch_add(1, Ordering::Relaxed);
+        }
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -839,6 +853,7 @@ impl Ring {
             let first = self.at;
             self.at += n;
             self.free -= n;
+            std::sync::atomic::AtomicU64::fetch_sub(&DYN_FREE, u64::from(n), Ordering::Relaxed);
             return Some((first, n));
         }
         for k in 0..self.runs.len() {
@@ -856,6 +871,7 @@ impl Ring {
                 self.runs[k] = (first + n, len - n);
             }
             self.free -= n;
+            std::sync::atomic::AtomicU64::fetch_sub(&DYN_FREE, u64::from(n), Ordering::Relaxed);
             return Some((first, n));
         }
         self.refused = n;
@@ -895,7 +911,123 @@ impl Ring {
         {
             self.steps += 1;
         }
+        std::sync::atomic::AtomicU64::fetch_add(&DYN_FREE, u64::from(len), Ordering::Relaxed);
     }
+}
+
+/// The dynamic ring, counted in every build: a table refused is a draw
+/// without its descriptors, and nothing else said so in a release run (run
+/// 2026-11-25 04:38: one line for the first of 4,359 draws a frame).
+/// Tables asked, refused and draws dropped for want of one, and refusals a
+/// wait for the card answered, since the last 5 s line.
+static DYN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+const DYN_ASKED: usize = 0;
+const DYN_REFUSED: usize = 1;
+const DYN_DROPPED: usize = 2;
+const DYN_ROOM_MADE: usize = 3;
+/// The gauge the refusal and the 5 s line name: slots free, slots in all
+/// view heaps' rings, and how many rings there are.
+static DYN_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a refusal waits before it asks the card to finish the
+/// submissions in the air, so the lists behind them give their runs back.
+/// One ask is one wait for the card (3.5-17.6 ms a frame of them in run
+/// 2026-11-25 04:38), so a refusal storm asks four times a second at most,
+/// never once per draw.
+const ROOM_EVERY_US: u64 = 250_000;
+
+/// How long a refusal waits before it is said: twelve lines in a 5 s window
+/// at most, whatever the storm, and the 5 s line carries the totals.
+const SAY_EVERY_US: u64 = 400_000;
+
+/// Whether `every` has passed since `last` (`u64::MAX`: never), or it is
+/// the first.
+fn due(last: u64, now: u64, every: u64) -> bool {
+    last == u64::MAX || now.saturating_sub(last) >= every
+}
+
+/// Asks the card to finish the submissions in the air, so that the lists
+/// behind them give their runs back ([`crate::host::settle_now`] →
+/// `tables_done` → [`HostHeap::release`]): one wait for the card, at most
+/// one per [`ROOM_EVERY_US`], and never from inside a submission (the draw
+/// path records, it does not submit). True when it asked, so the caller
+/// tries its table again.
+fn make_room() -> bool {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if !crate::host::late() {
+        // Nothing is in the air: a submission's slots were given back when
+        // it ran, before the title's next call returned.
+        return false;
+    }
+    let now = crate::host::now_us();
+    let last = LAST.load(Relaxed);
+    if !due(last, now, ROOM_EVERY_US) || LAST.compare_exchange(last, now, AcqRel, Relaxed).is_err() {
+        return false;
+    }
+    crate::host::settle_now(crate::host::WHY_DYNAMIC);
+    DYN[DYN_ROOM_MADE].fetch_add(1, Relaxed);
+    true
+}
+
+/// A table the ring had no room for, said with the room it had and what
+/// holds the rest: the line the [`std::sync::Once`] here printed once in a
+/// whole run.
+fn refused_line(n: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = crate::host::now_us();
+    let last = LAST.load(Relaxed);
+    if !due(last, now, SAY_EVERY_US) {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    tracing::warn!(
+        n,
+        free = DYN_FREE.load(Relaxed),
+        slots = DYN_SLOTS.load(Relaxed),
+        rings = DYN_RINGS.load(Relaxed),
+        in_air = crate::host::lists_in_air(),
+        "no free dynamic descriptor slots: a table is not made, and the draw goes without it"
+    );
+}
+
+/// A draw is dropped for want of a dynamic slot ([`crate::draw`]): counted
+/// for the 5 s line, where the refusal behind it is named.
+pub(crate) fn note_dropped_draw() {
+    DYN[DYN_DROPPED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The dynamic ring every 5 s, in every build: the slots free, the tables
+/// asked and refused, the draws that went without them, and the refusals a
+/// wait for the card answered.
+pub(crate) fn dynamic_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let slots = DYN_SLOTS.load(Relaxed);
+    if slots == 0 {
+        // No view heap yet, or a run that made none.
+        return;
+    }
+    let (free, rings) = (DYN_FREE.load(Relaxed), DYN_RINGS.load(Relaxed));
+    let [asked, refused, dropped, answered] = DYN.each_ref().map(|c| c.swap(0, Relaxed));
+    let per_frame = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "dynamic descriptor slots: {free} of {slots} free in {rings} view heap(s), {:.1} % used; per frame: {:.0} tables \
+         asked, {:.0} refused ({:.0} draws dropped for want of one), {:.0} refusals a wait for the card answered; \
+         {} lists in the air",
+        if slots == 0 {
+            0.0
+        } else {
+            100.0 * (slots - free) as f64 / slots as f64
+        },
+        per_frame(asked),
+        per_frame(refused),
+        per_frame(dropped),
+        per_frame(answered),
+        crate::host::lists_in_air()
+    );
 }
 
 /// A run of dynamic slots one list holds: `first` to `end` of the host heap
@@ -1025,6 +1157,15 @@ impl HostHeap {
         self.take_slots(n, None)
     }
 
+    /// `n` slots of the ring for `list`, or for the heap's life: the first's
+    /// host index.
+    fn alloc_in(&self, n: u32, list: &mut Option<&mut DynamicList>) -> Option<u32> {
+        match list {
+            Some(list) => list.alloc(self, n),
+            None => self.reserve(n).map(|(first, _)| first),
+        }
+    }
+
     fn take_slots(&self, n: u32, list: Option<&mut DynamicList>) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
@@ -1033,10 +1174,15 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let made = match list {
-            Some(list) => list.alloc(self, n),
-            None => self.reserve(n).map(|(first, _)| first),
-        };
+        DYN[DYN_ASKED].fetch_add(1, Ordering::Relaxed);
+        let mut list = list;
+        let mut made = self.alloc_in(n, &mut list);
+        if made.is_none() && list.is_some() && make_room() {
+            // The submissions that had run gave their lists' runs back: the
+            // table the ring refused a moment ago fits now. The ring is the
+            // same ring, so no slot is served that was not made for a table.
+            made = self.alloc_in(n, &mut list);
+        }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1046,8 +1192,8 @@ impl HostHeap {
             add(C::DynamicNs, started.elapsed().as_nanos() as u64);
         }
         if made.is_none() {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            DYN[DYN_REFUSED].fetch_add(1, Ordering::Relaxed);
+            refused_line(n);
         }
         made
     }
@@ -3028,6 +3174,23 @@ mod tests {
         // Spent: the list asks the ring for another run.
         assert_eq!(list.step(7, 1), None);
         assert_eq!(list.step(8, 1), None);
+    }
+
+    /// A refusal asks for room at most once a quarter second, however many
+    /// draws it stands for, and says itself at most once every 0.4 s; the
+    /// first of each goes at once.
+    #[test]
+    fn a_refusal_waits_before_it_asks_and_before_it_speaks() {
+        assert!(due(u64::MAX, 1_000, ROOM_EVERY_US));
+        assert!(!due(1_000, 1_000, ROOM_EVERY_US));
+        assert!(!due(1_000, 1_000 + ROOM_EVERY_US - 1, ROOM_EVERY_US));
+        assert!(due(1_000, 1_000 + ROOM_EVERY_US, ROOM_EVERY_US));
+        // A clock that went backwards (two threads, one settled earlier):
+        // no second ask until it has caught up.
+        assert!(!due(9_000, 1_000, ROOM_EVERY_US));
+        // Saying it is rarer than asking: a storm of refusals is not a storm
+        // of lines.
+        const { assert!(SAY_EVERY_US > ROOM_EVERY_US) };
     }
 
     /// Runs never overlap, whatever the order tables are asked for and given
