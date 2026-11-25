@@ -1327,6 +1327,32 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// A present moves the shown target's tracked state before it does
+    /// anything that can fail, and every way out puts that state back: a
+    /// minimised window refuses the resize, the back buffer and the pass, and
+    /// a target left tracked as the state the pass read it in is a barrier
+    /// the rest of the run will not emit.
+    #[test]
+    fn a_present_puts_back_the_state_it_moved() {
+        use std::cell::Cell;
+        let moved = Cell::new(0);
+        {
+            let _restore = Restore::new(|| moved.set(moved.get() + 1));
+            assert_eq!(moved.get(), 0, "nothing is put back before the way out");
+        }
+        assert_eq!(moved.get(), 1, "the way out puts back what the present moved");
+        // The present that gets the whole way restores the state itself, and
+        // the guard then has nothing left to do: a second restore would take
+        // the target out of the state the list just moved it to.
+        let moved = Cell::new(0);
+        {
+            let mut restore = Restore::new(|| moved.set(moved.get() + 1));
+            moved.set(moved.get() + 10);
+            restore.done();
+        }
+        assert_eq!(moved.get(), 10, "a finished present is not restored twice");
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -2058,10 +2084,20 @@ fn copy_queue() -> bool {
 
 /// The run's copies into the card's copies on their own queue
 /// ([`copy_queue`]): batches sent, their bytes, batches whose run had
-/// finished when the next was ready (they ran beside the direct queue), and
-/// batches still running then.
+/// finished by the time the next batch was ready (they ran beside the direct
+/// queue), and batches still running then. Every batch that a later one
+/// arrived behind lands in exactly the third or the fourth, so a window's
+/// third and fourth add up to its first less the batches still in the air
+/// when it ended.
 static COPY_QUEUE_STATS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The direct queue's relay fetch in flight: its fence and the value that
+/// fetch waits on the copy queue for. A fetch reads the copies the title's
+/// shaders read ([`Host::relay_card_fetch`]) with no list of its own on the
+/// copy queue, so the next batch of copies waits for the value the fetch's
+/// wait ends at before it writes one of those buffers ([`Host::card_copies`]).
+static FETCH_BARRIER: Mutex<Option<(ID3D12Fence, u64)>> = Mutex::new(None);
 
 /// What the copy queue and the direct queue know of each other: every batch
 /// of copies is signalled on the copy fence ([`CopyOrder::sending`]), the
@@ -2127,6 +2163,67 @@ struct CopyQueue {
     lists: Mutex<CopyLists>,
 }
 
+/// The most batches the copy queue holds in the air at once: below it a batch
+/// is recorded in a list of its own and the two queues overlap, at it the copy
+/// queue is already behind and the next batch waits for the oldest — which is
+/// the figure [`COPY_QUEUE_STATS`] reports as still running.
+const COPY_LISTS: usize = 4;
+
+/// Where the copy queue's next batch records ([`CopyLists::take`]): in a list
+/// whose batch the card has finished, in a new one while fewer than
+/// [`COPY_LISTS`] are in the air, or in the oldest batch's, waited for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListFrom {
+    Idle,
+    Fresh,
+    Wait,
+}
+
+fn list_from(idle: usize, flying: usize) -> ListFrom {
+    if idle > 0 {
+        ListFrom::Idle
+    } else if flying < COPY_LISTS {
+        ListFrom::Fresh
+    } else {
+        ListFrom::Wait
+    }
+}
+
+/// Which of [`COPY_QUEUE_STATS`]'s last two a batch counts in, from the value
+/// of the batch before it and the fence when this one was ready: still
+/// running (3) when the card had not reached it, finished (2) when it had.
+fn overlap_slot(before: u64, done: u64) -> usize {
+    2 + usize::from(done < before)
+}
+
+/// A window of [`COPY_QUEUE_STATS`]: the batches sent so far and, per frame of
+/// the window, the megabytes the window sent and the batches of the window
+/// that finished before the next batch was ready or were still running then.
+/// The two batch counts are swapped, not read: a total divided by one window's
+/// frames would report the whole run as if it happened in this window.
+fn copy_queue_window(
+    stats: &[std::sync::atomic::AtomicU64; 4],
+    frames: f64,
+) -> (u64, f64, f64, f64) {
+    let batches = stats[0].load(Ordering::Relaxed);
+    let mb = stats[1].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+    let finished = stats[2].swap(0, Ordering::Relaxed) as f64 / frames;
+    let running = stats[3].swap(0, Ordering::Relaxed) as f64 / frames;
+    (batches, mb, finished, running)
+}
+
+/// Whether a batch has run, from the value its own signal carries (`None` when
+/// that signal failed) and the first value signalled after it: one queue runs
+/// its batches in the order they were sent, so a later value says an
+/// unsignalled batch before it has run too, and a batch with no value anywhere
+/// is one nothing can wait for.
+fn batch_done(value: Option<u64>, after: Option<u64>, done: u64) -> bool {
+    match value {
+        Some(value) => value <= done,
+        None => after.is_some_and(|after| after <= done),
+    }
+}
+
 /// The copy queue's lists, and the order the two queues keep
 /// ([`CopyOrder`]). A list is recorded, sent, and given back only when the
 /// batch it recorded has completed: an allocator cannot be reset while the
@@ -2136,9 +2233,10 @@ struct CopyLists {
     order: CopyOrder,
     /// Lists whose batch has completed: free to record again.
     idle: Vec<Prelude>,
-    /// Batches sent and not completed: the value signalled after each and
-    /// the list that recorded it.
-    flying: std::collections::VecDeque<(u64, Prelude)>,
+    /// Batches sent and not completed: the value signalled after each (`None`
+    /// for a batch whose signal failed, which no value in the fence ever
+    /// names) and the list that recorded it.
+    flying: std::collections::VecDeque<(Option<u64>, Prelude)>,
 }
 
 impl CopyLists {
@@ -2146,28 +2244,57 @@ impl CopyLists {
     fn free(&mut self, fence: &ID3D12Fence) {
         // SAFETY: a plain query of our fence.
         let done = unsafe { fence.GetCompletedValue() };
-        while self.flying.front().is_some_and(|(value, _)| *value <= done) {
+        while self.front_done(done) {
             if let Some((_, prelude)) = self.flying.pop_front() {
                 self.idle.push(prelude);
             }
         }
     }
 
-    /// A list to record the next batch in: one whose batch completed, or
-    /// the oldest batch's when none has and all are in the air.
+    /// Whether the oldest batch in the air has run ([`batch_done`]).
+    fn front_done(&self, done: u64) -> bool {
+        let Some((value, _)) = self.flying.front() else {
+            return false;
+        };
+        // A batch whose signal failed is behind the first value after it on the
+        // queue, which names its completion too.
+        let after = value.is_none().then(|| self.after_front()).flatten();
+        batch_done(*value, after, done)
+    }
+
+    /// The first value signalled after the oldest batch in the air.
+    fn after_front(&self) -> Option<u64> {
+        self.flying.iter().skip(1).find_map(|(value, _)| *value)
+    }
+
+    /// The value a wait must be for to know the oldest batch has run: `None`
+    /// when every batch in the air has no value of its own, a queue no wait
+    /// can be told about.
+    fn wait_value(&self) -> Option<u64> {
+        self.flying.iter().find_map(|(value, _)| *value)
+    }
+
+    /// A list to record the next batch in: one whose batch completed, a new one
+    /// while fewer than [`COPY_LISTS`] batches are in the air (they overlap the
+    /// direct queue rather than being waited for), or the oldest batch's when
+    /// the pool is full.
     fn take(&mut self, fence: &ID3D12Fence, event: HANDLE) -> Option<Prelude> {
         self.free(fence);
-        if self.idle.is_empty()
-            && let Some((value, _)) = self.flying.front()
-        {
-            // SAFETY: our fence and event; the batch is on the card.
-            unsafe {
-                fence.SetEventOnCompletion(*value, event).ok()?;
-                let _ = WaitForSingleObject(event, INFINITE);
+        match list_from(self.idle.len(), self.flying.len()) {
+            ListFrom::Idle => self.idle.pop(),
+            // A list of its own: `None` is the caller's `make_copy_prelude`.
+            ListFrom::Fresh => None,
+            ListFrom::Wait => {
+                let value = self.wait_value()?;
+                // SAFETY: our fence and event; the batch is on the card.
+                unsafe {
+                    fence.SetEventOnCompletion(value, event).ok()?;
+                    WaitForSingleObject(event, INFINITE);
+                }
+                self.free(fence);
+                self.idle.pop()
             }
-            self.free(fence);
         }
-        self.idle.pop()
     }
 }
 
@@ -2955,6 +3082,11 @@ struct Line {
     /// A settle has taken the line and is not done: a signal still goes
     /// behind it.
     settling: bool,
+    /// Merges held back ([`HeldBack`]) that a thread has taken out of
+    /// `deferred` and is merging: the line is empty of them while their bytes
+    /// are not in title memory yet, so a settle waits for this and not only
+    /// for `deferred` ([`settled`]).
+    draining: usize,
     /// Something was settled away from a queue's own calls: the helper
     /// thread looks at what queues hold.
     poke: bool,
@@ -2979,6 +3111,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     lists: 0,
     target: 0,
     settling: false,
+    draining: 0,
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
@@ -3528,7 +3661,14 @@ fn relay_hand_back(back: &[Declared]) {
 fn drain_deferred() -> usize {
     let entries = {
         let mut line = line();
-        std::mem::take(&mut line.deferred)
+        let entries = std::mem::take(&mut line.deferred);
+        // Counted under the same lock as the take: a settle that looked at the
+        // line between the two would find nothing left to merge and return
+        // while these bytes are still in the copies in the PC's memory.
+        if !entries.is_empty() {
+            line.draining += 1;
+        }
+        entries
     };
     if entries.is_empty() {
         return 0;
@@ -3559,9 +3699,23 @@ fn drain_deferred() -> usize {
         for entry in &entries {
             line.held.merged(entry.number);
         }
+        // After `held.merged`: the ranges stay held until the bytes are in
+        // title memory, and a settle that woke on this one sees both.
+        line.draining -= 1;
     }
     LINE_LANDED.notify_all();
     entries.len()
+}
+
+/// Whether a settle has nothing left to wait for: no flight in the line, none
+/// being landed, and no merge held back or being merged. The line alone does
+/// not say it — [`drain_deferred`] takes what a landing held back out of
+/// `deferred` before it writes those bytes into title memory, so a second
+/// settle that looked at the line while that ran would find it empty and
+/// return with the title's memory still holding the copies' bytes from before
+/// ([`lazy_merge`]).
+fn settled(line: &Line) -> bool {
+    line.line.is_empty() && !line.settling && line.deferred.is_empty() && line.draining == 0
 }
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
@@ -3655,7 +3809,56 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Held, Line, continues, join_ranges, settled, touches};
+
+    /// A line with nothing in it.
+    fn empty_line() -> Line {
+        Line {
+            line: Vec::new(),
+            held: Held::new(),
+            deferred: Vec::new(),
+            settles: 0,
+            lists: 0,
+            target: 0,
+            settling: false,
+            draining: 0,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+        }
+    }
+
+    /// A settle returns only when title memory holds what the flights wrote:
+    /// merges held back in `deferred`, and the merges a thread has taken out of
+    /// it and is writing (`draining`), are both in the way. Without the second,
+    /// a second thread returns from `settle` while the first is still relaying
+    /// those writes into title memory.
+    #[test]
+    fn a_settle_waits_for_the_merges_being_relayed() {
+        let mut line = empty_line();
+        assert!(settled(&line));
+        // A merge held back has not landed.
+        line.deferred.push(super::HeldBack {
+            number: 0,
+            back: Vec::new(),
+        });
+        assert!(!settled(&line), "a missing merge is one a settle waits for");
+        line.deferred.clear();
+        // A thread that took the merges out of `deferred` and is writing them:
+        // the line is empty of them, title memory is not holding them yet.
+        line.draining = 1;
+        assert!(
+            !settled(&line),
+            "a drain in hand is one a settle waits for, as a merge still in `deferred` is"
+        );
+        line.draining = 0;
+        assert!(settled(&line));
+        // A settle in progress is still in the way, and a flight too.
+        line.settling = true;
+        assert!(!settled(&line));
+        line.settling = false;
+        assert!(settled(&line));
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4431,14 +4634,14 @@ impl Host {
         let (allocator, list) = lists
             .take(&copies.fence, copies.event)
             .or_else(|| self.make_copy_prelude())?;
-        // Whether the batch before this one overlapped the direct queue: a
-        // batch still on the card when the next is ready held it, and is
-        // what the split buys or does not ([`COPY_QUEUE_STATS`]).
-        if lists.order.sent > 0 {
-            // SAFETY: a plain query of our fence.
-            let done = unsafe { copies.fence.GetCompletedValue() };
-            COPY_QUEUE_STATS[2 + usize::from(done < lists.order.sent)].fetch_add(1, Ordering::Relaxed);
-        }
+        // How the copy queue stood when this batch was ready: the value of the
+        // batch before it, and what the card had reached. A batch the card had
+        // not reached was still running while this one was recorded, which is
+        // what the split buys or does not ([`COPY_QUEUE_STATS`], counted once
+        // the batch is on the queue).
+        let before = lists.flying.back().and_then(|(value, _)| *value).unwrap_or(0);
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { copies.fence.GetCompletedValue() };
         let mut bytes = 0u64;
         let mut ranges = 0u64;
         // SAFETY: a list whose last batch has completed (`CopyLists::take`),
@@ -4450,6 +4653,19 @@ impl Host {
                 if direct > lists.order.direct {
                     copies.queue.Wait(&self.fence, direct)?;
                     lists.order.direct_sent(direct);
+                }
+                // A relay fetch reads these buffers on the direct queue,
+                // which this queue does not otherwise wait for: a batch
+                // recorded over one of them while that read runs overwrites
+                // what it is copying out. The fetch publishes the value its
+                // own wait on this queue ends at, and this batch waits for it
+                // ([`FETCH_BARRIER`]) before it writes anything.
+                let barrier = FETCH_BARRIER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some((fetch_fence, fetch_value)) = barrier {
+                    copies.queue.Wait(&fetch_fence, fetch_value)?;
                 }
                 for (shadow, dirty) in dirty {
                     let Some((staging, _, _)) = shadow.card_sides() else {
@@ -4500,7 +4716,18 @@ impl Host {
         if let Err(ref e) = signalled {
             tracing::warn!(error = %e, "no signal for the copies into the card's memory");
         }
-        lists.flying.push_back((value, (allocator, list)));
+        // Whether the batch before this one ran beside the direct queue while
+        // this one was recorded: one of the two counts for every batch that a
+        // later one arrived behind, and neither for the batches still in the
+        // air when the run ends.
+        if before > 0 {
+            COPY_QUEUE_STATS[overlap_slot(before, done)].fetch_add(1, Ordering::Relaxed);
+        }
+        // A batch whose signal failed is `None`: the value is in the fence's
+        // sequence but never named by a signal, so no wait can be for it and
+        // [`CopyLists::front_done`] reads it as done behind the first value
+        // after it instead of waiting forever on a value that never comes.
+        lists.flying.push_back((signalled.is_ok().then_some(value), (allocator, list)));
         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
         crate::shadow::CARD_STATS[1].fetch_add(ranges, Ordering::Relaxed);
         COPY_QUEUE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4895,6 +5122,22 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, sent) = (f.list.clone(), f.fence.clone(), f.sent);
+        // The copy queue's batches write the same card-side buffers this fetch
+        // reads, and it is a queue of its own: the fetch waits for the batches
+        // sent so far ([`CopyOrder`]), and the batches recorded from here on
+        // wait for this fetch, published as [`FETCH_BARRIER`] in the same hold
+        // of the lists lock so that every batch is on one side of the fetch or
+        // the other.
+        let copies = self.copies.as_ref();
+        let fetch_waits = copies.map(|copies| {
+            let lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+            let waits = lists.order.sent;
+            if waits > 0 {
+                *FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((fence.clone(), sent * 2));
+            }
+            waits
+        });
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -4912,6 +5155,11 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                // A copy queue of its own writes those buffers too: waited for
+                // before the fetch reads one of them.
+                if let (Some(copies), Some(waits)) = (copies, fetch_waits.filter(|w| *w > 0)) {
+                    self.queue.Wait(&copies.fence, waits)?;
+                }
                 // A signal before the fetch: when it completes, everything
                 // sent before the fetch has run, and the time until it did
                 // is the waiting behind that work, not the fetch's own.
@@ -4926,7 +5174,17 @@ impl Host {
         };
         let after = match ran {
             Ok(after) => after,
-            Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
+            Err(e) => {
+                // No fetch reached the queue: a batch waiting for its value
+                // would wait for a value that never comes.
+                if fetch_waits.is_some_and(|waits| waits > 0) {
+                    let mut barrier = FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner());
+                    if barrier.as_ref().is_some_and(|(_, value)| *value == sent * 2) {
+                        *barrier = None;
+                    }
+                }
+                fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)"))
+            }
         };
         Some(FetchRun { pieces, data, total, sent, after, runs: runs.len() })
     }
@@ -5464,7 +5722,7 @@ impl Host {
                 line.settles += 1;
             }
             drain_deferred();
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            relay_wait(why, settled);
             {
                 let mut line = line();
                 line.settles -= 1;
@@ -7952,6 +8210,64 @@ enum Show {
     Drawn(Fit),
 }
 
+/// Whether a present of picture `format` into a chain of `swap` may copy it
+/// ([`Show::Copy`]): a copy takes the format as it is, so only the chain's
+/// own, or a typeless picture that a format of its family stands in for
+/// ([`typeless`]). A 64-bit-per-pixel picture copied into a 32-bit back buffer
+/// is a `CopyResource` the device refuses, and the pass draws it instead
+/// ([`draw_or_copy`]).
+fn copy_compatible(format: DXGI_FORMAT, swap: DXGI_FORMAT) -> bool {
+    format == swap || (typeless(format) && crate::resource::family(swap.0 as u32) == format.0 as u32)
+}
+
+/// Whether a present draws the picture through the pass or copies it: the
+/// picture must have the client area's size for a copy (DXGI's stretch of the
+/// back buffer is not one of D3D12's), and a copy of another format is none
+/// at all, so such a picture is drawn whenever the pass can read it and shown
+/// not at all when it cannot — a black window rather than a present the device
+/// refuses.
+fn draw_or_copy(readable: bool, copyable: bool, same_size: bool) -> Option<bool> {
+    // A copy is offered only at the client area's size and in a format the
+    // copy takes as it is: the pass stretches, a `CopyResource` does neither.
+    let may_copy = copyable && same_size;
+    if readable && !same_size {
+        Some(true)
+    } else if may_copy {
+        Some(false)
+    } else if readable {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Runs what the present owes a target it moved when the present returns,
+/// however it returns: the state a shown target is tracked in must be the one
+/// the pass found it in even on the ways out that present nothing (a minimised
+/// window refuses every present, and a target left tracked as a shader read is
+/// a barrier the rest of the run will not emit). [`Restore::done`] is for the
+/// present that got far enough to put it back itself.
+struct Restore<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Restore<F> {
+    fn new(restore: F) -> Self {
+        Restore(Some(restore))
+    }
+
+    /// What it would run is done: nothing on the way out.
+    fn done(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for Restore<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
+        }
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     /// The size of the swap chain's buffers: the window's client area when the
@@ -8209,15 +8525,15 @@ impl Meter {
             }
             // The uploads on their own queue ([`copy_queue`]): a batch whose
             // run had finished when the next was ready ran beside the direct
-            // queue, and that overlap is all the split buys.
+            // queue, and that overlap is all the split buys. Per window, as
+            // `CARD_STATS` is: the batches' totals divide by this window's
+            // frames, so they are drained here.
             if copy_queue() {
+                let (batches, mb, finished, running) = copy_queue_window(&COPY_QUEUE_STATS, frames);
                 tracing::info!(
-                    "copies into the card's memory on the copy queue: {} batches, {:.1} MB a frame, \
-                     {:.0} of them finished when the next batch was ready, {:.0} still running",
-                    COPY_QUEUE_STATS[0].load(Ordering::Relaxed),
-                    COPY_QUEUE_STATS[1].load(Ordering::Relaxed) as f64 / 1e6 / frames,
-                    COPY_QUEUE_STATS[2].load(Ordering::Relaxed) as f64 / frames,
-                    COPY_QUEUE_STATS[3].load(Ordering::Relaxed) as f64 / frames
+                    "copies into the card's memory on the copy queue: {batches} batches so far, \
+                     {mb:.1} MB a frame, {finished:.0} finished before the next batch was ready \
+                     and {running:.0} still running then, a frame"
                 );
             }
             tracing::info!(
@@ -8392,9 +8708,15 @@ impl Host {
         match crate::present::pick((desc.Width as u32, desc.Height), since, |t| {
             const DEPTH: u32 = 0x2;
             const DENY_SHADER_RESOURCE: u32 = 0x8;
+            let candidate = DXGI_FORMAT(t.format);
             t.sample_count <= 1
                 && t.flags & (DEPTH | DENY_SHADER_RESOURCE) == 0
-                && frame_view(DXGI_FORMAT(t.format), format).is_some()
+                // The pass reads it, or a copy takes it as it is: a target
+                // neither can show is no substitute (a copy of another format
+                // is one the device refuses, and a wrong image is worse than a
+                // black one).
+                && (frame_view(candidate, format).is_some()
+                    || copy_compatible(candidate, format))
         }) {
             Ok(index) => {
                 let shown = since.targets.get(index).and_then(|target| {
@@ -8456,6 +8778,18 @@ impl Host {
             Err(crate::present::Why::Written) => {}
         }
         let size = (desc.Width as u32, desc.Height);
+        // What is shown may be a target of the frame's, moved to be read as a
+        // pixel shader resource above. Everything below can leave without
+        // presenting (no swap chain, a minimised window, a refused resize, no
+        // back buffer), and a target left tracked in a state no barrier moved
+        // it to is a texture the rest of the run moves from the wrong one: the
+        // guard puts it back on every return, and the present that gets this
+        // far puts it back itself and disarms the guard.
+        let mut restore = Restore::new(|| {
+            if let Some(this) = picture_this {
+                crate::resource::host_transition(this, picture_state);
+            }
+        });
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(size, format) {
@@ -8489,9 +8823,27 @@ impl Host {
         let drawn = p.pass.filter(|_| readable(&desc)).zip(view).and_then(
             |(pass, view)| pass.pipeline(format).map(|pipeline| (pass, pipeline, view)),
         );
-        let (chain, show) = match drawn {
-            Some(_) if client != size => (client, Show::Drawn(fit(size, client)?)),
-            _ => (size, Show::Copy),
+        // Whether a copy can show this picture as it is: the swap chain's own
+        // format, at the client area's size ([`copy_compatible`],
+        // [`draw_or_copy`]).
+        let copyable = copy_compatible(desc.Format, format);
+        let (chain, show) = match draw_or_copy(drawn.is_some(), copyable, client == size) {
+            Some(true) => (client, Show::Drawn(fit(size, client)?)),
+            Some(false) => (size, Show::Copy),
+            None => {
+                // Neither the pass nor a copy: nothing is presented, and the
+                // next run says why rather than showing a stretched black
+                // frame from a `CopyResource` the device refused.
+                victory_core::logging::warn_once("present.unshowable", || {
+                    format!(
+                        "the presented frame is in a format the present pass cannot read as float \
+                         and cannot be copied into the swap chain (frame_format={}, \
+                         swap_format={}): nothing is shown",
+                        desc.Format.0, format.0
+                    )
+                });
+                return None;
+            }
         };
         // What the run shows, for the log: the letters, or the stretch.
         let shown = match show {
@@ -8620,6 +8972,8 @@ impl Host {
                 // puts the frame's back.
                 crate::resource::host_transition(this, picture_state);
             }
+            // Put back above: nothing left for the way out to do.
+            restore.done();
             // SAFETY: a live back buffer of the swap chain.
             list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             copy.close();
@@ -8828,8 +9182,9 @@ fn move_to(
 mod present_tests {
     use super::{Fit, fit};
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS,
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
     };
 
     /// A view of the frame names a format the frame's own resource allows. The
@@ -9014,6 +9369,52 @@ mod present_tests {
                 "{client:?}: {rect:?} is not 16:9"
             );
         }
+    }
+
+    /// A frame the swap chain takes as it is still takes the path it takes
+    /// today: the same format at the client area's size is a `CopyResource`,
+    /// never a stretch through the present pass.
+    #[test]
+    fn a_frame_of_the_swap_chains_own_format_is_still_copied() {
+        assert!(super::copy_compatible(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert_eq!(super::draw_or_copy(true, true, true), Some(false));
+    }
+
+    /// A copy takes the format as it is: a picture of another format is never
+    /// copied into the back buffer, whatever its size. It is drawn when the
+    /// pass reads it, and nothing is shown when the pass cannot read it
+    /// either — a black window rather than a present the device refuses.
+    #[test]
+    fn a_picture_of_another_format_is_not_copied() {
+        // 64 bpp into a 32 bpp chain: `CopyResource` refuses it.
+        assert!(!super::copy_compatible(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert_eq!(super::draw_or_copy(true, false, true), Some(true));
+        assert_eq!(super::draw_or_copy(false, false, true), None);
+        // sRGB into the family's linear chain: another format, so a draw.
+        assert!(!super::copy_compatible(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        // A typeless picture: a format of its family, the chain's, stands in.
+        assert!(super::copy_compatible(
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+    }
+
+    /// A copy is only offered at the client area's size: a picture of the
+    /// chain's own format but another size is stretched by the pass, and one
+    /// the pass cannot read is not presented at all.
+    #[test]
+    fn a_copy_is_only_offered_at_the_client_areas_size() {
+        assert_eq!(super::draw_or_copy(true, true, false), Some(true));
+        assert_eq!(super::draw_or_copy(false, true, false), None);
     }
 }
 
@@ -9545,10 +9946,81 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
 #[cfg(test)]
 mod copy_queue {
-    use super::{CopyOrder, copied_state};
+    use super::{
+        COPY_LISTS, CopyOrder, ListFrom, batch_done, copy_queue_window, copied_state, list_from,
+        overlap_slot,
+    };
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
     };
+
+    /// Batches overlap the direct queue while the pool has room, and only then
+    /// does the next batch wait for the oldest: a pool of one waited for every
+    /// batch before it sampled the fence, so nothing overlapped and the count
+    /// of batches still running was always zero.
+    #[test]
+    fn a_batch_only_waits_once_the_pool_is_full() {
+        assert_eq!(list_from(1, 0), ListFrom::Idle);
+        assert_eq!(list_from(0, 0), ListFrom::Fresh);
+        assert_eq!(list_from(0, COPY_LISTS - 1), ListFrom::Fresh);
+        assert_eq!(list_from(0, COPY_LISTS), ListFrom::Wait);
+        assert_eq!(list_from(0, COPY_LISTS + 3), ListFrom::Wait);
+        // A list back from the card is used before a new one is made.
+        assert_eq!(list_from(2, COPY_LISTS + 3), ListFrom::Idle);
+    }
+
+    /// A batch whose signal failed has no value of its own: a later value on
+    /// the queue says it has run, and with no later value nothing may be
+    /// waited for — a wait for a value never signalled never returns.
+    #[test]
+    fn a_batch_whose_signal_failed_is_not_waited_for() {
+        // Its own value at or under what the card reached: run.
+        assert!(batch_done(Some(5), None, 5));
+        assert!(!batch_done(Some(6), None, 5));
+        // No value of its own: the first value after it names its completion.
+        assert!(!batch_done(None, Some(6), 5));
+        assert!(batch_done(None, Some(6), 6));
+        // No value at all: it is run behind the next batch that has one, and
+        // nothing here may be waited for.
+        assert!(!batch_done(None, None, u64::MAX));
+    }
+
+    /// The run's overlap figure: a batch the card had reached when the next
+    /// was ready ran beside the direct queue, one it had not was still running
+    /// then. Every batch that a later one arrived behind counts in one of the
+    /// two, and in one only.
+    #[test]
+    fn a_batch_the_card_had_reached_ran_beside_the_direct_queue() {
+        assert_eq!(overlap_slot(7, u64::MAX), 2);
+        assert_eq!(overlap_slot(7, 7), 2);
+        assert_eq!(overlap_slot(7, 6), 3);
+    }
+
+    /// Each window reports its own batches and bytes: a total divided by one
+    /// window's frames reported the whole run's bytes as if this window sent
+    /// them, and that grew with uptime.
+    #[test]
+    fn a_window_reports_only_what_it_sent() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let stats = [const { AtomicU64::new(0) }; 4];
+        for _ in 0..2 {
+            stats[0].fetch_add(1, Ordering::Relaxed);
+            stats[1].fetch_add(4_000_000, Ordering::Relaxed);
+            stats[2].fetch_add(1, Ordering::Relaxed);
+        }
+        let frames = 2.0;
+        // Two batches of 4 MB over two frames: 4 MB a frame.
+        assert_eq!(copy_queue_window(&stats, frames), (2, 4.0, 1.0, 0.0));
+        // Read, not drained: the batches sent so far are a running total.
+        assert_eq!(stats[0].load(Ordering::Relaxed), 2);
+        // A second window with one batch of 1 MB and one still running.
+        stats[0].fetch_add(1, Ordering::Relaxed);
+        stats[1].fetch_add(1_000_000, Ordering::Relaxed);
+        stats[3].fetch_add(1, Ordering::Relaxed);
+        assert_eq!(copy_queue_window(&stats, frames), (3, 0.5, 0.0, 0.5));
+        // Nothing sent since: nothing to report but the total.
+        assert_eq!(copy_queue_window(&stats, frames), (3, 0.0, 0.0, 0.0));
+    }
 
     /// The rule the copy queue is built on: a batch of copies is signalled
     /// with a value no list before it has waited for, and every list after

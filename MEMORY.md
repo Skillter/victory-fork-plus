@@ -387,7 +387,11 @@ card work is waited for once wherever the landing splits it —
 (the submitting thread's own wait 59 → 123 ms, the card's idle 49 → 73 ms,
 `run-20261125-100317.log`), and `VICTORY_COPY_QUEUE=1` only moves it into
 preparing, 96 → 168 ms, 205 ms a frame (`run-20261125-101119.log`); measured
-25 Nov.
+25 Nov. That run's copy-queue line says nothing about overlap: its pool held
+one batch, so `host::CopyLists::take` recorded a batch only after the one
+before had completed and `still running` read 0 by construction. Up to
+`host::COPY_LISTS` batches may now be in the air at once, so that figure must
+be measured before it is quoted.
 
 The argument clamp is not a lever either: with the indirect window off
 (`indirect.rs::record_clamp_as` once a record; the default since the window
