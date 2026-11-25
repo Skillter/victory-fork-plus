@@ -122,6 +122,10 @@ target\release\victory.exe run <title.exe> --execute
 - `VICTORY_*` switches are read at their use sites. Search the variable name
   before documenting one; several are diagnostics-only.
 
+## Commit titles
+
+- `type(scope): summary` — types `fix feat perf refactor docs test build ci chore`; scope = crate without `victory-` or `cli docs ci`; imperative, lowercase, no period, subject <= 72; body = why, then evidence.
+
 ## Definition of done
 
 - Both clippy invocations clean, `cargo test --workspace` green and
