@@ -66,6 +66,53 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Checks left at which a guarded texture is hashed whatever the guards
+    /// say, because its hash found a change they did not report
+    /// ([`unseen_write`]).
+    unseen: u32,
+}
+
+/// Movie-like textures found so far ([`unseen_write`]), for the log.
+static UNSEEN_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Checks at which a texture whose hash found a write the guards missed is
+/// hashed again, instead of at its turn.
+const UNSEEN_AGAIN: u32 = 2;
+/// Checks a texture found to be written at every frame is hashed at, until
+/// that many in a row find it as it was.
+const UNSEEN_MOVIE: u32 = 30;
+
+/// The checks left after a hash of a guarded texture that the guards
+/// reported no write to, `state` before it and `changed` whether the hash
+/// found a change all the same (a write through another view of the same
+/// pages, which the guards cannot see).
+///
+/// The first such write has the texture hashed at its next two checks
+/// instead of at its turn; a second one within those marks it as written
+/// every frame (a movie's picture), and it is hashed at every check until
+/// thirty of them in a row find it as it was. A texture that changes once
+/// (streamed in) costs two hashes more than before.
+fn unseen_write(state: u32, changed: bool) -> u32 {
+    if !changed {
+        return state.saturating_sub(1);
+    }
+    if state == 0 { UNSEEN_AGAIN } else { UNSEEN_MOVIE }
+}
+
+/// Whether `state`, before [`unseen_write`], is a texture found again to be
+/// written where the guards cannot see it (worth a line in the log): the
+/// first sighting only asks for its next two checks.
+fn unseen_found(state: u32) -> bool {
+    (1..=UNSEEN_AGAIN).contains(&state)
+}
+
+/// Whether a guarded texture is read at this check: always when the guards
+/// saw a write (`unwritten` false), otherwise at its hash turn (`turn`), or
+/// at once while [`unseen_write`] asks for it (`unseen` not 0). Without the
+/// last, a texture written where the guards cannot see it — a movie's
+/// picture, every frame — was read once in eight frames.
+fn reads_now(unwritten: bool, turn: bool, unseen: u32) -> bool {
+    !unwritten || turn || unseen != 0
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -767,7 +814,18 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        //
+        // A movie's pictures are written through another view at every
+        // frame, and on the hash's turn alone they were read once in eight
+        // frames. The intro movies keep three pictures of three planes
+        // (3840x2160 and two of 1920x1080, 36 MB in all) and show them in
+        // turn, so what was shown jumped between pictures read at different
+        // moments. A texture whose hash finds a change the guards did not
+        // report is hashed at its next checks too
+        // ([`unseen_write`]).
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Whether the guards reported no write since the last check.
+        let mut silent = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -775,10 +833,61 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if !reads_now(unwritten, turn, last.unseen) {
                 return 0;
             }
+            silent = unwritten;
         }
+        let before = last.hash;
+        let read = self.refresh_hashed(last, size);
+        if silent && read != 0 && self.unseen_applies() {
+            let state = last.unseen;
+            last.unseen = unseen_write(state, last.hash != before);
+            if last.hash != before && unseen_found(state) {
+                self.announce_unseen();
+            }
+        }
+        read
+    }
+
+    /// Whether [`unseen_write`] applies to this texture: block-compressed
+    /// textures are left to their turn, and `VICTORY_TEXTURE_UNSEEN=0`
+    /// leaves every texture to it.
+    ///
+    /// shortcut: block-compressed textures are streamed, not drawn into
+    /// (30-100 MB of them change in a frame while the world streams in),
+    /// and each would be hashed twice more.
+    fn unseen_applies(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.layout.desc.block == 1
+            && *ON.get_or_init(|| {
+                std::env::var_os("VICTORY_TEXTURE_UNSEEN").is_none_or(|v| v != "0")
+            })
+    }
+
+    /// Logs a texture found to be written at every frame where the guards
+    /// cannot see it (a movie's picture), the first 64 of them.
+    fn announce_unseen(&self) {
+        let found = UNSEEN_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if found <= 64 {
+            let d = &self.layout.desc;
+            tracing::info!(
+                memory = ?self.memory,
+                width = d.width,
+                height = d.height,
+                element_bytes = d.element_bytes,
+                megabytes = format_args!("{:.2}", self.layout.size as f64 / 1048576.0),
+                found,
+                "a texture is written every frame where the guards do not see it (a movie's picture): \
+                 hashed at every check while it keeps changing (VICTORY_TEXTURE_UNSEEN=0: at its turn only)"
+            );
+        }
+    }
+
+    /// The rest of a refresh, once the guards have said nothing was written:
+    /// the texture's memory is read and hashed, and detiled if the hash
+    /// differs from the last. Returns the bytes read.
+    fn refresh_hashed(&self, last: &mut Last, size: usize) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1549,5 +1658,80 @@ mod staging_ceiling_tests {
         assert!(to_ceiling(&entries, 400, 400).is_empty(), "under the ceiling");
         // A list holds the only buffer: it goes regardless of the ceiling.
         assert!(to_ceiling(&[(1, 400, true)], 400, 0).is_empty(), "held");
+    }
+}
+
+#[cfg(test)]
+mod unseen_tests {
+    use super::{UNSEEN_AGAIN, UNSEEN_MOVIE, reads_now, unseen_found, unseen_write};
+
+    /// Checks in a row, of which every `turn_of`-th is the texture's hash
+    /// turn; `changing` says the memory changes at every check where it is
+    /// read. Returns how many times the texture was read.
+    fn reads(turn_of: u64, changing: bool) -> u32 {
+        let mut state = 0;
+        let mut reads = 0;
+        for check in 0..80u64 {
+            let turn = check.is_multiple_of(turn_of);
+            let unwritten = true;
+            if !reads_now(unwritten, turn, state) {
+                continue;
+            }
+            reads += 1;
+            state = unseen_write(state, changing);
+        }
+        reads
+    }
+
+    /// A picture written at every frame where the guards cannot see it is
+    /// read at every check, not one in eight: without [`reads_now`]'s third
+    /// term it is read the 10 times its turn falls in 80 checks.
+    #[test]
+    fn a_picture_written_every_frame_is_read_at_every_check() {
+        assert!(!reads_now(true, false, 0), "its turn only");
+        assert!(reads_now(true, false, 1), "asked for by an unseen write");
+        assert!(reads_now(true, false, UNSEEN_MOVIE));
+        assert!(reads_now(true, true, 0), "its turn");
+        assert!(reads_now(false, false, 0), "the guards saw a write");
+        assert_eq!(reads(8, true), 80);
+        assert_eq!(reads(8, false), 10, "its turn only");
+    }
+
+    /// A texture that changes once (streamed in) is read at its next two
+    /// checks and then back at its turn only, and it is not announced.
+    #[test]
+    fn a_texture_written_once_costs_two_more_reads_and_no_line() {
+        let mut state = unseen_write(0, true);
+        assert_eq!(state, UNSEEN_AGAIN);
+        assert!(!unseen_found(0), "the first sighting says nothing");
+        let mut reads = 0;
+        for _ in 0..UNSEEN_AGAIN {
+            assert_ne!(state, 0, "read, not left to its turn");
+            reads += 1;
+            state = unseen_write(state, false);
+        }
+        assert_eq!((reads, state), (UNSEEN_AGAIN, 0), "back at its turn");
+    }
+
+    /// A movie's picture keeps its state while it changes, is announced
+    /// once, and thirty unchanged checks in a row leave it to its turn.
+    #[test]
+    fn a_texture_written_every_frame_is_hash_at_every_check_until_it_settles() {
+        let mut state = unseen_write(0, true);
+        assert_eq!(state, UNSEEN_AGAIN);
+        state = unseen_write(state, true);
+        assert_eq!(state, UNSEEN_MOVIE);
+        assert!(unseen_found(UNSEEN_AGAIN), "the movie is announced");
+        for _ in 0..100 {
+            assert_ne!(state, 0, "read at every check");
+            state = unseen_write(state, true);
+            assert_eq!(state, UNSEEN_MOVIE);
+            assert!(!unseen_found(UNSEEN_MOVIE), "announced once, not every frame");
+        }
+        for left in (0..UNSEEN_MOVIE).rev() {
+            state = unseen_write(state, false);
+            assert_eq!(state, left);
+        }
+        assert_eq!(state, 0);
     }
 }
