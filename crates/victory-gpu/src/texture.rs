@@ -1579,7 +1579,7 @@ mod subresource_len_tests {
         const TOTAL: u64 = 784;
         // The length the code took before the clamp, which is what the slice
         // used to claim: 1024 bytes of a 784-byte mapping.
-        let unclamped = ROW_PITCH * 4 * 1;
+        let unclamped = ROW_PITCH * 4;
         assert!(
             unclamped as u64 > TOTAL,
             "the unpadded last row makes pitch * rows * depth overrun"
