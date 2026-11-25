@@ -91,6 +91,10 @@ all agree on; anything else stays unfolded.
 
 ## Traps
 
+- `emit::hw_sgpr::on_entry` gives every hardware SGPR read on entry its own
+  verdict (the value, or a refusal naming it); the pixel stage's ordered-section
+  arguments read zero, so their section runs unordered. `lower.rs` is at its
+  size limit: verdicts belong there, not in it.
 - `emit::lower::take_needs` is thread-local state carried between programs.
 - `resource::Tracer::patched` models only a four-dword buffer `V#`, gated on
   `Role::Resource`; a patched image `T#` (eight dwords) or sampler `S#` is

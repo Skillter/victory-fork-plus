@@ -90,6 +90,7 @@ pub mod fit;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod hw_sgpr;
 mod lanes;
 mod lower;
 mod own_bits;
@@ -99,6 +100,8 @@ mod shader;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod sgpr_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -969,7 +972,12 @@ mod tests {
 
     /// The lowered program of a wave64 compute shader: `body`, then a store
     /// of v1 to a UAV.
-    fn cs_lower(body: &[u32]) -> crate::emit::lower::Lowered {
+    pub(super) fn cs_lower(body: &[u32]) -> crate::emit::lower::Lowered {
+        cs_try(body).expect("lower")
+    }
+
+    /// `cs_lower` as its error.
+    pub(super) fn cs_try(body: &[u32]) -> Result<crate::emit::lower::Lowered, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -1021,12 +1029,17 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .unwrap()
     }
 
     /// The lowered program of a pixel shader exporting v1 to `mrt0`, with no
     /// input attribute and `vgprs` VGPRs.
-    fn ps_lower(words: &[u32], vgprs: u16) -> crate::emit::lower::Lowered {
+    pub(super) fn ps_lower(words: &[u32], vgprs: u16) -> crate::emit::lower::Lowered {
+        ps_try(words, vgprs).expect("lower")
+    }
+
+    /// `ps_lower` as its error, with a program of `vgprs` and no user data:
+    /// the pixel stage's ordered-section arguments are its s0 and s1.
+    pub(super) fn ps_try(words: &[u32], vgprs: u16) -> Result<crate::emit::lower::Lowered, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1069,7 +1082,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .unwrap()
     }
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
     /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
@@ -1126,7 +1138,7 @@ mod tests {
     }
 
     /// Whether the program declares the function `name` (a `dx.op` name).
-    fn declares(l: &crate::emit::lower::Lowered, name: &str) -> bool {
+    pub(super) fn declares(l: &crate::emit::lower::Lowered, name: &str) -> bool {
         l.declared.iter().any(|n| n == name)
     }
 

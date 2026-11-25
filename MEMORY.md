@@ -538,6 +538,18 @@ and `PSV0`'s stage, thread group and bindings, then `cause=<what is provably
 invalid>` or `cause=no cause known (<what closes it>)`; the 04:21 run prints the
 latter, and no cause is known yet.
 
+- *(re-measured 25-11 23:52, `victory translate --validate --list` over
+  `shaders.rpf`)* 25,483 programs validate before the change below and 25,493
+  after, every other refusal count unchanged; the ten `emit: a hardware SGPR
+  input` ones were all RDNA2 POPS pixel programs. Their live entry SGPRs past
+  the user data are the ordered-section arguments (`s_bfe_u32 s1, s18,
+  0x0002001c` at 0x2d3c, `s_lshr_b32 s0, s18, 31` at 0x2d70 of
+  `PS_PedTexturedCutOutTint_Zero_8aeae56d`) and EXEC read as data
+  (`s_cselect_b64 s[0:1], exec, 0` at 0x2d90). `emit::hw_sgpr::on_entry` now
+  derives both: the arguments are zero (a host wave overlaps no other, so the
+  section runs unordered instead of waiting) and the mask is the ballot of every
+  lane.
+
 In the log a refusal appears as `shader does not translate; its pipelines'
 draws are dropped ... stage=... error=converter shader.dxil v1: GFX10 code at
 0x....`, a bounded rule in `crates/victory-shader/src/emit/lower.rs`.

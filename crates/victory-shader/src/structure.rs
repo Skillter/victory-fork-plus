@@ -453,6 +453,15 @@ impl Structured {
         }
         .copied()
     }
+
+    /// Whether mask value `v` (either dword) holds every lane: as a number it
+    /// is the ballot of them all.
+    pub fn every_lane(&self, v: Value) -> bool {
+        self.masks
+            .get(&v)
+            .or_else(|| self.highs.get(&v).and_then(|lo| self.masks.get(lo)))
+            == Some(&Bool::TRUE)
+    }
 }
 
 /// Builds the per-lane form of `program`.

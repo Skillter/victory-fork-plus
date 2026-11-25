@@ -1820,19 +1820,10 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
-                    // Above the SGPRs the hardware initializes, a register
-                    // holds what the last wave left, so no program depends
-                    // on it: a read the paths only seem to allow (a branch
-                    // past the write, taken only with one past the read)
-                    // reads zero, as VGPRs do.
-                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
-                        Val::I32(self.s.m.i32(0))
-                    }
-                    // A scalar parked in a VGPR lane (`ir::unspill`), read where the
-                    // paths only seem to allow it before any save: the lane of a VGPR
-                    // nobody wrote, and VGPRs nobody set read as zero.
-                    None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
-                    None => Val::Missing("a hardware SGPR input"),
+                    None => match super::hw_sgpr::on_entry(n, self.x) {
+                        None => Val::I32(self.s.m.i32(0)),
+                        Some(what) => Val::Missing(what),
+                    },
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
@@ -2007,8 +1998,12 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        // A mask of every lane is its number: their ballot. Any other is
+        // a number only in uses that mean the same on any wave (`mask_ok`).
         match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
+            Some(&Val::Missing(_)) | None
+                if is_mask && (self.mask_ok || self.x.st.every_lane(v)) =>
+            {
                 return self.mask_dword(v).map(Val::I32);
             }
             Some(&Val::Missing(w)) => return Err(w),
@@ -2700,6 +2695,7 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, b, self.s.t.i32))
             }
             Operand::Const(254) => Err("the special operand m0"),
+            Operand::Const(239) => Ok(self.s.m.i32(0)), // see `hw_sgpr`
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
