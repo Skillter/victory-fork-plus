@@ -315,6 +315,18 @@ followed keeps the declared maxima, which is the `shortcut:` still in
 `emit::lower::mesh_prologue` for it. `VICTORY_MESH_COUNTS=max` restores the
 maxima, `=zero` promises nothing.
 
+A mesh primitive word is bit-packed the way the console compiler reads it
+back: three 10-bit indices at bits 0, 10 and 20, `0x80000000` (bit 31) for a
+cull. Census of `shaders.rpf` alone (26,503 containers, 614 of them
+duplicates, 9,282 mesh sections, 18,564 `exp prim`): 1,435 sites build the
+word with shifts 10 and 20, none with 9 or 18, none mentions `0x1FF` within
+50 instructions. The title's own bounds cull is `v_bfe_u32 v1, v13, 10, 10`,
+`v_bfe_u32 v2, v13, 20, 10`, `v_and_b32 v3, lit(0x000003ff), v13`, compared
+against the declared vertices and applied as `v_cndmask_b32 v1, v13,
+lit(0x80000000)`: bits 9, 19 and 29 are index bits, not edge flags. The
+archive holds 32,645 ten-bit `v_bfe_u32` reads and 55 nine-bit ones, none of
+them next to an `exp prim`.
+
 The size of the promise is not what the frame pays; the caps above say so, and
 so does promising nothing. Last ten frames of three runs minutes apart
 (`run-20261125-125520` `zero`, `-131331` `max`, `-132005` `own`), `on the GPU`

@@ -30,6 +30,14 @@ pub(super) mod intersect;
 
 pub(super) type Why = &'static str;
 
+/// A mesh program's primitive word: three 10-bit vertex indices at bits 0,
+/// 10 and 20. The console's compiler reads the same fields back at its own
+/// bounds cull (`v_bfe_u32 w, 10, 10`, `v_bfe_u32 w, 20, 10`, `v_and_b32
+/// 0x3FF`), so bits 9, 19 and 29 are index bits, not edge flags; a word with
+/// bit 31 set is the null primitive it writes as `0x80000000`.
+const PRIM_INDEX_SHIFT: [u32; 3] = [0, 10, 20];
+const PRIM_INDEX_MASK: u32 = 0x3FF;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -10536,8 +10544,9 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it: the
+    /// console's compiler writes `0x80000000` there for a primitive it does
+    /// not emit (all indices 0, no area).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -10570,7 +10579,8 @@ impl<'a> Lower<'a> {
         });
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let shift = self.s.m.i32(PRIM_INDEX_SHIFT[k]);
+            let mask = self.s.m.i32(PRIM_INDEX_MASK);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -10952,6 +10962,33 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The mesh primitive word the console's compiler writes: index 0, index
+    /// 1 `<< 10` and index 2 `<< 20` ORed together, `0x80000000` for a
+    /// primitive it culls. A 9-bit field with an edge flag at bit 9 would
+    /// make every primitive with that bit set name a vertex 512 too high.
+    #[test]
+    fn a_primitive_word_is_three_ten_bit_indices() {
+        use super::{PRIM_INDEX_MASK, PRIM_INDEX_SHIFT};
+        let indices = |w: u32| [0, 1, 2].map(|k| w >> PRIM_INDEX_SHIFT[k] & PRIM_INDEX_MASK);
+        let word = 5 | (71 << 10);
+        assert_eq!(indices(word), [5, 71, 0]);
+        assert_eq!(
+            indices(7 | (128 << 10) | (1023 << 20)),
+            [7, 128, 1023],
+            "the widest index a 10-bit field holds"
+        );
+        assert_eq!(
+            indices(word | (1 << 9)),
+            [517, 71, 0],
+            "bit 9 is index 0's own bit 9, so 5 becomes 517, past the declared 128"
+        );
+        assert_eq!(
+            indices(0x8000_0000),
+            [0, 0, 0],
+            "the null primitive is bit 31 with every index 0"
+        );
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
