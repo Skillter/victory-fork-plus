@@ -1109,6 +1109,8 @@ fn create() -> windows::core::Result<Host> {
         // `VICTORY_SHADING_RATE`, and what this device makes of it, before a
         // list exists to carry it.
         let shading = shading_rate(&device);
+        #[cfg(feature = "diagnostics")]
+        crate::gpusplit::announce();
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -2871,28 +2873,85 @@ pub(crate) fn late() -> bool {
 }
 
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
-fn late_stage() -> u8 {
+pub(crate) fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
-            return 0;
-        }
-        // Split timings are read after each submission's wait: a submission
-        // sent ahead has none yet, and the card's clock would then hold two
-        // lists' segments at once.
+        // Whether the per-group split is on is passed in and not consulted:
+        // see `late_stage_of` and the test that says so.
         #[cfg(feature = "diagnostics")]
-        if crate::gpusplit::on() {
-            return 0;
-        }
-        match std::env::var("VICTORY_LATE_WAIT").as_deref() {
-            Ok("1") => 1,
-            Ok("2") => 2,
-            Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
-        }
+        let split = crate::gpusplit::on();
+        #[cfg(not(feature = "diagnostics"))]
+        let split = false;
+        late_stage_of(
+            std::env::var_os("VICTORY_GPU_TIMING").is_some(),
+            split,
+            std::env::var("VICTORY_LATE_WAIT").ok().as_deref(),
+            crate::shadow::relay(),
+        )
     })
+}
+
+/// [`late_stage`] as a function of what it reads, so that what it must *not*
+/// read can be asserted (`the_split_does_not_stand_the_stage_still`).
+///
+/// `timing` (`VICTORY_GPU_TIMING`) is the one switch that stands the stage
+/// still: it reads a list's stamps and notes once that list's own wait has
+/// ended, and a submission sent ahead has no wait of its own yet.
+///
+/// `split` (`crate::gpusplit`) is not such a switch. Its segments are
+/// queries recorded into the list, resolved at the list's close and read
+/// when the submission that carried them has run
+/// (`crate::gpusplit::harvest`, called where a list's read-backs are, so a
+/// submission sent ahead is timed at its landing). It forced stage 0 once,
+/// to have a wait before every read: the intro and loading frames then came
+/// out white, because stage 0 is not only a wait — the relay's landings,
+/// the compare of copies in the card's memory and the present of a flight
+/// all go with it. A number taken on that order describes a submission
+/// order the title does not use.
+fn late_stage_of(timing: bool, split: bool, late_wait: Option<&str>, relay: bool) -> u8 {
+    let _ = split;
+    if timing {
+        return 0;
+    }
+    match late_wait {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        // The relay alone: on top of stage 3.
+        None if relay => 3,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::late_stage_of;
+
+    /// The per-group split adds a query to a list; it does not choose how
+    /// that list is submitted. It forced stage 0 once (`if
+    /// crate::gpusplit::on() { return 0 }` in `late_stage`), and the intro
+    /// and loading frames came out white: stage 0 takes the relay's
+    /// landings, the compare of copies in the card's memory and the present
+    /// of a flight with it. Every case here is a run whose picture was
+    /// right, and the split must leave each of them where it was.
+    #[test]
+    fn the_split_does_not_stand_the_stage_still() {
+        // The default: the relay alone, so stage 3, split on or off.
+        assert_eq!(late_stage_of(false, false, None, true), 3);
+        assert_eq!(late_stage_of(false, true, None, true), 3);
+        // A pinned stage stays pinned.
+        for (wait, stage) in [("1", 1), ("2", 2), ("3", 3)] {
+            assert_eq!(late_stage_of(false, true, Some(wait), true), stage, "VICTORY_LATE_WAIT={wait}");
+        }
+        // No relay and no pin: off, with the split on as with it off (it
+        // must not invent a stage either).
+        assert_eq!(late_stage_of(false, false, None, false), 0);
+        assert_eq!(late_stage_of(false, true, None, false), 0);
+        // The timing run is the one switch that stands the stage still: it
+        // reads a list's stamps once that list's own wait has ended.
+        assert_eq!(late_stage_of(true, false, Some("3"), true), 0);
+        assert_eq!(late_stage_of(true, true, None, true), 0);
+    }
 }
 
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
@@ -5888,6 +5947,10 @@ impl Host {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
+                        // The group's stamps with them: the card has run
+                        // the list, which is all they waited for.
+                        #[cfg(feature = "diagnostics")]
+                        self.harvest_split(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -6185,6 +6248,25 @@ impl Host {
         number
     }
 
+    /// The list's per-group segments (`crate::gpusplit`), read now that the
+    /// card has run it: one query a group was recorded into the list and
+    /// resolved at its close, so the stamps are complete once the list has
+    /// run and gone from the read-back buffer only when the list is
+    /// recorded into again (`HostList::reset`). Called where a list's
+    /// read-backs are: after a submission's own wait, or at its landing
+    /// with [`late`] (`VICTORY_LATE_WAIT`, the relay) — never before the
+    /// card has run it, which is what a stage forced still used to buy and
+    /// did not need to.
+    #[cfg(feature = "diagnostics")]
+    fn harvest_split(&self, list: &HostList) {
+        if !crate::gpusplit::on() {
+            return;
+        }
+        // SAFETY: a plain query on a live queue.
+        let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(100_000_000);
+        crate::gpusplit::harvest(list, frequency);
+    }
+
     /// Waits for the card to run every flight in the air ([`late`]) and
     /// does what they left to do, as [`Host::execute`] does for one
     /// submission after its wait: the pieces their shaders wrote in copies
@@ -6324,6 +6406,10 @@ impl Host {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
+                            // The group's stamps with them: the card has
+                            // run the list, which is all they waited for.
+                            #[cfg(feature = "diagnostics")]
+                            self.harvest_split(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -6544,11 +6630,13 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`, or
-        // `VICTORY_GPU_SPLIT`, whose segments are read back after each
-        // group's wait).
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`,
+        // which reads a list's stamps and notes after that list's own wait).
+        // The per-group split does not ask for that: its queries are in the
+        // lists as they were recorded, so the submission's order is the one
+        // without the switch and they are read once it has run.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() || crate::gpusplit::on() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -6585,14 +6673,6 @@ impl Host {
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
-            if crate::gpusplit::on()
-                && let Some(run) = runs.get(i)
-            {
-                // SAFETY: a plain query on a live queue.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(100_000_000);
-                crate::gpusplit::harvest(run, frequency);
-            }
-            #[cfg(feature = "diagnostics")]
             if timing() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
@@ -6614,6 +6694,15 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        // The per-group segments (`VICTORY_GPU_SPLIT`), now that every list
+        // of this submission has run: a query a group was recorded into the
+        // list, and it takes nothing but the list's own run to read it. The
+        // lists went to the card as one submission, as they do without the
+        // switch, so the segments price the order the title really uses.
+        #[cfg(feature = "diagnostics")]
+        for &run in runs {
+            self.harvest_split(run);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
