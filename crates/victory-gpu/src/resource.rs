@@ -1404,17 +1404,60 @@ const PROBATION: u8 = 1;
 /// [`ADMIT_FRAMES`], so the world is showing it.
 const PROTECTED: u8 = 2;
 
+/// Frames a protected host copy may go unsampled before its protection
+/// lapses ([`protected_at`], [`admit_step`]): 600 frames is 10 s at 60 fps.
+///
+/// A second sample inside [`ADMIT_FRAMES`] protects a copy and `hits` then
+/// saturates, so every later sample answered `PROTECTED` again and nothing
+/// ever gave the protection back: in a long session the set of every texture
+/// ever shown twice filled the budget, `room` then answered `NoRoom` for the
+/// rest of the run and the card could only refuse. Ten seconds is longer
+/// than a scene, a cutscene or a menu lasts, so a texture the world keeps
+/// showing is sampled inside it and stays protected, while the memory of one
+/// scene lapses; it is also far longer than the idle window a sweep waits
+/// out (`IDLE_FRAMES`, `vram_idle_ms`), so a lapsed copy is takeable at once.
+const PROTECTED_FRAMES: u64 = 600;
+
+/// Whether a copy protected by [`admit_step`] still is at `frame`, the frame
+/// last sampled: protection holds while the texture keeps being sampled
+/// inside [`PROTECTED_FRAMES`]. Read where protection is asked
+/// ([`let_go_idle`], [`slot_only_idle`], [`let_go_for_room`],
+/// [`reclaimable_bytes`], [`admission`]) rather than stored, so that a
+/// texture nothing samples again lapses without a sample of its own.
+pub(crate) fn protected_at(admit: u8, last: u64, frame: u64) -> bool {
+    admit == PROTECTED && frame.saturating_sub(last) <= PROTECTED_FRAMES
+}
+
+/// Whether `r`'s host copy is protected from the sweep now: the state
+/// [`note_sampled`] last stored and the frame it counted, read against the
+/// frame running ([`protected_at`]), so that a copy nothing samples again
+/// lapses without a sample of its own.
+#[cfg(windows)]
+fn protected_now(r: &Resource) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    protected_at(
+        r.host.admit.load(Relaxed),
+        r.host.last.load(Relaxed),
+        crate::frame::current(),
+    )
+}
+
 /// The state [`admit_step`] leaves after a frame `frame` sampled the
 /// texture, from the hits it had and the first and last frames counted:
 /// `hits` (saturating), the first frame of the window, and the admission
 /// ([`PROBATION`] or [`PROTECTED`]). A frame that samples it twice counts
 /// once; a first sample puts it on probation; a second inside
 /// [`ADMIT_FRAMES`] of the first protects it; a second too late starts the
-/// window again.
+/// window again; and a sample after more than [`PROTECTED_FRAMES`] of none
+/// starts the window again too, so that one sample does not protect a
+/// texture the run stopped showing (protection lapses, [`protected_at`]).
 ///
 /// Frequency, not just recency: without this the sweep let a whole world
 /// set go to make room for streaming pages nothing showed twice.
 pub(crate) fn admit_step(hits: u8, first: u64, last: u64, frame: u64) -> (u8, u64, u8) {
+    if hits > 0 && frame.saturating_sub(last) > PROTECTED_FRAMES {
+        return (1, frame, PROBATION);
+    }
     if hits > 0 && frame == last {
         return (hits, first, if hits >= PROTECTED { PROTECTED } else { PROBATION });
     }
@@ -1645,7 +1688,7 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             // A texture the world samples again and again is not swept to
             // make room for streaming pages nothing shows twice.
-            let protected = r.host.admit.load(Relaxed) == PROTECTED;
+            let protected = protected_now(r);
             let take = made.as_ref().is_some_and(|(host, _)| {
                 sweepable(
                     crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
@@ -1689,8 +1732,12 @@ pub(crate) fn let_go_idle() {
 /// A shader sampled title texture `this` this frame (`draw.rs` `readable`):
 /// counts the hit once per frame and promotes a texture seen again within
 /// [`ADMIT_FRAMES`] from probation to protected, so the sweep leaves it
-/// ([`let_go_idle`]). Buffers and host-written copies are not counted: the
-/// title's memory is not their source.
+/// ([`let_go_idle`]); a copy nothing samples for [`PROTECTED_FRAMES`] lapses
+/// ([`protected_at`]). Buffers are not counted: a texture's copy is what the
+/// sweep manages. A copy the host wrote is counted here too, because this
+/// runs on the draw path and may not take the lock that says the host wrote
+/// it; no sweep takes such a copy and the admission line leaves it out
+/// ([`admission`]).
 #[cfg(windows)]
 pub(crate) fn note_sampled(this: This) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1698,9 +1745,8 @@ pub(crate) fn note_sampled(this: This) {
         return;
     }
     let r = resource(this);
-    // Buffers only: a texture's copy is what the sweep manages. Every frame
-    // this runs for every sampled texture, so it takes no lock (the
-    // host-written set is a mutex) and only touches the two atomics.
+    // Every frame this runs for every sampled texture, so it takes no lock
+    // (the host-written set is a mutex) and only touches the atomics.
     if !fills(&r.desc) {
         return;
     }
@@ -1736,7 +1782,7 @@ pub(crate) fn slot_only_idle(this: This) -> bool {
         return false;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    let protected = r.host.admit.load(Relaxed) == PROTECTED;
+    let protected = protected_now(r);
     let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     made.as_ref().is_some_and(|(host, _)| {
         reclaimable_slot(
@@ -1763,7 +1809,7 @@ pub(crate) fn let_go_for_room(this: This) -> Option<u64> {
         return None;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    let protected = r.host.admit.load(Relaxed) == PROTECTED;
+    let protected = protected_now(r);
     let gone = {
         let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         let take = made.as_ref().is_some_and(|(host, _)| {
@@ -1808,7 +1854,7 @@ fn reclaimable_bytes() -> u64 {
             continue;
         }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-        let protected = r.host.admit.load(Relaxed) == PROTECTED;
+        let protected = protected_now(r);
         if let Some((host, _)) = made.as_ref()
             && sweepable(
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
@@ -1826,9 +1872,16 @@ fn reclaimable_bytes() -> u64 {
 /// For the admission line: host copies of textures the title fills that are
 /// protected from the sweep and on probation, and their bytes
 /// (`[protected, protected bytes, probation, probation bytes]`).
+///
+/// A copy the host wrote is in no figure: a render target or a depth texture
+/// sampled by a later pass is held by the slots and lists that name it, not
+/// by the sweep, and counting it here put the card memory the targets take on
+/// the streaming texture queue's line. Asked here, not in [`note_sampled`]:
+/// this walk may lock, the draw path may not.
 #[cfg(windows)]
 pub(crate) fn admission() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::frame::current();
     let mut out = [0u64; 4];
     let all = textures();
     for &at in all.iter() {
@@ -1838,14 +1891,27 @@ pub(crate) fn admission() -> [u64; 4] {
         if admit == 0 {
             continue;
         }
+        let Some(slot) = admission_slot(
+            fills(&r.desc),
+            crate::texture::host_wrote(at),
+            protected_at(admit, r.host.last.load(Relaxed), frame),
+        ) else {
+            continue;
+        };
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref() {
-            let slot = if admit == PROTECTED { 0 } else { 2 };
             out[slot] += 1;
             out[slot + 1] += host.bytes;
         }
     }
     out
+}
+
+/// Which pair of figures of the admission line ([`admission`]) counts a host
+/// copy in: 0 when it is protected from the sweep, 2 when it is on probation,
+/// `None` when the line counts it in neither.
+fn admission_slot(fills: bool, host_wrote: bool, protected: bool) -> Option<usize> {
+    (fills && !host_wrote).then_some(if protected { 0 } else { 2 })
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -3921,6 +3987,65 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(admit_step(hits, first, 0, late), (1, late, PROBATION));
         // And the frame just inside the window would have protected it.
         assert_eq!(admit_step(1, 0, 0, ADMIT_FRAMES), (PROTECTED, 0, PROTECTED));
+    }
+
+    /// Protection lapses: a copy protected at frame 10 that nothing samples
+    /// again is on probation by frame 700, and the sweep may take it; one
+    /// sampled inside the window is still protected, and a single sample
+    /// after the lapse does not protect it again (a saturated `hits` alone
+    /// used to protect it forever, which filled the budget in a long run).
+    #[test]
+    fn protection_lapses_when_nothing_samples_the_copy() {
+        let (hits, first, admit) = admit_step(0, 0, 0, 10);
+        assert_eq!((hits, first, admit), (1, 10, PROBATION));
+        let (hits, first, admit) = admit_step(hits, first, 10, 12);
+        assert_eq!((hits, admit), (PROTECTED, PROTECTED), "sampled again: the world shows it");
+        // Read where the sweep asks: inside the window it holds.
+        assert!(protected_at(admit, 12, 12 + PROTECTED_FRAMES));
+        assert!(!sweepable(true, 1, 1, protected_at(admit, 12, 12 + PROTECTED_FRAMES)));
+        // 688 frames on, nothing has sampled it: the sweep may take it.
+        let at = 700;
+        let protected = protected_at(admit, 12, at);
+        assert!(!protected, "a copy nothing sampled for 688 frames is still protected");
+        assert!(sweepable(true, 1, 1, protected), "the sweep cannot take a lapsed copy");
+        assert!(reclaimable_slot(true, 1, 2, protected), "reclaim cannot take a lapsed copy");
+        // Sampled once after the lapse: the window starts again, so one
+        // sample does not re-protect a texture the run has not shown for
+        // ten seconds.
+        assert_eq!(admit_step(hits, first, 12, at), (1, at, PROBATION));
+        // And a texture the world keeps showing never lapses: every frame
+        // inside the window keeps it protected and saturated.
+        let (mut h, mut l) = (hits, 12);
+        for frame in 13..1_000 {
+            let (nh, _, na) = admit_step(h, first, l, frame);
+            assert_eq!(na, PROTECTED, "frame {frame}");
+            (h, l) = (nh, frame);
+        }
+        assert_eq!(h, ADMIT_SATURATED);
+    }
+
+    /// The admission line counts the copies the sweep could ever take: a
+    /// texture the title fills, which the host never wrote. A render target
+    /// or a depth texture sampled by a later pass is held by the slots and
+    /// lists that name it, not by the sweep: it is in no figure of the line,
+    /// whatever the frames did to its admission state.
+    #[test]
+    fn the_admission_line_counts_no_copy_the_host_wrote() {
+        // Sampled twice, then left alone: the state it is in does not put it
+        // in the line.
+        let (hits, first, _) = admit_step(0, 0, 0, 10);
+        let (hits, first, admit) = admit_step(hits, first, 10, 11);
+        assert_eq!((hits, first, admit), (PROTECTED, 10, PROTECTED));
+        assert_eq!(admission_slot(true, true, protected_at(admit, 11, 12)), None);
+        assert_eq!(
+            admission_slot(true, true, protected_at(admit, 11, 11 + PROTECTED_FRAMES + 1)),
+            None
+        );
+        // A buffer is not a texture the title fills.
+        assert_eq!(admission_slot(false, false, true), None);
+        // The two splits of the line, for the copies the sweep manages.
+        assert_eq!(admission_slot(true, false, true), Some(0));
+        assert_eq!(admission_slot(true, false, false), Some(2));
     }
 
     /// A copy a descriptor slot shows is not swept (its reference is 2, not
