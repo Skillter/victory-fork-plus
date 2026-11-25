@@ -640,12 +640,16 @@ mod tests {
         assert!(LoadLibraryW(w("wininet.dll").as_ptr()).is_null());
         assert!(LoadLibraryA(c"C:\\Windows\\System32\\urlmon".as_ptr().cast()).is_null());
         assert!(GetModuleHandleW(w("WININET.DLL").as_ptr()).is_null());
+        // The host has this one too: the policy, not the file, refuses it.
+        assert!(LoadLibraryW(w("userenv.dll").as_ptr()).is_null());
         assert_eq!(
             // SAFETY: reads this thread's last error.
             unsafe { windows_sys::Win32::Foundation::GetLastError() },
             ERROR_MOD_NOT_FOUND
         );
         assert!(!LoadLibraryW(w("kernel32").as_ptr()).is_null());
+        // The RPC runtime the title loads by name: the host's System32 copy.
+        assert!(!LoadLibraryW(w("rpcrt4.dll").as_ptr()).is_null());
         // By ordinal too (ws2_32 #4 is `connect`).
         let ws2 = LoadLibraryW(w("ws2_32.dll").as_ptr());
         assert_eq!(

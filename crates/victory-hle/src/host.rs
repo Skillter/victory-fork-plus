@@ -42,7 +42,18 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // COM's data types (BSTR, VARIANT, IDispatch): the console's
+            // `oleaut32.dll` is the same DLL, and marshalling has no console
+            // meaning of its own.
+            "oleaut32.dll",
+            // The RPC runtime behind COM's local calls. The console ships it
+            // too and the title loads it by name; only the host's System32
+            // copy is ever used (see `imp::module`).
+            "rpcrt4.dll",
             "advapi32.dll",
+            // The shared body behind `api-ms-win-security-*` and
+            // `advapi32.dll`, both allowed above: same DLL on the console.
+            "sechost.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",
@@ -52,6 +63,10 @@ impl Default for HostPolicy {
             "mfplat.dll",
             "mfreadwrite.dll",
         ];
+        // Not allowed on purpose: `userenv.dll` (console code has no host user
+        // profile; saved data comes from `storage`), `kernel.appcore.dll` and
+        // `api-ms-win-appmodel-*` (package identity is `xpackage`'s),
+        // `winmm.dll`/`dsound.dll` (timers and audio devices differ here).
         HostPolicy {
             allow: allow.iter().map(|s| s.to_string()).collect(),
         }
@@ -144,5 +159,44 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostPolicy;
+
+    #[test]
+    fn shared_system_dlls_pass_through() {
+        let policy = HostPolicy::default();
+        assert!(policy.allows("rpcrt4.dll"));
+        // Compared lower-case, as the host cache keys it and the loader does.
+        assert!(policy.allows("RPCRT4.DLL"));
+        assert!(policy.allows("sechost.dll"));
+        assert!(policy.allows("oleaut32.dll"));
+        assert!(policy.allows("api-ms-win-security-base-l1-1-0.dll"));
+        // Console-only DLLs never do.
+        assert!(!policy.allows("xmem.dll"));
+        assert!(!HostPolicy::none().allows("rpcrt4.dll"));
+    }
+
+    #[test]
+    fn console_specific_dlls_stay_refused() {
+        let policy = HostPolicy::default();
+        for dll in [
+            // Host user profile: ours is the `storage` mount.
+            "userenv.dll",
+            // Package identity: ours is `xpackage`.
+            "kernel.appcore.dll",
+            "api-ms-win-appmodel-runtime-l1-1-0.dll",
+            // Timers and audio devices differ on the console.
+            "winmm.dll",
+            "dsound.dll",
+            // Refused by name in `modules::kernel::find_module`.
+            "wininet.dll",
+            "urlmon.dll",
+        ] {
+            assert!(!policy.allows(dll), "{dll} is allowed through");
+        }
     }
 }
