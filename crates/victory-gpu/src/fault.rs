@@ -61,13 +61,17 @@ enum C {
     /// were not in memory before the read.
     SampledBytes,
     SampledAbsent,
-    /// Pages the working-set question was asked about, and how many of them
-    /// it found outside the working set: each of those is a byte read through
-    /// the kernel, and a page fault with it.
+    /// Pages the committed question covered, and how many of them the
+    /// kernel called not committed: what a copy or a detiling left alone
+    /// because the memory is not there yet.
     Asked,
-    Absent,
+    Outside,
+    /// Calls of `VirtualQuery` the question cost, and the pages it answered
+    /// from the runs it had already been given.
+    Queries,
+    Known,
 }
-const COUNTERS: usize = 15;
+const COUNTERS: usize = 17;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 fn add(c: C, n: u64) {
@@ -79,14 +83,21 @@ fn load(c: C) -> u64 {
 }
 
 /// One question put to the kernel about `pages` pages
-/// ([`crate::texture::committed`]), and one page of them found outside the
-/// working set, which is a byte read through the kernel and a fault with it.
-pub(crate) fn asked(pages: usize) {
-    add(C::Asked, pages as u64);
+/// ([`crate::texture::committed`]): `outside` of them were not committed,
+/// `calls` questions of the kernel it took, and `known` pages of the span
+/// were answered from the runs it had already given.
+pub(crate) fn question(pages: u64, outside: u64, calls: u64, known: u64) {
+    add(C::Asked, pages);
+    add(C::Outside, outside);
+    add(C::Queries, calls);
+    add(C::Known, known);
 }
 
-pub(crate) fn absent() {
-    add(C::Absent, 1);
+/// The kernel calls the committed question has cost so far, for the test
+/// that a run is asked about once.
+#[cfg(test)]
+pub(crate) fn kernel_questions() -> u64 {
+    load(C::Queries)
 }
 
 /// Whether this big copy is one of the sampled ones.
@@ -282,7 +293,9 @@ struct Seen {
     sampled_bytes: u64,
     sampled_absent: u64,
     asked: u64,
-    absent: u64,
+    outside: u64,
+    outside_calls: u64,
+    outside_known: u64,
     faults: u64,
 }
 
@@ -303,7 +316,9 @@ impl Seen {
             sampled_bytes: load(C::SampledBytes),
             sampled_absent: load(C::SampledAbsent),
             asked: load(C::Asked),
-            absent: load(C::Absent),
+            outside: load(C::Outside),
+            outside_calls: load(C::Queries),
+            outside_known: load(C::Known),
             faults,
         }
     }
@@ -326,7 +341,9 @@ impl Seen {
             sampled_bytes: d(self.sampled_bytes, before.sampled_bytes),
             sampled_absent: d(self.sampled_absent, before.sampled_absent),
             asked: d(self.asked, before.asked),
-            absent: d(self.absent, before.absent),
+            outside: d(self.outside, before.outside),
+            outside_calls: d(self.outside_calls, before.outside_calls),
+            outside_known: d(self.outside_known, before.outside_known),
             faults: d(self.faults, before.faults),
         }
     }
@@ -369,8 +386,9 @@ pub(crate) fn line(window: Duration, back: [u64; 2]) {
          copies sampled, in memory before the read: source {:.0}%, destination {:.0}%, after it \
          source {:.0}%, destination {:.0}% (of {:.1} MB copied in copies of {} KB and more, {:.0}% \
          of the source bytes were not in memory: {:.1} MB, {:.1} MB/s at best from the pagefile); \
-         the working-set question asked about {:.0} pages, {:.0} of them outside the working set ({} \
-         one-byte reads through the kernel, a fault apiece)",
+         the committed question asked about {:.0} pages, {:.0} of them the kernel called not \
+         committed, in {:.0} calls of VirtualQuery ({:.0} pages answered from the runs it already \
+         held)",
         rate(w.bytes, w.us),
         mb(w.bytes),
         w.us as f64 / 1e3,
@@ -396,8 +414,9 @@ pub(crate) fn line(window: Duration, back: [u64; 2]) {
         mb(w.sampled_absent),
         mb(w.sampled_absent) / secs,
         w.asked as f64,
-        w.absent as f64,
-        w.absent,
+        w.outside as f64,
+        w.outside_calls as f64,
+        w.outside_known as f64,
     );
 }
 
@@ -456,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn the_working_set_question_is_counted_page_by_page() {
+    fn the_committed_question_is_counted_page_by_page() {
         let before = load(C::Asked);
         let buffer = vec![0u8; 8 << 10];
         assert!(crate::texture::committed(buffer.as_ptr(), buffer.len()));

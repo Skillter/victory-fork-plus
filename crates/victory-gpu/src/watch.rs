@@ -1036,6 +1036,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Answers of the registry of host copies are answers by address, and
     // what an address holds is new (`crate::shadow::revision`).
     crate::shadow::changed();
+    // So are the kernel's answers about which of it is committed
+    // (`crate::texture::committed`, which holds them under one lock with
+    // the question it asks).
+    crate::texture::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
