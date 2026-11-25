@@ -37,7 +37,8 @@ riskier widening retry; `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` let
 
 Pass bits are `DEAD | FOLD | REUSE | FACTS | LOADS | FIRST` in
 `emit::bitcode::opt`; `VICTORY_SHADER_OPT` (read in `emit`) selects them.
-Floating-point arithmetic is deliberately never folded.
+Floating-point folds return only bits that nearest, up, down and toward-zero
+all agree on; anything else stays unfolded.
 
 ## Tests
 
