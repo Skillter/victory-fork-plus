@@ -33,6 +33,10 @@
 - Host heaps mirror the title's slots and are re-made when a slot is written.
 - Per-draw tables come from the dynamic ring in `descriptor::host`; a request
   that cannot fit must be refused, never served from unbuilt slots.
+- A command list bumps through a run it holds (`DynamicList`), given back whole
+  at submission; the ring is never walked per table.
+- Root arguments are cached per list (`draw::RootArgs`) and re-issued only when
+  the resolved value changes; a root-signature change or a new list drops them.
 - The capped heap points past-the-end reads at a null slot for a reason: a
   real read past the heap end hung an NVIDIA GPU.
 
