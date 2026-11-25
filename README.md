@@ -186,7 +186,7 @@ Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above). `victory run` also writes the same log to
 `<data-dir>\logs\run-<YYYYMMDD>-<HHMMSS>.log` (UTC, one file per run, so a run
 never overwrites the last one and a run that outlives its terminal still leaves
-a record). `VICTORY_LOG_FILE=<path>` puts that file somewhere else;
+a record; the newest 20 are kept). `VICTORY_LOG_FILE=<path>` puts that file somewhere else;
 `VICTORY_LOG_FILE=0` keeps the log on stderr only.
 
 ## Debugging

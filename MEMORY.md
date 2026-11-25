@@ -143,7 +143,8 @@ Log destination. `VICTORY_LOG_FILE=<path>` writes the log to that file in
 addition to stderr. `VICTORY_LOG_FILE=0` (or `off`) disables the file copy, so
 the log is stderr only. When the variable is unset, `victory run` logs to
 `<data-dir>/logs/run-<YYYYMMDD>-<HHMMSS>.log` (UTC, one file per run, so no
-run overwrites another), and every other command logs to stderr only. If the data directory cannot hold the file (asset
+run overwrites another; the newest 20 are kept and older ones are removed at
+start-up), and every other command logs to stderr only. If the data directory cannot hold the file (asset
 policy, permissions), the run falls back to stderr instead of refusing to
 start. A capture that must survive a closed window is therefore
 `VICTORY_LOG_FILE=<path> target\release\victory.exe run ...`; a relative value
