@@ -77,6 +77,15 @@ impl Target {
     pub(crate) fn this(&self) -> This {
         self.key as This
     }
+
+    /// One target, named for a log line: the texture, its shape, and whether a
+    /// shader read it.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{:#x} {}x{} format={} flags={:#x} sampled={}",
+            self.key, self.width, self.height, self.format, self.flags, self.sampled
+        )
+    }
 }
 
 /// What the operations since the last present named, for one present.
