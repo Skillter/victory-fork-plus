@@ -1,49 +1,56 @@
-Written for: future-us returning to this tree. Everything measured on
-2026-11-24 on Windows 10 19045 / AMD RX 6800 XT (gfx1030, driver 2.0.353),
-against `D:\gta6\GTA6.Xbox.v1.0.2.1-CYBERLEEK`.
+# Memory: running and debugging this fork
 
-**Read §1 first. If the game no longer starts at all, §2 is the answer.**
+Handoff notes for maintainers returning to this tree. Measurements were taken
+on the reference rig (Windows 10 19045, AMD RX 6800 XT gfx1030, driver
+2.0.353) at 4K unless stated; other hardware will differ. The preparation in
+§2 is what makes the world render at all on Windows 10. Windows 11 already
+ships a new enough D3D12 core, so the redistributed one is optional there.
+
+Placeholders used below: `<repo>` is this checkout, `<game-folder>` is the
+title package (outside the repository, read-only by preference), `<data-dir>`
+is the configured data directory (`VICTORY_DATA_DIR` / `VICTORY_CACHE_DIR` or
+`victory.toml`; default `%LOCALAPPDATA%\victory`), and `<title-id>` is the
+package's title id from its manifest. Neither tree contains game data.
+
+**If the title no longer starts at all, §2 is the answer.**
 
 ---
 
-# 0. The two trees, and which one runs
+# 0. This tree and upstream
 
-| Tree | What it is | State |
-|---|---|---|
-| `D:\victory-fork-main` | **This tree.** A fork of upstream VIctory that fixes the world. | Boots, renders cutscenes and the world, ~2 fps at 4K |
-| `C:\Users\mojiko\Documents\VIctory-main` | Upstream VIctory | Menus only; the world submits and renders dark |
+This is a fork of upstream VIctory that fixes the world. Upstream boots the
+menus but its world submits, then renders dark. Work here; keep an upstream
+checkout only as a reference for what the fork changed (the fork keeps
+upstream's history).
 
-Both were patched for Windows 10 (§2). **Work here, not in upstream.** Upstream is
-useful only as a reference for what the fork changed (the fork keeps upstream's
-history).
+All derived state lives in `<data-dir>`:
 
-Neither tree contains game data. `D:\victory-data\` holds everything derived:
-`fork-cache\` (shader cache, pipeline library, mapped images),
-`data\7952987A\` (saves, settings, `crashes.log`), `agility\` (the unpacked
-Agility SDK), `capture\`, `world*\` (frame dumps from earlier sessions).
+    fork-cache/           shader cache, pipeline library, mapped images
+    data/<title-id>/      saves, settings, crashes.log
+    agility/              unpacked Agility SDK, if you keep one
+    capture/              captured frames
+    world*/               frame dumps from earlier sessions
 
-The game folder is **read-only** (set deliberately). Nothing should ever need to
-write there: the title sees the package as `G:` and its writable storage as
-`Z:`/`T:` over `D:\victory-data\data\7952987A\`.
+The game folder is read-only by preference. Nothing should ever need to write
+there: the title sees the package as `G:` and its writable storage as `Z:`/`T:`
+over `<data-dir>/data/<title-id>/`.
 
 ---
 
 # 1. Working configuration
 
-    cd D:\victory-fork-main
-    set PATH=%USERPROFILE%\.cargo\bin;%PATH%
+    cd <repo>
     cargo build --release -p victory
-
-    target\release\victory.exe run "D:\gta6\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe" --execute
+    target\release\victory.exe run "<game-folder>\game_scarlett_master.exe" --execute
 
 with `VICTORY_D3D12_BACKGROUND=0` set. That is the configuration that rendered
-the cutscenes and the world. Measured: **473 ms/frame (2.1 fps)**, of which
-**249 ms GPU**, 62 ms uploads (158 MB), 87 ms readback (74 MB), the rest
-preparation.
+the cutscenes and the world. Measured on the reference rig: **473 ms/frame
+(2.1 fps)**, of which **249 ms GPU**, 62 ms uploads (158 MB), 87 ms readback
+(74 MB), the rest preparation.
 
-`VICTORY_KEYS=12:Enter,16:Enter,...` drives the first-boot screens and the intro
-(diagnostics builds only — the key list is `#[cfg(feature = "diagnostics")]` in
-`crates/victory-hle/src/modules/gameinput.rs:1187`).
+`VICTORY_KEYS=12:Enter,16:Enter,...` drives the first-boot screens and the
+intro (diagnostics builds only; the key list is behind
+`feature = "diagnostics"` in `victory_hle::modules::gameinput`).
 
 ---
 
@@ -56,13 +63,13 @@ this title builds declares
     D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED  (0x400)
     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED      (0x800)
 
-(`crates/victory-gpu/src/pipeline/host.rs` ~line 819). The 12_1 core refuses
-them — `Unsupported bit-flag set (root signature flags c01)` — so no root
-signature serializes, no pipeline is created, and **every draw is dropped**.
-The game then runs at a clean 30 fps presenting an empty frame, which looks like
-a rendering bug and is not one.
+(root signature flags live in `victory_gpu::pipeline::host`). The 12_1 core
+refuses them — `Unsupported bit-flag set (root signature flags c01)` — so no
+root signature serializes, no pipeline is created, and **every draw is
+dropped**. The title then runs at a clean 30 fps presenting an empty frame,
+which looks like a rendering bug and is not one.
 
-Three changes fix it. Keep all three:
+Three changes fix it. Keep all three.
 
 **2a. Ship the Agility SDK beside the executable.** D3D12 Agility SDK 1.614.1
 runtime:
@@ -71,11 +78,12 @@ runtime:
     target\release\D3D12\d3d12SDKLayers.dll
 
 Source: NuGet `Microsoft.Direct3D.D3D12` 1.614.1,
-`build/native/bin/x64/`. Unpacked copy kept at `D:\victory-data\agility\`.
-**`cargo clean` deletes this folder and the game stops working.**
+`build/native/bin/x64/`. **`cargo clean` deletes this folder and the title
+stops working.** It is build output, so it is not committed; `VICTORY_D3D12_SDK`
+points the loader at a folder kept elsewhere.
 
-**2b. `crates/victory-gpu/src/host.rs`** — `d3d12_factory()` and `create_device()`,
-called before the device is created:
+**2b. `crates/victory-gpu/src/host.rs`** — `d3d12_factory()` and
+`create_device()`, called before the device is created:
 
     D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config)   // ID3D12SDKConfiguration1
     config.CreateDeviceFactory(AGILITY_SDK_VERSION = 614, "<exe dir>\\D3D12")
@@ -90,8 +98,8 @@ Two traps, both cost hours:
   new core but `d3d12.dll`'s own exports keep using the old one, so
   `D3D12SerializeVersionedRootSignature` still rejects 0xc01 and nothing changes.
 
-Then the device is created at `D3D_FEATURE_LEVEL_12_2` with a 12_0 fallback.
-(The fork still asks for 12_0 upstream; 12_2 is what the title needs.)
+Then the device is created at `D3D_FEATURE_LEVEL_12_2` with a 12_0 fallback
+(`HIGHEST_FEATURE_LEVEL` in `crates/victory-gpu/src/device.rs` is `0xc200`).
 
 **2c. `crates/victory-gpu/src/root.rs`** — the title serializes its own root
 signatures through the version-1.0 entry point, which refuses 0x400/0x800 even
@@ -108,13 +116,13 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 | Switch | Effect | Notes |
 |---|---|---|
 | `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off | **in the working config** |
-| `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable here**: 473 → 350 ms, then `device removed after 3 submissions sent ahead` (TDR) |
-| `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as RELAY; untested here, assume the same risk |
+| `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable**: 473 → 350 ms, then `device removed after 3 submissions sent ahead` (TDR) |
+| `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as `RELAY`; assume the same risk |
 | `VICTORY_WIDE_BACK=1` | snapshot compares spread across cores | safe; sold as part of the fast config |
 | `VICTORY_CARD_BUFFERS=0` | disables the card-side buffer shadow copies | **did not change the cutscene ghosting** |
 | `VICTORY_DISPLAY_MODE=WxH` | display size reported to the title | **useless for resolution**, see §5 |
 | `--console series-s` | title targets 1080p | **blackscreens**, see §5 |
-| `VICTORY_MESH_GROUPS=n` | caps mesh dispatch groups (upstream only, my patch) | default 65535; added while chasing the upstream TDR, not present here |
+| `VICTORY_MESH_GROUPS=n` | caps mesh dispatch groups | upstream tree only, not present here; default 65535; added while chasing the upstream TDR |
 | `VICTORY_SHADER_LOOP_LIMIT=n` | bounds translated loops | did not stop the upstream TDR |
 | `VICTORY_D3D12_DRED=1` | on device loss, name the faulting command | how the upstream TDR was identified |
 | `VICTORY_CAPTURE=<dir>` / `VICTORY_CAPTURE_FRAMES=` / `VICTORY_DUMP_TARGETS=1` | save presented frames / every render target | diagnostics builds only |
@@ -130,13 +138,14 @@ Diagnostics build (needed for capture, keys, WARP, GPU timing):
 
 # 4. What works, measured
 
-- Boot, first-boot screens, menus, start screen, profile, saves (`saves\0009000000000001\...`).
-- **In-engine cutscenes render**: characters, skin, hair, fabric, specular, sun
-  flares, floating motes, correct single-line subtitles. Frames captured to
-  `D:\victory-data\world\`.
-- **The world renders** with working controls, HUD, pause menu.
+- Boot, first-boot screens, menus, start screen, profile, saves
+  (`saves\0009000000000001\...`).
+- **In-engine cutscenes render**: characters, skin, hair, fabric, specular,
+  sun flares, floating motes, correct single-line subtitles. Frames were
+  captured to `<data-dir>/world/`.
+- **The world renders** with working controls, HUD and pause menu.
 - Pipeline library accumulates across sessions —
-  `fork-cache\pipelines\host-pipelines.bin` went 97 KB → 231 KB → 320 KB — so
+  `fork-cache/pipelines/host-pipelines.bin` went 97 KB → 231 KB → 320 KB — so
   each session drops fewer draws. `dropped N (0 being made)` means the backlog
   is drained; `M being made` means compilation is the limit that frame.
 - With the library warm: `dropped ~350-400 without a host pipeline (0 being made)`.
@@ -156,11 +165,11 @@ Split measured at 4K:
 The readback exists because the console has unified memory and the PC does not:
 compute shaders write buffers that the title's CPU code then reads, so VIctory
 must find what changed (785 refreshes, ~427 MB checked per frame) and copy it
-back before the title proceeds. Same for the upload direction.
+back before the title proceeds. The same applies to the upload direction.
 
-Ceiling on this machine: 3–4 fps with every stable trick. The fork's own authors
-report 420–450 ms → 240–350 ms with relay on a 4070, i.e. this is inherent to the
-port, not a bug.
+Ceiling on the reference rig: 3–4 fps with every stable trick. The fork's own
+authors report 420–450 ms → 240–350 ms with relay on a 4070, i.e. this is
+inherent to the port, not a bug.
 
 ## 5.2 Missing content — clothes and materials
 
@@ -175,17 +184,18 @@ be built. Ten shaders, five rules:
 | 1 | `v_permlanex16_b32 is not supported` | compute |
 | 1 | `a wave sum of 16-bit floats where not every lane runs` | compute |
 
-Plus one mesh pipeline the host refuses (`0x80070057`). Agent-visible in the log
+Plus one mesh pipeline the host refuses (`0x80070057`). In the log it appears
 as `shader does not translate; its pipelines' draws are dropped ... stage=...
 error=converter shader.dxil v1: GFX10 code at 0x....`.
 
 **Start with the two pixel rules** — clothes are pixel-shaded, so those are the
-likely culprits, and each is a bounded rule in `crates/victory-shader/src/emit/lower.rs`.
+likely culprits, and each is a bounded rule in
+`crates/victory-shader/src/emit/lower.rs`.
 
 ## 5.3 Light in shadow — black interiors
 
 Not a bug: the fork's ray-traced bounce light and RT lamp/sun shadows are not
-implemented. `docs/fork-ray-tracing.md` is the status. Off by default
+implemented. `docs/fork-ray-tracing.md` has the status. Off by default
 (`VICTORY_BVH_BUILDER=1` asks for the builder; its own notes say it then stays
 off in a real run). Anything the sun does not hit directly is black.
 
@@ -197,12 +207,12 @@ lines can appear superimposed. Hypotheses eliminated:
 - not stale card-side copies (`VICTORY_CARD_BUFFERS=0` changes nothing)
 - not the present path in the default configuration (it is upstream's:
   `self.execute(&[copy])` then `Present`; the sent-ahead variant only runs at
-  `late_stage() > 2`, i.e. with RELAY/`LATE_WAIT=3`)
+  `late_stage() > 2`, i.e. with `RELAY` / `LATE_WAIT=3`)
 
-Not yet eliminated: a missing clear/composite pass among the ~350 dropped draws
-(the doubled subtitles are two *different* strings, which is temporal blending,
-not a repeated frame). **Fix 5.2 first and re-check this** — it may be the same
-root cause.
+Not yet eliminated: a missing clear or composite pass among the ~350 dropped
+draws (the doubled subtitles are two *different* strings, which is temporal
+blending, not a repeated frame). **Fix 5.2 first and re-check this** — it may be
+the same root cause.
 
 ---
 
@@ -216,31 +226,35 @@ root cause.
 
       refused dll="amd_fidelityfx_upscaler_xbox.dll"
 
-  Cause: `apps/victory/src/run.rs` builds `wanted = |dll| title_dll(host, dll) && !image_named(dll)`,
-  and `title_dll` is false for anything the host policy does not explicitly deny,
-  so `victory_loader::load_title_dll` maps nothing (`crates/victory-loader/src/windows.rs:142`,
-  `map_dll` returns early unless `wanted(&name)` and the file exists). The kernel
-  then refuses it too (`crates/victory-hle/src/modules/kernel.rs:335`, "a host DLL
-  outside the host policy").
+  Cause: `apps/victory/src/run.rs` builds
+  `wanted = |dll| title_dll(host, dll) && !image_named(dll)`, and `title_dll`
+  is false for anything the host policy does not explicitly deny, so
+  `victory_loader::windows::map_dll` maps nothing (it returns early unless
+  `wanted(&name)` and the file exists). The kernel then refuses it too
+  (`victory_hle::modules::kernel`, "a host DLL outside the host policy").
   **Do not fix it by mapping every DLL beside the exe**: the game folder also
   holds `msvcp140.dll`, `vccorlib140.dll`, `libHttpClient.GDK.dll` and friends,
   and mapping the title's copies of those instead of the host's is a much larger
   risk than the feature is worth. If this is attempted, allow *that one name*
   explicitly, and only in the `LoadLibrary` path.
 - **`VICTORY_DISPLAY_MODE=1920x1080`.** Accepted and reported, no effect: the
-  title creates its 3840x2160 window *before* it queries the display
-  (window 21:41:55, `display mode reported` 21:41:59). `dxgi.rs::modes()` already
-  returns `display_size()`; the title ignores the mode list.
-- **In-game resolution setting.** Does not exist. `storage\settings\settings.xml`
-  has no resolution key and no ray-tracing key.
+  title creates its 3840x2160 window *before* it queries the display (sample
+  run: window 21:41:55, `display mode reported` 21:41:59).
+  `victory_gpu::dxgi::modes()` already returns `display_size()`; the title
+  ignores the mode list.
+- **In-game resolution setting.** Does not exist. `settings.xml` has no
+  resolution key and no ray-tracing key.
 - **`VICTORY_SHADER_LOOP_LIMIT`** as a TDR fix (upstream). Did not stop it.
-- **`VICTORY_MESH_GROUPS`** as a TDR fix (upstream). Did not stop it; the failing
-  command moved to a 1x1x1 compute dispatch with one thread.
-- **Widening `wanted()` in `run.rs`.** Tried, black-screened, reverted. See above.
+- **`VICTORY_MESH_GROUPS`** as a TDR fix (upstream). Did not stop it; the
+  failing command moved to a 1x1x1 compute dispatch with one thread.
+- **Widening `wanted()` in `run.rs`.** Tried, black-screened, reverted. See
+  above.
 
 ---
 
 # 7. What the title does at startup, for orientation
+
+Sample run clock:
 
     21:41:55  title asks for a 3840x2160 window   → lifecycle::fit() logs it
     21:41:59  display mode reported (dxgi::display_size)
@@ -250,21 +264,20 @@ root cause.
      …        intro: cutscene renders, ~1-2 fps, ~350 dropped draws
               world: 2.1 fps, 473 ms/frame
 
-Saves and settings: `D:\victory-data\data\7952987A\`
+Saves and settings live under `<data-dir>/data/<title-id>/`
 (`saves\0009000000000001\...\Player~<hash>\v3\{0,1,manifest}` and
-`SettingsProfileSettings~<hash>\v1\...`). The settings blob is binary; resolution
-is not greppable in it.
+`SettingsProfileSettings~<hash>\v1\...`). The settings blob is binary;
+resolution is not greppable in it.
 
 ---
 
 # 8. Reference material outside this tree
 
-`C:\Users\mojiko\Documents\Leonida-main` is a *different* port of the same game
-(Vulkan + SPIR-V). It has never run the retail executable, so its code is not
-authoritative — but its `docs\` are the best measured reference for this game's
-formats and several of them map onto the gaps above:
+A separate Vulkan + SPIR-V port of the same title has measured documentation
+for this game's formats. It has never run the retail executable, so its code is
+not authoritative, but its docs map onto the gaps above:
 
-| Leonida doc | Use here |
+| Document | Use here |
 |---|---|
 | `docs/gbuffer.md` | deferred targets: 5- and 6-target signatures, `float32` declared but **compressed f16 exported**, 24-bit octahedral normal across `mrt1.gba` (scale 2047.5), sqrt-encoded `mrt2`. Binding these at the wrong format mangles normals silently |
 | `docs/shader_inputs.md` | 512-byte light records, eight-light loop, plane count at `+0x4C`, ACES LUT splines, the `+0xD0` sky-LUT output-format dword |
@@ -272,7 +285,7 @@ formats and several of them map onto the gaps above:
 | `tools/lane_masks.py` | the path-sensitive lane-mask analysis, with its docstring explaining exactly the class of failure in 5.2 ("a register counts as a mask only if every path wrote a mask", ballot materialised where the mask is written) |
 | `docs/design.md` | ~650 lines of RDNA2→SPIR-V contract; several rows (f16 semantics, `v_cvt_f32_f64`, `v_permlane*`, VINTRP) describe instructions the fork still refuses |
 
-Its **first** lesson is worth keeping: 100% of that game's `*Deferred*` pixel
+Its **first** lesson is worth keeping: 100% of that title's `*Deferred*` pixel
 shaders export **compressed half-float** while declaring `float32`. If the
 deferred path here ever looks wrong rather than dark, check target formats first.
 
@@ -280,19 +293,20 @@ deferred path here ever looks wrong rather than dark, check target formats first
 
 # 9. Gotchas that cost time
 
-- `cargo clean` → the `D3D12` folder goes with it → the game silently stops
-  rendering (see §2a). Re-copy the two DLLs after any clean.
+- `cargo clean` → the `D3D12` folder goes with it → the title silently stops
+  rendering (see §2a). Re-copy the two DLLs after any clean, or point
+  `VICTORY_D3D12_SDK` at a folder outside `target\`.
 - Task-killing `victory.exe` is fine; the pipeline library still grows. Prefer
-  Esc / a clean exit when the session went well.
+  Esc or a clean exit when the session went well.
 - A GPU hang resets the display and shows up as
-  `host GPU device removed ... (0x887A0006)`. Set `VICTORY_D3D12_DRED=1` first if
-  a run might die — it names the faulting command.
-  `D:\victory-data\data\7952987A\crashes.log` and the title's own
+  `host GPU device removed ... (0x887A0006)`. Set `VICTORY_D3D12_DRED=1` first
+  if a run might die — it names the faulting command.
+  `<data-dir>/data/<title-id>/crashes.log` and the title's own
   `temp\victory-*.crash.log` both survive a crash.
 - `VICTORY_CAPTURE` frames 1-1024 are black during boot; the menu art only
   streams in around frame 700-768. Pick later frames or you will debug a black
   image that is simply early.
-- Builds need the MSVC toolchain: VS at `C:\toolchain\VS` (14.44), Windows SDK
-  10.0.26100. Rust 1.98.1 pinned by `rust-toolchain.toml`.
-- `PATH` in git-bash: `$USERPROFILE` has backslashes and breaks the export; use
-  `/c/Users/mojiko/.cargo/bin`.
+- Builds need the MSVC toolchain and the Windows SDK (10.0.26100). Rust is
+  pinned by `rust-toolchain.toml`.
+- In git-bash, `$USERPROFILE` contains backslashes and breaks an `export PATH`;
+  use a forward-slash path to the cargo bin directory instead.
