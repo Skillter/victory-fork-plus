@@ -351,6 +351,191 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// lies far above this.
 const SMALL: u64 = 0x1_0000;
 
+/// The size of the PC graphics pipeline description (shaders inline) and of
+/// the console compute one: a word of a description equal to either is where
+/// that description keeps its own size, so finding neither is what the dump
+/// below has to show.
+const GRAPHICS_DESCRIPTION: u64 = 0x2b0;
+const COMPUTE_DESCRIPTION: u64 = 0x60;
+
+/// `ID3D12PipelineState`, the interface the title asks these two methods for
+/// (PC's own GUID): the dump prints the `iid` argument as text, so an
+/// argument order we have wrong shows at once.
+const PIPELINE_STATE_IID: Iid = guid(
+    0x765a30f3,
+    0xf624,
+    0x4c6f,
+    [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+);
+
+/// Bytes the dump shows behind each argument.
+const DUMP_BYTES: usize = 256;
+
+/// Where [`dump_call`]'s text goes: `VICTORY_PIPELINE_DUMP=<file>` in any
+/// build (appended, so both slots and later runs stay in one file), the log
+/// in a `diagnostics` build, nowhere in a release one.
+enum Dump {
+    Off,
+    Log,
+    File(std::path::PathBuf),
+}
+
+fn dump_destination() -> &'static Dump {
+    static DEST: std::sync::OnceLock<Dump> = std::sync::OnceLock::new();
+    DEST.get_or_init(|| {
+        if let Some(path) = std::env::var_os("VICTORY_PIPELINE_DUMP").map(std::path::PathBuf::from)
+        {
+            if outside_repo(&path) {
+                return Dump::File(path);
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "VICTORY_PIPELINE_DUMP is inside the repository; the dump stays in the log"
+            );
+        }
+        if cfg!(feature = "diagnostics") {
+            Dump::Log
+        } else {
+            Dump::Off
+        }
+    })
+}
+
+/// Whether `path`'s folder is outside the workspace: a dump written into the
+/// tree fails the asset policy. This crate has no `victory_core` to ask
+/// (`ensure_outside_repo`), and a folder that does not exist is unresolvable,
+/// hence refused too.
+fn outside_repo(path: &std::path::Path) -> bool {
+    let Ok(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+    else {
+        return false;
+    };
+    path.parent()
+        .unwrap_or(path)
+        .canonicalize()
+        .is_ok_and(|folder| !folder.starts_with(root))
+}
+
+/// One argument's bytes: a header naming it and its value, then sixteen lines
+/// of sixteen bytes, hex and as text where printable. A line the kernel
+/// cannot read is `??` and counted at the end instead of aborting, so a
+/// pointer to a short block, or to nothing, still dumps what is there.
+fn dump_argument(
+    index: usize,
+    name: &str,
+    at: usize,
+    read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+) -> String {
+    let mut text = format!("[{index} {name}] {at:#018x}\n");
+    let mut faulted = 0;
+    for offset in (0..DUMP_BYTES).step_by(16) {
+        let mut bytes = [0u8; 16];
+        let (hex, shown) = if read(at + offset, &mut bytes) {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let shown: String = bytes
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        char::from(b)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            (hex.join(" "), shown)
+        } else {
+            faulted += 1;
+            ("?? ".repeat(15) + "??", "unreadable".to_string())
+        };
+        text += &format!("+{offset:#05x} | {hex} | {shown}\n");
+    }
+    if faulted > 0 {
+        text += &format!(
+            "[{index} {name}] {faulted} of {} lines unreadable\n",
+            DUMP_BYTES / 16
+        );
+    }
+    text
+}
+
+/// Where the two description sizes appear in the first 128 bytes at `at`: a
+/// word equal to 0x2b0 says the console's graphics description sits where the
+/// PC one keeps its size, 0x60 the compute one.
+fn layout_hint(at: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> String {
+    let mut bytes = [0u8; 128];
+    let mut whole = true;
+    for (line, chunk) in bytes.chunks_mut(16).enumerate() {
+        whole &= read(at + line * 16, chunk);
+    }
+    let words = |size: u64| -> Vec<usize> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .enumerate()
+            .filter(|&(_, word)| word == size)
+            .map(|(word, _)| word)
+            .collect()
+    };
+    let graphics = words(GRAPHICS_DESCRIPTION);
+    let compute = words(COMPUTE_DESCRIPTION);
+    format!(
+        "      sizes: 0x2b0 graphics at {graphics:x?}, 0x60 compute at {compute:x?}{}\n",
+        if whole { "" } else { " (partial read)" }
+    )
+}
+
+/// Every argument of one call, [`DUMP_BYTES`] behind each, and where the two
+/// documented description sizes appear. The first call of each slot dumps
+/// once, so 18,432 calls cost two dumps.
+///
+/// The mismatch the dump decides: `desc[0]` points at text (a capture decoded
+/// the block as `"2026-11-25 01:17:05Z"`), which no description starts with,
+/// so either the arguments are in another order than `(this, desc, iid, out)`
+/// or the description starts at a later word; the `iid` text and the size
+/// words say which.
+fn dump_call(slot: usize, this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> String {
+    let mut text = format!("slot {slot:#x}: 4 arguments (this, desc, iid, out)\n");
+    #[cfg(windows)]
+    let mut read =
+        |at: usize, bytes: &mut [u8]| at != 0 && crate::host::read_into(at as *const u8, bytes);
+    #[cfg(not(windows))]
+    let mut read = |_: usize, _: &mut [u8]| false;
+    let args = [
+        ("this", this as usize),
+        ("desc", desc as usize),
+        ("iid", iid as usize),
+        ("out", out as usize),
+    ];
+    for (index, &(name, at)) in args.iter().enumerate() {
+        text += &dump_argument(index, name, at, &mut read);
+    }
+    let mut iid_bytes = [0u8; 16];
+    if read(iid as usize, &mut iid_bytes) {
+        text += &format!(
+            "      iid reads {} (ID3D12PipelineState is {})\n",
+            guid_text(&iid_bytes),
+            guid_text(&PIPELINE_STATE_IID)
+        );
+    }
+    text += &format!("      desc is {:#018x}:\n", desc as usize);
+    if !desc.is_null() {
+        text += &layout_hint(desc as usize, &mut read);
+        let mut first = [0u8; 8];
+        if read(desc as usize, &mut first) {
+            let at = usize::try_from(u64::from_le_bytes(first)).unwrap_or(0);
+            if at != 0 {
+                text += &format!("      desc[0] = {at:#018x}:\n");
+                text += &layout_hint(at, &mut read);
+            }
+        }
+    }
+    text
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -365,12 +550,15 @@ const SMALL: u64 = 0x1_0000;
 /// writing them needs: the words in hex, every word that reads as a small
 /// size, and the block it points at, which tells a byte count from a small
 /// pointer (a size beside a pointer is what a shader stage looks like).
+/// [`dump_call`] adds the raw bytes of every argument once per slot, and
+/// where the two known sizes appear, because 18,432 pipelines are lost here
+/// and the argument we assume is a description starts with text.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
-    _: This,
+    this: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -379,6 +567,31 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    if calls == 1 {
+        let dump = dump_call(SLOT, this, desc, iid, out);
+        match dump_destination() {
+            Dump::File(path) => {
+                use std::io::Write;
+                let written = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(dump.as_bytes()));
+                if let Err(e) = written {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %e,
+                        "VICTORY_PIPELINE_DUMP is not writable"
+                    );
+                }
+            }
+            Dump::Log => tracing::warn!(
+                slot = format_args!("{:#x}", SLOT),
+                "a pipeline creation call's raw arguments:\n{dump}"
+            ),
+            Dump::Off => {}
+        }
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -614,5 +827,114 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The dump prints hex, text where printable, and `??` for a line the
+    /// kernel could not read, counted rather than aborting the pointer.
+    #[test]
+    fn the_argument_dump_shows_hex_text_and_marks_unreadable_lines() {
+        let block: Vec<u8> = (0..DUMP_BYTES).map(|b| b as u8).collect();
+        let mut read = |at: usize, bytes: &mut [u8]| {
+            let offset = at - 0x1000;
+            if offset == 0x20 {
+                return false;
+            }
+            let len = bytes.len();
+            bytes.copy_from_slice(&block[offset..offset + len]);
+            true
+        };
+        let text = dump_argument(2, "iid", 0x1000, &mut read);
+        let lines: Vec<&str> = text.lines().collect();
+        // A header, sixteen lines of sixteen bytes, and the count of the one
+        // that faulted.
+        assert_eq!(lines.len(), 18);
+        assert_eq!(lines[0], "[2 iid] 0x0000000000001000");
+        assert_eq!(
+            lines[1],
+            "+0x000 | 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f | ................"
+        );
+        assert_eq!(
+            lines[3],
+            "+0x020 | ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? | unreadable"
+        );
+        // 0x30 to 0x3f are the digits, 0x40 to 0x4f the capitals.
+        assert!(lines[4].ends_with("| 0123456789:;<=>?"));
+        assert!(lines[5].ends_with("| @ABCDEFGHIJKLMNO"));
+        assert_eq!(lines[17], "[2 iid] 1 of 16 lines unreadable");
+        // A null argument dumps every line unreadable and reads nothing.
+        let mut none = |_: usize, _: &mut [u8]| false;
+        let text = dump_argument(3, "out", 0, &mut none);
+        assert_eq!(text.lines().count(), 18);
+        assert_eq!(
+            text.lines().last(),
+            Some("[3 out] 16 of 16 lines unreadable")
+        );
+    }
+
+    /// The layout line names the offsets of the two documented sizes, in the
+    /// description and in the block its first word points at, so a shifted
+    /// description or a wrong argument shows up without a hex search.
+    #[test]
+    fn the_layout_hint_names_the_size_words() {
+        let mut block = [0u8; 128];
+        block[3 * 8..4 * 8].copy_from_slice(&GRAPHICS_DESCRIPTION.to_le_bytes());
+        block[5 * 8..6 * 8].copy_from_slice(&COMPUTE_DESCRIPTION.to_le_bytes());
+        let mut read = |at: usize, bytes: &mut [u8]| {
+            let offset = at - 0x2000;
+            let len = bytes.len();
+            bytes.copy_from_slice(&block[offset..offset + len]);
+            true
+        };
+        let hint = layout_hint(0x2000, &mut read);
+        assert!(hint.contains("0x2b0 graphics at [3]"), "{hint}");
+        assert!(hint.contains("0x60 compute at [5]"), "{hint}");
+        assert!(!hint.contains("partial"), "{hint}");
+        // A block that cannot be read says so instead of naming offsets.
+        let mut none = |_: usize, _: &mut [u8]| false;
+        let hint = layout_hint(0x2000, &mut none);
+        assert!(hint.contains("graphics at []"), "{hint}");
+        assert!(hint.contains("(partial read)"), "{hint}");
+    }
+
+    /// A dump inside the tree would fail the asset policy; a folder outside
+    /// it is accepted, and one that does not exist is refused.
+    #[test]
+    fn the_dump_refuses_a_path_inside_the_repository() {
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pipeline.txt");
+        assert!(!outside_repo(&inside));
+        let temp = tempfile::tempdir().unwrap();
+        assert!(outside_repo(&temp.path().join("pipeline.txt")));
+        assert!(!outside_repo(
+            &temp.path().join("missing").join("pipeline.txt")
+        ));
+    }
+
+    /// The call dump reads the arguments it is handed: a description whose
+    /// word 3 holds the PC size, and the pipeline state's own interface id.
+    #[cfg(windows)]
+    #[test]
+    fn the_call_dump_reads_a_description_and_the_iid() {
+        let mut description = [0u64; 16];
+        description[3] = GRAPHICS_DESCRIPTION;
+        let mut out: This = std::ptr::null_mut();
+        let text = dump_call(
+            0x1c8,
+            std::ptr::null_mut(),
+            (&raw const description).cast(),
+            std::ptr::from_ref(&PIPELINE_STATE_IID),
+            &raw mut out,
+        );
+        assert!(
+            text.starts_with("slot 0x1c8: 4 arguments (this, desc, iid, out)"),
+            "{text}"
+        );
+        assert!(text.contains("sizes: 0x2b0 graphics at [3]"), "{text}");
+        assert!(text.contains("ID3D12PipelineState is"), "{text}");
+        // The first word is null, so nothing is followed (the bytes behind the
+        // description are stack, so only a line of its own counts).
+        assert!(
+            !text.lines().any(|line| line.starts_with("      desc[0] =")),
+            "{text}"
+        );
     }
 }
