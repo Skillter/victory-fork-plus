@@ -7754,8 +7754,20 @@ impl HostList {
         let list = self.deferred();
         let steps: &[Step] = &list.copies;
         let mut at = 0;
+        // Texture refreshes wait here to be done together
+        // (`crate::texture::refresh_all`): before the next step that is not
+        // one of them, a host-side note or a buffer refresh (those neither
+        // write title memory nor read a staging buffer), and when the
+        // list's steps are through.
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         while at < steps.len() {
             let step = &steps[at];
+            if !textures.is_empty()
+                && !matches!(step, Step::Texture(_) | Step::Host(_) | Step::Refresh(..))
+            {
+                crate::texture::refresh_all(&textures);
+                textures.clear();
+            }
             let started = std::time::Instant::now();
             // The steps this one runs, and the microseconds of them a flush
             // took (it is refresh work, counted apart as well).
@@ -7879,7 +7891,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if crate::texture::batched() {
+                            textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     at += 1;
                     continue;
@@ -7894,6 +7910,7 @@ impl HostList {
             PREPARING[0].fetch_add(own, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        crate::texture::refresh_all(&textures);
     }
 }
 
@@ -8999,6 +9016,14 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                );
+            }
+            let [batches, together] =
+                [0, 1].map(|i| crate::texture::BATCHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if batches > 0.0 {
+                tracing::info!(
+                    "textures read in place together per frame: {batches:.1} batches of {:.1} textures, on the threads kept                      for the snapshots (VICTORY_TEXTURE_BATCH=0: one by one)",
+                    together / batches
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
