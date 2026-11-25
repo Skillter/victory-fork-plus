@@ -372,10 +372,33 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes). [`twin_line`] prints the first as
+/// a rate and the other two as totals.
 #[cfg(windows)]
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The depth-twin clause of the frame-rate line, from [`TWINS`] and
+/// [`PLANES`]: two of those counts are swapped every line (a rate), three
+/// are never reset (a total), so the clause names the basis of each. A total
+/// reads as a rate when it sits beside one unmarked.
+#[cfg(windows)]
+pub(crate) fn twin_line(
+    alive: u64,
+    without: u64,
+    into_depth: f64,
+    into_colour: f64,
+    planes: f64,
+    not_given: u64,
+    late: u64,
+) -> String {
+    format!(
+        "depth twins: {alive} alive; per frame: {into_depth:.1} copies into depth textures, \
+         {into_colour:.1} copies into twins, {planes:.1} planes drawn from their twins; so far: \
+         {not_given} times not given back to a twin, {late} times used before the pass, {without} \
+         depth textures left without one"
+    )
+}
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -3916,5 +3939,32 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(!reclaimable_slot(true, 1, 2, true), "protected: never taken");
         // The slot marked gone leaves the sweep's reference of 1.
         assert!(sweepable(true, 1, 1, false), "reclaimed after `texture_slot_gone`");
+    }
+
+    /// Two of the depth-twin counts are swapped every line and three are
+    /// never reset: the clause states each count's basis, so a total is not
+    /// read as a rate (`PLANES[1]` and `PLANES[2]` only grow).
+    #[cfg(windows)]
+    #[test]
+    fn twin_line_marks_the_counts_that_never_reset() {
+        let line = twin_line(47, 0, 0.0, 1.0, 1.0, 1726, 1728);
+        assert_eq!(line.matches("per frame").count(), 1, "{line}");
+        let Some((rates, totals)) = line.split_once("so far") else {
+            panic!("counts that never reset are not marked `so far`: {line}");
+        };
+        for rate in ["1.0 copies into twins", "1.0 planes drawn from their twins"] {
+            assert!(rates.contains(rate), "{rate} is not in the per-frame part: {line}");
+        }
+        // Each total follows the mark, and no total is stated as a rate.
+        let totals_expected = [
+            "1726 times not given back",
+            "1728 times used before the pass",
+            "0 depth textures",
+        ];
+        for total in totals_expected {
+            assert!(totals.contains(total), "{total} is not in the `so far` part: {line}");
+            assert!(!rates.contains(total), "{total} reads as a rate: {line}");
+        }
+        assert!(rates.contains("per frame:"), "the rates are not named: {line}");
     }
 }
