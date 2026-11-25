@@ -8,9 +8,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -30,6 +31,21 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
 
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
+
+/// When the run began, for the summary [`end`] logs.
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// Notes the moment the run began, so the end-of-run summary can state how
+/// long the title ran. Called once by `victory run`, after logging is set up;
+/// a second call keeps the first moment, so nothing can shorten the run's
+/// recorded duration.
+pub fn note_run_start() {
+    let _ = STARTED.set(Instant::now());
+}
+
+fn started() -> Option<&'static Instant> {
+    STARTED.get()
+}
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -212,7 +228,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         if let Some(then) = then.take() {
             then();
         }
-        end();
+        end(how);
     };
     let late = finish.clone();
     // Not on the calling thread: titles hand the suspend to their window
@@ -285,10 +301,33 @@ pub fn wait_for_previous() {
     }
 }
 
-fn end() {
+/// The last line of a run: how it ended, and how long the title ran.
+///
+/// The 5 s lines of `victory_gpu::host` only describe their own window, and
+/// the last of them can be minutes old, so a log that stops at a shutdown
+/// message says nothing about the run as a whole. Emitted inside [`end`],
+/// before the process is terminated: a line written after the hard exit would
+/// never be written at all.
+fn summary(how: &str) {
+    let secs = started().map_or(0.0, |start| start.elapsed().as_secs_f64());
+    // Frames rendered and the average rate stay out of this line until
+    // `victory-gpu` publishes its frame count: `frame::current` and
+    // `queue::presented` are both `pub(crate)`
+    // (crates/victory-gpu/src/frame.rs:83, crates/victory-gpu/src/queue.rs:749),
+    // and the per-window counters of `host::Stats` are private too.
+    tracing::info!("run summary: {how}; the title ran {secs:.1} s");
+}
+
+fn end(how: &str) {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    summary(how);
+    // `victory_core::logging` buffers nothing: each event reaches the file
+    // as it is logged (`logging::Locked` writes the `File` directly,
+    // crates/victory-core/src/logging.rs:183), and stderr is unbuffered. This
+    // flush is the last guard before the hard exit, not the only one.
+    let _ = std::io::stderr().flush();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
@@ -329,6 +368,16 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn the_run_start_is_noted_once() {
+        note_run_start();
+        let noted = *started().expect("noted");
+        note_run_start();
+        // A second note keeps the first moment, so the summary cannot be
+        // made to understate how long the title ran.
+        assert_eq!(*started().expect("still noted"), noted);
     }
 
     #[test]
