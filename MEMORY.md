@@ -515,6 +515,23 @@ late_stage=3` says which stage the numbers were taken under; forcing it to 0
 once whitened the intro's frames), so 87 µs a draw is still not compared with a
 run that has it off: that run pays one query a group less.
 
+**The ray-tracing structure builder, measured (2026-11-26).** With
+`VICTORY_BVH_BUILDER=1 VICTORY_FIRSTLANE_OWN=1` the host logs
+`the ray-tracing structure builder runs: all of its programs have host
+pipelines pipelines=53` (log `run-20261125-224639.log` at 22:49:51, and
+`run-20261125-225835.log` at 23:02:42). Either run held 13–24 fps (48–74 ms a
+frame) up to that line; the host report after it reads **0.1 fps, 12169.4 ms a
+frame, 8808.2 ms of it copies of 2002.7 MB** of title memory the builder wrote
+(22:50:22), and in the lighter run **2.2 fps, 452.5 ms a frame** (23:03:00).
+The title then faults 20–40 s later: `0xc0000005`, a read of
+`0xffffffffffffffff` at `victory-image-*.dll+0x4f38ba5` (dump
+`fafdd3f0-e060-4a19-8a48-b6c2089c2b1b.dmp`, title frame 1544, `Prestream`).
+Four crashes without the builder are the same exception at a different site (a
+write to `0x0` at `victory-image-*.dll+0x23cf683`, dumps `7f759f07`,
+`d1c56668`, `fb8d7775`), so the builder's fault is its own. The builder writes
+title memory, so every page it touches is copied back: 1.9 GiB a frame at that
+point, at 3% card busy.
+
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run
@@ -537,6 +554,12 @@ description, the root signature's bytes, the container's parts, `DXIL`'s lengths
 and `PSV0`'s stage, thread group and bindings, then `cause=<what is provably
 invalid>` or `cause=no cause known (<what closes it>)`; the 04:21 run prints the
 latter, and no cause is known yet.
+*(Corrected 2026-11-26: the cause is known. `run-20261125-224639.log` prints
+`cause=its code requires waves of 64..64 lanes (its PSV0's wave size …) and the
+host GPU runs waves of 32..32` for every one of them: a `WaveSize(64)` module
+that the translator could not split, which `CreateComputePipelineState` refuses
+on this device however valid the DXIL is — see `crates/victory-shader/AGENTS.md`
+and `victory_shader::emit::lanes`.)*
 
 - *(re-measured 25-11 23:52, `victory translate --validate --list` over
   `shaders.rpf`)* 25,483 programs validate before the change below and 25,493
