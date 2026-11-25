@@ -348,6 +348,17 @@ page trimmed out of the working set cost nothing measurable (the same read came
 back at 5.6–9.3 GB/s) — measured 25 Nov by
 `cargo test -p victory-gpu --lib what_a_copy_costs -- --ignored --nocapture`.
 
+"Is this range committed" was asked a page at a time until 25 Nov: over 170 MB
+of a committed block that is 43,520 one-byte kernel reads, 41.7 ms, each
+faulting its page back in. One `VirtualQuery` per run of pages in one state
+answers the same span in 1.09 ms, and the run it keeps answers it in 0.12 µs
+thereafter. The kernel's answer costs the committed run it walks — 3.0–4.5 ms
+inside the title's 1.2 GB block, 0.3–0.7 µs in a single 4 KiB page, 1.1–1.8 µs
+in a 1.2 GB reservation with nothing committed — so a negative answer is cheap
+and is never kept, and a positive one in a big block is worth keeping
+(`cargo test -p victory-gpu --lib what_a_committed_question_costs -- --ignored
+--nocapture`, same date; `texture::committed`).
+
 The readback exists because the console has unified memory and the PC does not:
 compute shaders write buffers that the title's CPU code then reads, so VIctory
 must find what changed and copy it back, before the title proceeds.

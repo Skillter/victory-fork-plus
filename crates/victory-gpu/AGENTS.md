@@ -193,6 +193,13 @@
   (`texture_slot_later`), whether or not the copy was reclaimed: unmade and
   left due, the queue's next look takes the slot `done` and it is never made
   again for the run.
+- Whether title memory is committed is asked of the kernel once per run of
+  pages in one state (`texture::committed`), and the run is kept until the
+  runtime maps or unmaps inside it (`texture::remapped`, under one lock with
+  the question). Never ask it a page at a time: the answer costs the
+  committed run it walks (1.1 ms over 170 MB, 3.0-4.5 ms inside the title's
+  1.2 GB block, 0.3-0.7 µs in one page), and a page at a time it was 43,520
+  one-byte reads through the kernel, each faulting its page back in.
 
 ## Diagnostics
 
