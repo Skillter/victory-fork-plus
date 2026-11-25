@@ -1491,7 +1491,23 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
-            interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            interps: {
+                let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
+                // A first half whose result is also read as data (an f16 second half keeps
+                // the other half of its dst, PS_DeferredTextured): evaluated as the pair it
+                // starts. Approximate for those other bits (P0 + i P10 on the console); a
+                // first half only the second half reads is gone before lowering.
+                if std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                    for (_, i) in &x.io.interps {
+                        if let Interp::Interpolated { first, .. } = i {
+                            for s in first {
+                                m.entry(*s).or_insert(i);
+                            }
+                        }
+                    }
+                }
+                m
+            },
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
@@ -1787,6 +1803,9 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::ActiveF64(lo, hi, mask, high) => {
+                return self.active_f64_sum(lo, hi, mask, high);
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -1950,6 +1969,74 @@ impl<'a> Lower<'a> {
             r
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// `WaveActiveSum` of 64-bit floats (`f64(lo, hi)` in active lanes, `+0.0` elsewhere),
+    /// returning the low (`!high`) or high (`high`) 32-bit word.
+    fn active_f64_sum(
+        &mut self,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        high: bool,
+    ) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let on = self.boolean(m, c)?;
+        let lo = self.i32_of(lo)?;
+        let hi = self.i32_of(hi)?;
+        let z = self.s.m.i32(0);
+        let lo = self.s.m.select(c, on, lo, z);
+        let hi = self.s.m.select(c, on, hi, z);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let split_ty = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let arg = self
+            .s
+            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
+        let sum = self
+            .s
+            .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[arg, k0, k0b]);
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let mut r_lo = self.s.m.extract(c, split, 0);
+        let mut r_hi = self.s.m.extract(c, split, 1);
+        if self.exchange.is_some() {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
+            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let c = self.cur;
+            let d0 = self
+                .s
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo0, hi0]);
+            let d1 = self
+                .s
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo1, hi1]);
+            let total = self.s.m.bin(c, Bin::Add, d0, d1);
+            let split = self
+                .s
+                .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[total]);
+            r_lo = self.s.m.extract(c, split, 0);
+            r_hi = self.s.m.extract(c, split, 1);
+        }
+        Ok(if high { r_hi } else { r_lo })
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
@@ -5584,6 +5671,15 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                eprintln!(
+                    "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
+                    inst.machine.offset,
+                    inst.name(),
+                    address,
+                    self.x.res.lane_copied.contains(&site)
+                );
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -6987,6 +7083,68 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads the lane a 4-bit selector names in its own
+                // 16-lane group (`v_permlane16_b32`) or in the other group of
+                // its 32-lane row (`v_permlanex16_b32`). Lanes 0-15 take the
+                // pick from src1, lanes 16-31 from src2, as AMD's permlane
+                // builtins describe their `lanesel_lo` / `lanesel_hi`. The
+                // console pairs 0-15 with 16-31 and 32-47 with 48-63, so a
+                // host wave of 32 lanes holds both groups of every pair and
+                // the read stays inside it (a wave64 console wave cut in two
+                // needs no exchange here).
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                // Not `cross_lane`: its reads stay inside one 32-lane half,
+                // which is one host wave even when a console wave64 program
+                // runs in two (`console_lanes` in `lower`).
+                if self.s.mesh.is_some() {
+                    return Err("a cross-lane operation in a mesh shader");
+                }
+                if self.s.threads.is_none() {
+                    return Err("a cross-lane operation outside compute");
+                }
+                self.s.flags |= flags::WAVE_OPS;
+                let c = self.cur;
+                let m16 = self.s.m.i32(16);
+                let fifteen = self.s.m.i32(15);
+                let k15 = self.s.m.i32(!15);
+                let k31 = self.s.m.i32(!31);
+                let me = self.lane_index();
+                let upper = self.s.m.bin(c, Bin::And, me, m16);
+                let zero = self.s.m.i32(0);
+                let in_upper = self.s.m.cmp(c, pred::NE, upper, zero);
+                let sel = self.s.m.select(c, in_upper, hi, lo);
+                // The selector is 4 bits, so it cannot leave the group and
+                // `bound_ctrl` never applies.
+                let sel = self.s.m.bin(c, Bin::And, sel, fifteen);
+                // shortcut: `fi` (a source lane EXEC has cleared) is not
+                // modelled - the read returns that lane's value either way,
+                // which is `fi` set. Only wave operations under a divergence
+                // notice, and the console uses these with EXEC full.
+                let row = if name == "v_permlanex16_b32" {
+                    // the other group of this 32-lane row
+                    let half = self.s.m.bin(c, Bin::And, me, k31);
+                    let other = self.s.m.bin(c, Bin::Xor, upper, m16);
+                    self.s.m.bin(c, Bin::Or, half, other)
+                } else {
+                    // the group this lane is in
+                    self.s.m.bin(c, Bin::And, me, k15)
+                };
+                let at = self.s.m.bin(c, Bin::Or, row, sel);
+                let r = self.read_lane(a, at);
+                int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                // A double in a register pair (`s[20:21]` in a real program),
+                // rounded to single. No console program computes with doubles:
+                // this only ever shortens one. The hardware rounds to nearest
+                // even here, which is DXIL's `fptrunc`.
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                self.s.flags |= flags::DOUBLES;
+                let d = self.s.op(c, "makeDouble.f64", Attr::ReadNone, self.s.t.f64, 101, &[lo, hi]);
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -7002,17 +7160,6 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
-                float(self, r)
-            }
-            "v_cvt_f32_f64" => {
-                // A double in a register pair (`s[20:21]` in a real program),
-                // rounded to single. No console program computes with doubles:
-                // this only ever shortens one. The hardware rounds to nearest
-                // even here, which is DXIL's `fptrunc`.
-                let x = self.src64(inst, 0)?;
-                self.s.flags |= flags::DOUBLES;
-                let d = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f64);
-                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
@@ -7213,48 +7360,6 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
-            "v_permlanex16_b32" => {
-                // Each lane takes the value of a lane in the *other* 16-lane
-                // group of its 32-lane row, at that group's 4-bit selector:
-                // `v_permlane16_b32` is the same without the crossing. The
-                // console pairs 0-15 with 16-31 and 32-47 with 48-63, so a
-                // host wave of 32 lanes holds both groups of every pair and
-                // the read stays inside it (a wave64 console wave cut in two
-                // needs no exchange here).
-                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                // Not `cross_lane`: its reads stay inside one 32-lane half,
-                // which is one host wave even when a console wave64 program
-                // runs in two (`console_lanes` in `lower`).
-                if self.s.mesh.is_some() {
-                    return Err("a cross-lane operation in a mesh shader");
-                }
-                if self.s.threads.is_none() {
-                    return Err("a cross-lane operation outside compute");
-                }
-                self.s.flags |= flags::WAVE_OPS;
-                let c = self.cur;
-                let m16 = self.s.m.i32(16);
-                let fifteen = self.s.m.i32(15);
-                let k31 = self.s.m.i32(!31);
-                let me = self.lane_index();
-                let upper = self.s.m.bin(c, Bin::And, me, m16);
-                let zero = self.s.m.i32(0);
-                let in_upper = self.s.m.cmp(c, pred::NE, upper, zero);
-                let sel = self.s.m.select(c, in_upper, hi, lo);
-                // The selector is 4 bits, so it cannot leave the group and
-                // `bound_ctrl` never applies.
-                let sel = self.s.m.bin(c, Bin::And, sel, fifteen);
-                // shortcut: `fi` (a source lane EXEC has cleared) is not
-                // modelled - the read returns that lane's value either way,
-                // which is `fi` set. Only wave operations under a divergence
-                // notice, and the console uses these with EXEC full.
-                let row = self.s.m.bin(c, Bin::And, me, k31);
-                let other = self.s.m.bin(c, Bin::Xor, upper, m16);
-                let at = self.s.m.bin(c, Bin::Or, row, other);
-                let at = self.s.m.bin(c, Bin::Or, at, sel);
-                let r = self.read_lane(a, at);
-                int(self, r)
-            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -7355,6 +7460,14 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
+                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
+                        // first lane, exact when the value is the same in every lane of
+                        // the console wave (the ray-tracing builder's scans read a sum of
+                        // scalars this way, inside a loop whose exit is per console wave).
+                        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                            return int(self, mine);
+                        }
                         need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
                     }
@@ -7423,6 +7536,58 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
+    /// `abs` and `neg` input modifiers on operand `k`.
+    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(c @ 240..=248) => {
+                const INLINE_F64: [f64; 9] = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    1.0 / std::f64::consts::TAU,
+                ];
+                let bits = INLINE_F64[(c - 240) as usize].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
+            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
+            _ => return Err("a 64-bit float operand"),
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
+        }
+        Ok((lo, hi))
     }
 
     fn join64(&mut self, lo: V, hi: V) -> V {

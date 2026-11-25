@@ -184,11 +184,15 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    if rc != zlib_rs::ReturnCode::Ok {
+        // A frame that did not compress would be written as a PNG with an
+        // empty IDAT: a file that opens and shows nothing.
+        tracing::warn!(code = ?rc, "a captured frame's pixels did not compress; not saved");
+        return;
+    }
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
