@@ -8175,25 +8175,43 @@ impl Host {
                 && frame_view(DXGI_FORMAT(t.format), format).is_some()
         }) {
             Ok(index) => {
-                if let Some(target) = since.targets.get(index)
-                    && let Some(texture) = crate::resource::host_resource(target.this())
-                {
-                    // SAFETY: a live host texture.
-                    desc = unsafe { texture.GetDesc() };
-                    // The state it is in now: the pass reads it, and the list
-                    // puts it back, as it would for a frame.
-                    let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
-                    picture_state = crate::resource::host_transition(target.this(), read)
-                        .map_or(read, |(_, before)| before);
-                    picture = texture;
-                    picture_this = Some(target.this());
-                    victory_core::logging::warn_once("present.fallback", || {
-                        format!(
-                            "presented frame was not written; showing the {}x{} frame it did \
-                             write (VICTORY_PRESENT_FALLBACK=0 turns this off)",
-                            desc.Width, desc.Height
-                        )
-                    });
+                let shown = since.targets.get(index).and_then(|target| {
+                    let at = target.this();
+                    crate::resource::host_resource(at).map(|texture| (target, texture))
+                });
+                match shown {
+                    Some((target, texture)) => {
+                        // SAFETY: a live host texture.
+                        desc = unsafe { texture.GetDesc() };
+                        // The state it is in now: the pass reads it, and the
+                        // list puts it back, as it would for a frame.
+                        let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+                        picture_state = crate::resource::host_transition(target.this(), read)
+                            .map_or(read, |(_, before)| before);
+                        picture = texture;
+                        picture_this = Some(target.this());
+                        if since.cleared {
+                            // The case this fix exists for: the title clears
+                            // the texture its upscaler would have filled in.
+                            victory_core::logging::warn_once("present.fallback.cleared", || {
+                                format!(
+                                    "presented frame was cleared but never drawn into; showing \
+                                     the {}x{} frame it did write",
+                                    desc.Width, desc.Height
+                                )
+                            });
+                        } else {
+                            victory_core::logging::warn_once("present.fallback", || {
+                                format!(
+                                    "presented frame was not written; showing the {}x{} frame it \
+                                     did write (VICTORY_PRESENT_FALLBACK=0 turns this off)",
+                                    desc.Width, desc.Height
+                                )
+                            });
+                        }
+                    }
+                    // A target `pick` chose that has no host texture any more.
+                    None => nothing_written(since),
                 }
             }
             Err(crate::present::Why::Competing(sizes)) => {
@@ -8210,7 +8228,10 @@ impl Host {
                     )
                 });
             }
-            Err(crate::present::Why::Written) | Err(crate::present::Why::Nothing) => {}
+            // Nothing was written into the frame and no target of its shape
+            // either: once, what the title did write, so the next run says why.
+            Err(crate::present::Why::Nothing) => nothing_written(since),
+            Err(crate::present::Why::Written) => {}
         }
         let size = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -8492,6 +8513,40 @@ fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
     unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     (w > 0 && h > 0).then_some((w as u32, h as u32))
+}
+
+/// Once: a present whose frame nothing wrote, and no target of its shape to
+/// stand for it. Names what the title did write, so the run says why the window
+/// is black and a later one whether this fix saw the frame at all.
+fn nothing_written(since: &crate::present::Since) {
+    victory_core::logging::warn_once("present.fallback.nothing", || {
+        let mut sizes: Vec<String> = Vec::new();
+        for target in &since.targets {
+            let size = format!("{}x{}", target.width, target.height);
+            if !sizes.contains(&size) {
+                sizes.push(size);
+            }
+        }
+        let more = sizes.len().saturating_sub(8);
+        sizes.truncate(8);
+        if more > 0 {
+            sizes.push(format!("and {more} more"));
+        }
+        let written = if sizes.is_empty() {
+            "none".to_string()
+        } else {
+            sizes.join(", ")
+        };
+        let frame = if since.cleared {
+            "presented frame was cleared but never drawn into"
+        } else {
+            "presented frame was not written"
+        };
+        format!(
+            "{frame}, and no target of its shape was written either (targets written: \
+             {written}): showing it as it is"
+        )
+    });
 }
 
 /// Records `texture`'s move from `before` to `after` in `list`, unless it is

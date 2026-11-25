@@ -1398,8 +1398,9 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
-        // A clear writes it: a target (`crate::present`).
-        crate::present::note_target(record.resource);
+        // A clear says the texture exists, not that it holds a frame
+        // (`crate::present`).
+        crate::present::note_cleared(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1454,7 +1455,9 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
-        crate::present::note_target(record.resource);
+        // A clear of the depth buffer says it exists, not that it holds a
+        // frame (`crate::present`).
+        crate::present::note_cleared(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

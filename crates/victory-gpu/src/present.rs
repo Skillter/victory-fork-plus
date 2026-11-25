@@ -8,10 +8,12 @@
 //! of 12 071 recorded operations at world frame 3318 naming a 1920-wide
 //! resource).
 //!
-//! So every operation that names a texture as a target (a render target, a
-//! depth buffer, an unordered access view, a copy or resolve destination, a
-//! clear) and every shader read of one says so here, and a present whose frame
-//! was written by none of them shows a target that was ([`pick`]).
+//! So every operation that renders into a texture (a draw or dispatch naming it
+//! as a render target or an unordered access, a copy or a resolve into it) and
+//! every shader read of one says so here, and a present whose frame was written
+//! by none of them shows a target that was ([`pick`]). A clear is not one of
+//! them: it says the texture exists, never that it holds a frame, and the title
+//! clears exactly the texture its upscaler would have filled in.
 //!
 //! The rules are conservative on purpose: a wrong image is worse than a black
 //! one.
@@ -19,6 +21,8 @@
 //! - A frame written since the last present - or the one before it, as a title
 //!   that alternates two textures presents each one every second frame - is
 //!   shown as it is, and the run is the one it was.
+//! - A clear of the frame is not a write of it: it says the texture exists,
+//!   and the target that did receive a frame is shown instead.
 //! - A target a shader also read is the frame's own source, and is preferred
 //!   to a larger one that nothing read.
 //! - Only a target of the frame's shape (within [`ASPECT_TOLERANCE`]) may
@@ -76,10 +80,13 @@ impl Target {
 /// What the operations since the last present named, for one present.
 #[derive(Debug, Default)]
 pub(crate) struct Since {
-    /// The presented texture was written since the last present, or the one
-    /// before it: it is shown as it is.
+    /// The presented texture was rendered into since the last present, or the
+    /// one before it: it is shown as it is.
     pub(crate) written: bool,
-    /// The other textures named as targets, with the shape they have now.
+    /// The presented texture was cleared instead: it exists, and holds the
+    /// clear's colour, which is not a frame.
+    pub(crate) cleared: bool,
+    /// The other textures rendered into, with the shape they have now.
     pub(crate) targets: Vec<Target>,
 }
 
@@ -96,13 +103,27 @@ pub(crate) enum Why {
 }
 
 /// What the operations since the last present named.
+#[derive(Debug, Default)]
 struct Window {
-    /// Named as a target since the last present.
+    /// Rendered into since the last present: a draw or dispatch naming it as a
+    /// render target or an unordered access, a copy or a resolve into it.
     written: Vec<usize>,
+    /// Cleared since the last present, and not necessarily drawn into: a clear
+    /// says the texture exists, never that it holds a frame.
+    cleared: Vec<usize>,
     /// Read as a shader resource since the last present.
     sampled: Vec<usize>,
-    /// Named as a target in the present before the last one.
+    /// Rendered into in the present before the last one.
     before: Vec<usize>,
+}
+
+/// What one present is told about the window it closes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Decision {
+    written: bool,
+    cleared: bool,
+    /// The textures rendered into, and whether a shader also read each.
+    candidates: Vec<(usize, bool)>,
 }
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
@@ -112,11 +133,14 @@ fn window() -> std::sync::MutexGuard<'static, Option<Window>> {
 }
 
 fn entries(window: &mut Option<Window>) -> &mut Window {
-    window.get_or_insert_with(|| Window {
-        written: Vec::new(),
-        sampled: Vec::new(),
-        before: Vec::new(),
-    })
+    window.get_or_insert_with(Window::default)
+}
+
+/// Names `at` in `list`, once.
+fn note(list: &mut Vec<usize>, at: usize) {
+    if !list.contains(&at) {
+        list.push(at);
+    }
 }
 
 /// Whether the fallback is on (`VICTORY_PRESENT_FALLBACK=0` turns it off).
@@ -125,16 +149,24 @@ fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FALLBACK").is_none_or(|v| v != "0"))
 }
 
-/// A draw, dispatch, copy, resolve or clear named `this` as a target.
+/// A draw, dispatch, copy or resolve rendered into `this`: it holds a frame.
 pub(crate) fn note_target(this: This) {
     if this.is_null() || !on() {
         return;
     }
     let mut window = window();
-    let written = &mut entries(&mut window).written;
-    if !written.contains(&(this as usize)) {
-        written.push(this as usize);
+    note(&mut entries(&mut window).written, this as usize);
+}
+
+/// A clear filled `this`: it exists, and holds no frame of its own. The title
+/// clears the texture its upscaler would have filled in, so a clear counted as
+/// a write would show the clear's colour as the frame.
+pub(crate) fn note_cleared(this: This) {
+    if this.is_null() || !on() {
+        return;
     }
+    let mut window = window();
+    note(&mut entries(&mut window).cleared, this as usize);
 }
 
 /// A shader read `this` as a resource.
@@ -143,10 +175,7 @@ pub(crate) fn note_sampled(this: This) {
         return;
     }
     let mut window = window();
-    let sampled = &mut entries(&mut window).sampled;
-    if !sampled.contains(&(this as usize)) {
-        sampled.push(this as usize);
-    }
+    note(&mut entries(&mut window).sampled, this as usize);
 }
 
 /// Takes what the operations since the last present named, for the present of
@@ -157,33 +186,54 @@ pub(crate) fn take(presented: This) -> Since {
     let Some(window) = window.as_mut() else {
         return Since {
             written: true,
+            cleared: false,
             targets: Vec::new(),
         };
     };
-    let key = presented as usize;
+    let decision = decide(window, presented as usize, on());
+    let targets = decision
+        .candidates
+        .iter()
+        .filter_map(|&(at, sampled)| target(at, sampled))
+        .collect();
+    Since {
+        written: decision.written,
+        cleared: decision.cleared,
+        targets,
+    }
+}
+
+/// Closes `window` for the present of `presented`: was the frame rendered into
+/// (or in the present before), was it only cleared, and what else was rendered
+/// into. A clear of the frame is not a write of it.
+fn decide(window: &mut Window, presented: usize, on: bool) -> Decision {
     let before = std::mem::take(&mut window.before);
-    let written = !on() || window.written.contains(&key) || before.contains(&key);
-    let mut targets = Vec::new();
+    let written = !on || window.written.contains(&presented) || before.contains(&presented);
+    let cleared = window.cleared.contains(&presented);
+    let mut candidates = Vec::new();
     if !written {
         for &at in &window.written {
-            if at != key
-                && let Some(target) = target(at, &window.sampled)
-            {
-                targets.push(target);
+            if at != presented {
+                candidates.push((at, window.sampled.contains(&at)));
             }
         }
     }
     // This window's targets are the next present's "before": two textures a
     // title alternates carry a frame written one present ago.
     window.before = std::mem::take(&mut window.written);
+    window.cleared.clear();
     window.sampled.clear();
-    Since { written, targets }
+    Decision {
+        written,
+        cleared,
+        candidates,
+    }
 }
 
 /// The shape of the title texture at `at`, if it has a host copy: every path
 /// that names a texture as a target makes one first, so this makes none.
 #[cfg(windows)]
-fn target(at: usize, sampled: &[usize]) -> Option<Target> {
+fn target(at: usize, sampled: bool) -> Option<Target> {
     let texture = crate::resource::host_resource(at as This)?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -195,7 +245,7 @@ fn target(at: usize, sampled: &[usize]) -> Option<Target> {
         flags: d.Flags.0 as u32,
         sample_count: d.SampleDesc.Count,
         dimension: d.Dimension.0 as u32,
-        sampled: sampled.contains(&at),
+        sampled,
     })
 }
 
@@ -221,7 +271,8 @@ pub(crate) fn pick(
                 && t.height > 0
                 && t.dimension == TEXTURE_2D
                 && presentable(t)
-                && (f64::from(t.width) / f64::from(t.height) - shape).abs() <= shape * ASPECT_TOLERANCE
+                && (f64::from(t.width) / f64::from(t.height) - shape).abs()
+                    <= shape * ASPECT_TOLERANCE
         })
         .collect();
     if shaped.is_empty() {
@@ -274,7 +325,79 @@ mod tests {
     }
 
     fn since(written: bool, targets: Vec<Target>) -> Since {
-        Since { written, targets }
+        Since {
+            written,
+            cleared: false,
+            targets,
+        }
+    }
+
+    /// The series-s world present as it reaches `take`: the title cleared its
+    /// 1920x1080 frame every frame and drew nothing into it, while the world
+    /// went to a 1280x720 target. A clear is not a frame.
+    #[test]
+    fn a_cleared_frame_is_not_a_written_one() {
+        let mut window = super::Window::default();
+        window.cleared.push(0x10);
+        window.written.push(0x20);
+        window.sampled.push(0x20);
+        let decision = super::decide(&mut window, 0x10, true);
+        assert!(!decision.written, "a clear of the frame is not a write of it");
+        assert!(decision.cleared, "and it is the case the log names");
+        assert_eq!(decision.candidates, vec![(0x20, true)]);
+    }
+
+    /// A frame that was rendered into is shown as it is, cleared or not.
+    #[test]
+    fn a_drawn_frame_is_written_even_when_it_was_cleared() {
+        let mut window = super::Window::default();
+        window.cleared.push(0x10);
+        window.written.push(0x10);
+        let decision = super::decide(&mut window, 0x10, true);
+        assert!(decision.written);
+        assert!(decision.cleared);
+        assert!(decision.candidates.is_empty());
+    }
+
+    /// A cleared texture is no candidate either: it holds the clear's colour,
+    /// and it was named by an operation all the same.
+    #[test]
+    fn a_cleared_target_is_no_candidate() {
+        let mut window = super::Window::default();
+        window.cleared.push(0x10);
+        let decision = super::decide(&mut window, 0x20, true);
+        assert!(!decision.written);
+        assert!(!decision.cleared);
+        assert!(decision.candidates.is_empty());
+    }
+
+    /// A window closed leaves the frame it wrote for the next present, and no
+    /// further: two textures a title alternates carry a frame one present old.
+    #[test]
+    fn a_window_closed_hands_its_frame_to_the_next_present() {
+        let mut window = super::Window::default();
+        window.written.push(0x20);
+        window.cleared.push(0x10);
+        window.sampled.push(0x20);
+        let first = super::decide(&mut window, 0x10, true);
+        assert_eq!(first.candidates, vec![(0x20, true)]);
+        let second = super::decide(&mut window, 0x20, true);
+        assert!(second.written, "the frame written one present ago still stands");
+        assert!(
+            !super::decide(&mut window, 0x20, true).written,
+            "and not two presents later"
+        );
+    }
+
+    /// With the switch off nothing is remembered and every frame is its own.
+    #[test]
+    fn the_switch_off_leaves_every_frame_as_it_is() {
+        let mut window = super::Window::default();
+        window.written.push(0x20);
+        let decision = super::decide(&mut window, 0x10, false);
+        assert!(decision.written);
+        assert!(!decision.cleared);
+        assert!(decision.candidates.is_empty());
     }
 
     /// The series-s frame: the presented 1920x1080 texture was written by
