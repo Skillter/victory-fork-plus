@@ -80,3 +80,6 @@
 Thumbs.db
 .DS_Store
 /.trash
+
+# Machine-local opencode commands (project scoped)
+/.opencode/
