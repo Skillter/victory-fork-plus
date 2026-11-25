@@ -6701,12 +6701,15 @@ impl Meter {
                 let parts: Vec<String> = (0..PHASES.len())
                     .map(|i| format!("{} {:.1} ms", PHASE_NAMES[i], ms(i)))
                     .collect();
-                let (made, walked) = crate::watch::take_askings();
+                let (made, walked, run_us, kernel_us) = crate::watch::take_askings();
                 tracing::info!(
-                    "submission phases per frame: {}, asking the kernel {:.1} times for {:.0} pages",
+                    "submission phases per frame: {}, asking the kernel {:.1} times for {:.0} pages \
+                     ({:.1} ms finding their runs, {:.1} ms in the kernel)",
                     parts.join(", "),
                     made as f64 / frames,
-                    walked as f64 / frames
+                    walked as f64 / frames,
+                    run_us as f64 / 1e3 / frames,
+                    kernel_us as f64 / 1e3 / frames
                 );
             }
             // Why the host left buffer views null, once there are any: the
