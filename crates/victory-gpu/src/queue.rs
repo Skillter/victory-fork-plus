@@ -592,6 +592,11 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
+/// The dwords one [`Plane`] description occupies: `token`, `count`, the
+/// padding `repr(C)` puts before the pointer, then the pointer itself.
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLANE_WORDS: usize = std::mem::size_of::<Plane>() / std::mem::size_of::<u32>();
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -895,22 +900,29 @@ fn note_planes(frame: u64, planes: u32, parameters: *const Plane, more: *const u
     // scaling mode (all eight words of the parameters are zero), so a title
     // that renders below the frame size and expects the console's scaler to
     // bridge the two says nothing about it here.
-    let raw: Vec<String> = if parameters.is_null() {
-        Vec::new()
-    } else {
-        // SAFETY: each plane description is plain numbers; the first
+    let raw: Vec<String> = {
+        // A description is `token`, `count` and the resource pointer, plus the
+        // padding `repr(C)` puts before the pointer: six words, not the five a
+        // hardcoded stride assumed, which split the second one at the wrong
+        // word.
+        // SAFETY: each plane description is the plain numbers `Plane`
+        // describes, and `parameters` is not null (returned above); the first
         // two are read, as the present itself reads only the first.
-        unsafe { std::slice::from_raw_parts(parameters.cast::<u32>(), planes.len().min(2) * 5) }
-            .chunks(5)
+        let words = unsafe {
+            std::slice::from_raw_parts(parameters.cast::<u32>(), planes.len().min(2) * PLANE_WORDS)
+        };
+        words
+            .chunks(PLANE_WORDS)
             .map(|w| w.iter().map(|v| format!("{v:08x}")).collect::<Vec<_>>().join(","))
             .collect()
     };
     let tail = if more.is_null() {
         String::from("no parameters")
     } else {
-        // SAFETY: the title passes what its own present takes; read the
-        // first words only, as plain numbers.
-        let words = unsafe { std::slice::from_raw_parts(more, 8) };
+        // SAFETY: the present's parameters are eight dwords, not eight bytes;
+        // the title writes at least 4-aligned words (the struct is the console
+        // API's, all of them zero in every present seen so far).
+        let words = unsafe { std::slice::from_raw_parts(more.cast::<u32>(), 8) };
         words.iter().map(|v| format!("{v:08x}")).collect::<Vec<_>>().join(",")
     };
     tracing::info!(
@@ -1144,6 +1156,16 @@ mod tests {
         assert_eq!(queue(q).desc.kind, 2);
         let none = std::ptr::null();
         assert_eq!(create_x(null, none, &QUEUE_IIDS[0], &mut q), E_INVALIDARG);
+    }
+
+    /// A present plane description is 24 bytes: the diagnostics that log the
+    /// two the title's present names walk them as words of that stride, so the
+    /// padding `repr(C)` puts before the pointer is part of it.
+    #[test]
+    fn a_plane_description_is_six_words() {
+        assert_eq!(std::mem::size_of::<Plane>(), 24);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        assert_eq!(PLANE_WORDS, 6, "the diagnostics stride");
     }
 
     #[test]

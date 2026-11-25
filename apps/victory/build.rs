@@ -20,12 +20,28 @@ fn main() {
         // A new commit moves `HEAD`; a staged change moves `index`. Both make
         // this script run again, so the hash in the next build is the next
         // commit rather than the one before it.
-        for watch in ["HEAD", "index"] {
+        for watch in ["HEAD", "index", "packed-refs"] {
             println!("cargo:rerun-if-changed={}", dir.join(watch).display());
+        }
+        // `HEAD` is `ref: refs/heads/<name>` and stays put; the file a commit
+        // writes is the ref itself. `--git-path` (an absolute one when git is
+        // new enough) resolves it into the common directory, which is where a
+        // worktree's commit lands, not into `<worktree>/.git`.
+        if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
+            let path = git(
+                &root,
+                &["rev-parse", "--path-format=absolute", "--git-path", &reference],
+            )
+            .map_or_else(|| dir.join(&reference), PathBuf::from);
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
+    // `VICTORY_BUILD` is `git status` over the *whole* tree, so any tracked
+    // file that changes its answer must rerun this script: a dirty `crates`
+    // otherwise left the previous hash in the header.
+    println!("cargo:rerun-if-changed=../../crates");
     println!("cargo:rustc-env=VICTORY_BUILD={}", build(&root, git_dir.is_some()));
 }
 
