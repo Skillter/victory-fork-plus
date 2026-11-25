@@ -27,6 +27,9 @@ pub fn run(
         Ok(dir) => victory_core::logging::init_run("info", &dir),
         Err(_) => victory_core::logging::init("info"),
     }
+    // The run's clock: the shutdown summary states how long the title ran,
+    // and this is the first moment the log can mark as its start.
+    victory_hle::modules::lifecycle::note_run_start();
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
