@@ -3697,6 +3697,15 @@ impl<'a> Lower<'a> {
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
         // do not fit.
+        // Measured on the title's 71 mesh programs over that cap (the
+        // pedestrian and transform ones): each already declares the lane
+        // count as its maxima, its own allocation request proves no less
+        // (vertices `(x & 0x7f) + 1`, primitives `s_bfe(x, 7, 7) + 1`), and
+        // every component its signature declares receives a store, so
+        // nothing comes off either way. What is left is the signature's
+        // width: 65 components cannot fit at 128 vertices (4 * 65 * 128 =
+        // 33280). Narrowing one to the components of the pixel shader that
+        // reads it needs that pair, which one container does not carry.
         use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
         let (outputs, prims) = (&self.s.outputs, &self.s.prims);
         let fits = |m: super::shader::Mesh| {
