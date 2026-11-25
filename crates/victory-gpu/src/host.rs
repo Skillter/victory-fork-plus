@@ -4388,20 +4388,20 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            // Each range the submission refreshes, as its lists name them:
+            // the asking costs with the pages it walks, so the span of a
+            // copy's ranges (a whole buffer, from its first to its last)
+            // is not what to ask about (run 94: 1,150 ms a frame).
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                        ranges.push((*address, address.saturating_add(*len)));
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             let asking = std::time::Instant::now();
             crate::watch::ask_once(&ranges);
             phase(PHASE_ASKING, asking);

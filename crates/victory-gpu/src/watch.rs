@@ -192,27 +192,39 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
+    let merged = merged(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+    if j.kept {
+        return;
     }
-    // `ask_ahead` leaves a range that lies in no run of one reservation
-    // (fewer than two ranges, or no write-watch) to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    // Every range of the submission, asked about once: a range that lies in
+    // no run of one reservation, or is not write-watched, stays with
+    // `writes`, which asks once per flush (run 76: without this, every such
+    // range was asked again at each of the submission's 70 flushes).
+    for &(start, end) in &merged {
         ask_run(j, start, end);
     }
     j.kept = !j.ahead.is_empty();
+}
+
+/// `ranges` in order, with the ones that touch (or part by less than a
+/// page) joined. One asking costs with the pages it walks, some microsecond
+/// each, so a small gap is cheaper walked than asked about on its own.
+fn merged(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < b).collect();
+    spans.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some((_, last)) if start <= last.saturating_add(PAGE) => *last = (*last).max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -245,14 +257,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// the standing asking. Nothing if the range is not write-watched memory of
 /// one reservation, or that run is covered already.
 fn ask_run(j: &mut Journal, start: usize, end: usize) {
-    let Some((run_start, run_end)) = run_of(start, end) else {
-        return;
-    };
-    if covered(j, run_start / PAGE, run_end.div_ceil(PAGE)).is_some() {
+    if run_of(start, end).is_none() {
         return;
     }
-    if ask_writes(j, run_start, run_end, j.ahead_asked) {
-        j.ahead.push((run_start / PAGE, run_end.div_ceil(PAGE)));
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if covered(j, first, last).is_some() {
+        return;
+    }
+    // The range asked about, not the run it lies in: the kernel walks the
+    // page tables of what it is asked about, page by page, so asking about
+    // a gigabyte run to learn of a megabyte's ranges cost a second a frame
+    // (run 94: 1,150 ms asking, 300,000 pages, for 0.1 MB of copies).
+    if ask_writes(j, start, end, j.ahead_asked) {
+        j.ahead.push((first, last));
     }
 }
 
@@ -428,10 +445,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     // The kernel answers about one reservation at a time: ask it, once, for
     // the whole run this range lies in, and answer from the table.
-    if let Some((run_start, run_end)) = run_of(start, end) {
+    if run_of(start, end).is_some() {
         j.asked += 1;
         let now = j.asked;
-        if ask_writes(j, run_start, run_end, now) {
+        // The range, not its run (see `ask_run`).
+        if ask_writes(j, start, end, now) {
             return Some((now, pages(j, first, last)));
         }
     }
@@ -1185,7 +1203,7 @@ mod tests {
     /// ranges in it: the sync point's one asking answers them all, and the
     /// next sync point asks again.
     #[test]
-    fn a_reservation_is_asked_about_once_per_sync_point() {
+    fn a_sync_point_asks_once_for_the_ranges_it_touches() {
         let _one_at_a_time = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let w = Watched::new(16 * KERNEL_PAGES);
         let ranges: Vec<(usize, usize)> = (0..8)
@@ -1197,16 +1215,37 @@ mod tests {
         let asked = || ASKINGS.with(|n| n.get());
         let before = asked();
         for _ in 0..2 {
-            ask_ahead(&ranges);
+            ask_once(&ranges);
             for &(start, end) in &ranges {
                 writes(start, end, false).expect("write-watched");
             }
-            ask_ahead_done();
+            ask_once_end();
         }
         assert_eq!(
             asked() - before,
             2,
-            "one asking per sync point, not per range"
+            "one asking per sync point once the touching ranges are merged, not one per range"
+        );
+    }
+
+    /// A range is what is asked about, not the reservation it lies in: the
+    /// kernel walks the page tables of the range, and a world run asked
+    /// about whole gigabyte runs to learn of 0.1 MB of copies (1,150 ms a
+    /// frame, run 94).
+    #[test]
+    fn a_range_is_asked_about_alone_not_with_its_reservation() {
+        let _one_at_a_time = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let w = Watched::new(4096);
+        let at = w.at + 2048 * KERNEL_PAGE;
+        take_askings();
+        ask_once(&[(at, at + PAGE)]);
+        let (made, walked) = take_askings();
+        ask_once_end();
+        assert_eq!(made, 1, "one asking for one range");
+        assert_eq!(
+            walked,
+            (PAGE / KERNEL_PAGE) as u64,
+            "a page of the range, not the 4,096 of its reservation"
         );
     }
 
