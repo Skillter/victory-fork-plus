@@ -50,6 +50,7 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- The light those rays would have brought indoors is estimated instead, off by default: `VICTORY_AMBIENT=<share>` raises the diffuse probe resolve to a mean of the frame's own radiance (0.8 in the fork it comes from), `constant:<level>` for a flat level, with creases (`VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>`) and a bound on what the air scatters (`VICTORY_AMBIENT_AIR=<multiple>`). See `crates/victory-gpu/src/ambient.rs`.
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.

@@ -16,6 +16,8 @@
 //! share, [`console`] which console model the title sees.
 
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 pub mod autokeys;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
