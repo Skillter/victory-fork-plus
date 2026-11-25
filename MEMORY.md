@@ -231,6 +231,20 @@ default, `run-20261125-135405.log`) restores the path the title took before:
 `the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
 loading screen.
 
+*(re-measured, `victory translate` with `VICTORY_FSPX=1`, 25 Nov)* three of the
+package's refusals were instructions with no arm at all, and they are gone:
+`v_dot4c_i32_i8`/`v_dot4_i32_i8` (1 → 0), `a packed 16-bit operation` (1 → 0,
+`v_pk_fmac_f16`) and `a special operand (vccz, execz, scc, lds_direct)` (2 → 0).
+Compute programs emitted 2728 → **2731** of 2762; vertex/pixel 14211/14259 and
+mesh 8762/8765 unchanged, so nothing that translated before stopped. What is
+left of the package is the lane model: `a lane mask read as data` 17 ×,
+`a lane mask holding lanes elsewhere read as data` 9 → 10 (one program now
+reaches that refusal instead of stopping at a special operand), `a 16-bit image
+atomic` 1, `resources: a descriptor neither loaded nor built` 1. The lane-mask
+pair is the EXEC_LO idiom (`s_mov_b32 s16, exec_lo` … `s_andn2_b32 exec_lo, s16,
+exec_lo`): `structure::key` needs both dwords of a wave64 mask, so the saved
+copy is never a mask and the SOP op consuming it reads data.
+
 *(re-measured, `run-20261125-092842.log`)* series-s now reaches the world with
 **no failed texture create and no device removal**: `R9G9B9E5` (console format
 67) has neither `RENDER_TARGET` nor `TYPED_UNORDERED_ACCESS_VIEW` support on
