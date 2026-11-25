@@ -151,6 +151,22 @@ is relative to the working directory, so do not pass a bare name from inside
 `<repo>`. The default path is under `<data-dir>` because nothing may be written
 inside `<repo>`.
 
+Read a run log from its markers, in this order. `grep '^RUN '` is what the run
+was given (build `version+commit`, the `VICTORY_*` switches that were set, the
+resolved paths, the image's BLAKE3, title id, console). `grep WINDOW` is one
+line per interval of named counters and timers, the unit in the key (`_ns`,
+`_us`, `_ms`, `_s`, `_b`, `_mb`, `_n`) and the aggregate in the field: a
+counter reads `name=total`, a sampled step `name.sum= name.max= name.last=
+name.n=`. `grep '^STOP '` is what it came to: `STOP end` (reason, duration,
+frames, mean and worst fps), `STOP meter` (the meter totalled), `STOP cache`
+(MB on disk) and `STOP warn` (every repeating condition with its count).
+The 4.2 s stall of §5.1 stayed invisible because the frame line accounted for
+copies and textures and named nothing else — a step that no key names cannot
+be found in a log, so a new step gets a `victory_core::meter` call. A refusal
+that repeats is logged by `victory_core::logging::warn_once`: first occurrence,
+then 10/100/1 000, and the footer carries the total; the `Once` that printed
+4 359 lost draws a single time is the failure that pattern removes.
+
 Diagnostics build (needed for capture, keys, WARP, GPU timing):
 
     cargo build --profile diag -p victory --features diagnostics

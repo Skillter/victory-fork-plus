@@ -189,6 +189,36 @@ never overwrites the last one and a run that outlives its terminal still leaves
 a record; the newest 20 are kept). `VICTORY_LOG_FILE=<path>` puts that file somewhere else;
 `VICTORY_LOG_FILE=0` keeps the log on stderr only.
 
+### Reading a run log
+
+Three markers, in this order; grep them before reading anything else.
+
+- `RUN` — one line per fact the run started with: build (`version`, `commit`,
+  `+dirty` when tracked files differ from it), UTC and local start, the filter
+  and cap in effect, the log file, the config file or `(none)`, resolved game,
+  cache and data directories, the image's BLAKE3, title id, manifest and
+  storage quota, console model, and every `VICTORY_*` variable that was set,
+  sorted, one per line (`grep '^RUN env'`).
+- `WINDOW` — one line per measurement interval from the frame loop:
+  `key=value` fields, integers only, sorted by key, the unit in the key (`_ns`,
+  `_us`, `_ms`, `_s`, `_b`, `_mb`, `_n`). A counter reads `name=total`; a
+  sampled step reads `name.sum= name.max= name.last= name.n=`.
+- `STOP` — what the run came to: `STOP end` (reason, duration, frames,
+  `fps_mean`, `fps_worst`), `STOP meter` (the same fields totalled since the
+  start), `STOP cache` (MB on disk per region), `STOP warn` (each repeating
+  condition and how often it was seen).
+
+A condition that repeats logs its first occurrence, then the 10th, 100th,
+1 000th … and the first one after a minute of quiet; every line carries
+`count=` and `suppressed=`, so a storm is counted instead of hidden. `RUN`,
+`STOP` and warn lines bypass `VICTORY_LOG`: a filter is for volume, not for the
+three records that explain a run.
+
+The API for a call site is `victory_core::meter`: `meter().count("draws_n", 1)`
+per draw, `meter().observe("preparing_ms", ms)`, `meter().time("copy_us", d)`,
+and `meter().report_every(FIVE_SECONDS)` from the frame loop for the `WINDOW`
+line.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
