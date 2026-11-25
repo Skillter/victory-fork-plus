@@ -248,6 +248,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_ASK_ONCE=0` | ask the write watch about each refreshed range separately instead of once per submission; on unless `0`, so `0` inflates the `submission phases per frame` line's `asking` |
+| `VICTORY_ASK_PAGES=<n>` | pages one submission may ask the kernel about, 262,144 (1 GiB) by default; the rest wait for a later submission, so a title that declares more dirty ranges than it wrote costs latency, not a stall |
+| `VICTORY_COPY_THREADS=<n>` | threads that read title memory back, by default the machine's less one (2 to 6) |
+| `VICTORY_PIPELINE_WAIT_SHARED=0` | give each thread its own 500 ms pipeline wait per frame instead of sharing one budget across the frame |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
