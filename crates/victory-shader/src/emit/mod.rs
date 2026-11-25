@@ -295,6 +295,28 @@ pub struct UserData {
     pub dword: u32,
 }
 
+<<<<<<< Updated upstream
+=======
+/// Whether a container with no `DXIL` part has its programs read from the
+/// `ACCC` part. On unless `VICTORY_FSPX=0`/`off`: a package read this way is the
+/// title's FidelityFX upscale chain, and the frame the title presents is the
+/// one that chain fills, so refusing the package leaves that frame written by
+/// nothing and the window shows white. While a program in the package fails to
+/// translate the chain stops short, which the run's window line shows as
+/// `written=false` for the presented frame.
+fn fspx_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var_os("VICTORY_FSPX")
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+>>>>>>> Stashed changes
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
