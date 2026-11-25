@@ -212,6 +212,11 @@
   committed run it walks (1.1 ms over 170 MB, 3.0-4.5 ms inside the title's
   1.2 GB block, 0.3-0.7 µs in one page), and a page at a time it was 43,520
   one-byte reads through the kernel, each faulting its page back in.
+  The runs are a map by start, never a list walked: the question comes
+  62,681 times a second (`run-20261125-181859.log`), and the walk charged
+  0.68 µs a question, 7.3 µs a run noted and 0.96 µs an unmap at 3,000 runs
+  held, against 0.06, 0.19 and 0.03 in the map (`texture::note_run`, measured
+  by `what_the_run_table_costs`).
 
 ## Diagnostics
 

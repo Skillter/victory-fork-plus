@@ -15,7 +15,7 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -991,8 +991,16 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 }
 
 /// Runs of title memory the kernel has called committed, `(start, end)`,
-/// sorted and disjoint. A run holds until the runtime maps or unmaps inside
-/// it ([`remapped`]).
+/// sorted and disjoint by start. A run holds until the runtime maps or
+/// unmaps inside it ([`remapped`]). A map, not a list: every deferred copy
+/// asks it ([`committed`]) and the title maps memory under texture views a
+/// couple of thousand times a second, and a walk of the table grew every
+/// cost with its length — at 3,000 runs held, 0.68 µs a question, 7.3 µs a
+/// run noted
+/// and 0.96 µs an unmap, against 0.06, 0.19 and 0.03 µs in the map
+/// (`what_the_run_table_costs`). The `fault` line of
+/// `run-20261125-181859.log` watched one second answer 779,370 pages in
+/// 62,681 kernel questions: the walk was asked that many times a second.
 ///
 /// The kernel's answer costs the committed run it walks: 0.3-0.7 µs for one
 /// 4 KiB page, 1.1-1.8 µs for a 1.2 GB reservation with nothing in it, and
@@ -1004,7 +1012,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// reads through the kernel that answered it a page at a time, each
 /// faulting the page it asked about back in (`run-20261125-151659.log`
 /// asked about 478,920 such pages in one 5 s window).
-static RUNS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static RUNS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
 /// The most runs kept: past it the table is emptied rather than grown, and
 /// the next questions re-derive it (a run is worth one kernel call).
@@ -1012,6 +1020,11 @@ const MAX_RUNS: usize = 4096;
 
 /// A run shorter than this is not kept: the question costs 0.7 µs a call
 /// there, and the title's blocks are megabytes.
+///
+/// What that cost is worth knowing: one second of `run-20261125-181859.log`
+/// asked about 779,370 pages in 62,681 calls, 12.4 pages (50 KiB) a call, so
+/// the title's memory is in runs shorter than this and they are asked about
+/// again every time.
 const SHORT_RUN: usize = 64 << 10;
 
 /// Whether `[at, at + len)` is committed memory the process may read
@@ -1039,8 +1052,10 @@ fn committed_bytes(start: usize, end: usize) -> u64 {
     let mut calls = 0u64;
     let mut known = 0u64;
     while at < end {
-        // The part of the span a run already holds.
-        if let Some(&(_, run_end)) = runs.iter().find(|&&(a, b)| a <= at && at < b) {
+        // The part of the span a run already holds: the one run that could,
+        // since the table is disjoint and sorted by start.
+        let held = runs.range(..=at).next_back().map(|(_, &end)| end).filter(|&b| at < b);
+        if let Some(run_end) = held {
             let stop = run_end.min(end);
             there += (stop - at) as u64;
             there_pages += (stop.saturating_sub(1) / KERNEL_PAGE - at / KERNEL_PAGE + 1) as u64;
@@ -1092,27 +1107,35 @@ fn committed_bytes(start: usize, end: usize) -> u64 {
 /// and capped at [`MAX_RUNS`]. A short run is not worth a table entry: its
 /// question is 0.7 µs, and one of ours (`crate::fault`'s test buffer, a
 /// host copy) is not a title block asked about every frame.
-fn note_run(runs: &mut Vec<(usize, usize)>, base: usize, end: usize) {
+fn note_run(runs: &mut BTreeMap<usize, usize>, base: usize, end: usize) {
     if end.saturating_sub(base) < SHORT_RUN {
         return;
     }
-    if runs.iter().any(|&(a, b)| a <= base && end <= b) {
+    // A run the table holds already answers it whole.
+    if runs.range(..=base).next_back().is_some_and(|(_, &b)| end <= b) {
         return;
     }
     if runs.len() >= MAX_RUNS {
         runs.clear();
     }
-    runs.push((base, end));
-    runs.sort_unstable();
-    // The runs a new one joins or swallows are one run.
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for &(a, b) in runs.iter() {
-        match merged.last_mut() {
-            Some(last) if a <= last.1 => last.1 = last.1.max(b),
-            _ => merged.push((a, b)),
-        }
+    // The runs it joins, touches or swallows are one run: the one holding
+    // its first byte, then every one that starts before the merged end.
+    let (mut start, mut stop) = (base, end);
+    if let Some((&a, &b)) = runs.range(..=base).next_back()
+        && b >= base
+    {
+        start = a;
+        stop = stop.max(b);
+        runs.remove(&a);
     }
-    *runs = merged;
+    while let Some((&a, &b)) = runs.range(start..).next() {
+        if a > stop {
+            break;
+        }
+        stop = stop.max(b);
+        runs.remove(&a);
+    }
+    runs.insert(start, stop);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what the
@@ -1122,7 +1145,23 @@ fn note_run(runs: &mut Vec<(usize, usize)>, base: usize, end: usize) {
 pub(crate) fn remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    runs.retain(|&(a, b)| b <= at || a >= end);
+    drop_touching(&mut runs, at, end);
+}
+
+/// Drops every run `[at, end)` touches: they start before `end` and end
+/// after `at`, and the table is disjoint and sorted, so walking back from
+/// the last one stops at the first that ends at or before `at`.
+fn drop_touching(runs: &mut BTreeMap<usize, usize>, at: usize, end: usize) {
+    let mut gone: Vec<usize> = Vec::new();
+    for (&a, &b) in runs.range(..end).rev() {
+        if b <= at {
+            break;
+        }
+        gone.push(a);
+    }
+    for a in gone {
+        runs.remove(&a);
+    }
 }
 
 /// How many bytes of `[at, at + len)` are committed memory: all of a
@@ -1549,5 +1588,158 @@ mod staging_ceiling_tests {
         assert!(to_ceiling(&entries, 400, 400).is_empty(), "under the ceiling");
         // A list holds the only buffer: it goes regardless of the ceiling.
         assert!(to_ceiling(&[(1, 400, true)], 400, 0).is_empty(), "held");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod run_table_cost {
+    use std::time::Instant;
+
+    /// What the run table charges a question and an insertion, at the sizes
+    /// the table reaches in a run: the answer is a `VirtualQuery` once per
+    /// run, and every question after is a lookup in this table.
+    ///
+    /// `cargo test -p victory-gpu --lib --locked what_the_run_table_costs -- --ignored --nocapture`
+    ///
+    /// The table charges the copy refresh too: `shadow::read_in_place` asks
+    /// it once per copy ([`super::committed`]), and `texture::remapped`
+    /// walks it once per range the runtime maps or unmaps — 1,454 to 2,549
+    /// of those in a window of `run-20261125-181859.log`.
+    #[test]
+    #[ignore = "a measurement, not a proof: run by hand"]
+    fn what_the_run_table_costs() {
+        use windows_sys::Win32::System::Memory::*;
+        /// Fills the table with `n - 1` runs of 64 KiB apart from our own,
+        /// which stands last: the worst place for a search that walks it.
+        fn fill(n: usize, at: usize) {
+            let mut runs = super::RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            runs.clear();
+            for i in 0..n - 1 {
+                let base = 0x1_0000_0000u64 as usize + i * (1 << 20);
+                super::note_run(&mut runs, base, base + (64 << 10));
+            }
+            let base = at & !((64 << 10) - 1);
+            super::note_run(&mut runs, base, base + (64 << 10));
+        }
+        // A real committed range, so a question about it is answered from
+        // the table and never by the kernel.
+        // SAFETY: our own reservation, released before the test returns.
+        let base = unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 4 << 20, MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(1, 4096);
+            base
+        };
+        let at = base.wrapping_add(1 << 20) as usize;
+        for n in [256usize, 1000, 3000] {
+            fill(n, at);
+            const ASKS: usize = 20_000;
+            let started = Instant::now();
+            for _ in 0..ASKS {
+                assert_eq!(super::committed_bytes(at, at + (64 << 10)), 64 << 10);
+            }
+            let ask = started.elapsed().as_nanos() as f64 / ASKS as f64 / 1e3;
+            // Insertions: a run the table does not hold yet, one after
+            // another, into the table `fill` left.
+            const PUTS: usize = 500;
+            let started = Instant::now();
+            {
+                let mut runs = super::RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                for i in 0..PUTS {
+                    let fresh = 0x4000_0000_0000usize + i * (1 << 20);
+                    super::note_run(&mut runs, fresh, fresh + (64 << 10));
+                }
+            }
+            let put = started.elapsed().as_nanos() as f64 / PUTS as f64 / 1e3;
+            // What one mapping of the runtime costs the table.
+            const REMAPS: usize = 20_000;
+            let started = Instant::now();
+            for i in 0..REMAPS {
+                super::remapped(at + (i % 16) * 4096, 4096);
+            }
+            let remap = started.elapsed().as_nanos() as f64 / REMAPS as f64 / 1e3;
+            println!(
+                "{n} runs held: a question {ask:.3} us, an insertion {put:.3} us, \
+                 an unmap {remap:.3} us"
+            );
+        }
+        // SAFETY: our own reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod run_table_tests {
+    use super::{MAX_RUNS, SHORT_RUN, drop_touching, note_run};
+    use std::collections::BTreeMap;
+
+    /// The runs: `(start, end)` of each, in order.
+    fn held(runs: &BTreeMap<usize, usize>) -> Vec<(usize, usize)> {
+        runs.iter().map(|(&a, &b)| (a, b)).collect()
+    }
+
+    /// A run joins the ones it touches and swallows the ones it covers; a
+    /// run the table already holds whole is not noted again, and one
+    /// shorter than a short run is not noted at all.
+    #[test]
+    fn the_runs_a_new_one_joins_are_one() {
+        const K: usize = SHORT_RUN;
+        let mut runs = BTreeMap::new();
+        for (a, b) in [(0, K), (2 * K, 4 * K), (8 * K, 9 * K)] {
+            note_run(&mut runs, a, b);
+        }
+        assert_eq!(held(&runs), vec![(0, K), (2 * K, 4 * K), (8 * K, 9 * K)]);
+        // A run the table holds whole changes nothing.
+        note_run(&mut runs, 0, K);
+        note_run(&mut runs, K / 2, K);
+        assert_eq!(held(&runs), vec![(0, K), (2 * K, 4 * K), (8 * K, 9 * K)]);
+        // One that touches the first and the second at both ends is one run.
+        note_run(&mut runs, K, 2 * K);
+        assert_eq!(held(&runs), vec![(0, 4 * K), (8 * K, 9 * K)], "touching joins");
+        // One between the two, reaching past the end of the second and the
+        // start of the third, swallows both whole.
+        note_run(&mut runs, 3 * K, 8 * K + K / 2);
+        assert_eq!(held(&runs), vec![(0, 9 * K)], "swallows");
+        // A short run is not worth a table entry.
+        note_run(&mut runs, 16 * K, 16 * K + K / 2);
+        assert_eq!(held(&runs), vec![(0, 9 * K)], "short");
+        // Past the cap the table is emptied and the new run stands alone.
+        let mut full = BTreeMap::new();
+        for i in 0..MAX_RUNS {
+            note_run(&mut full, i * 4 * K, i * 4 * K + K);
+        }
+        assert_eq!(full.len(), MAX_RUNS);
+        let last = MAX_RUNS * 8 * K;
+        note_run(&mut full, last, last + K);
+        assert_eq!(held(&full), vec![(last, last + K)], "the cap empties it");
+    }
+
+    /// A mapping or unmapping drops every run it touches, and only those.
+    #[test]
+    fn an_unmap_drops_the_runs_it_touches() {
+        const K: usize = SHORT_RUN;
+        let mut runs = BTreeMap::new();
+        for (a, b) in [(0, 4 * K), (4 * K, 8 * K), (8 * K, 12 * K)] {
+            runs.insert(a, b);
+        }
+        // Inside the first run: it goes whole, the others stay.
+        drop_touching(&mut runs, K, 2 * K);
+        assert_eq!(held(&runs), vec![(4 * K, 8 * K), (8 * K, 12 * K)]);
+        // Touching the join: the run that ends there goes, the one that
+        // starts there stays (a range ends before it).
+        drop_touching(&mut runs, 8 * K - 1, 8 * K);
+        assert_eq!(held(&runs), vec![(8 * K, 12 * K)]);
+        drop_touching(&mut runs, 8 * K + K, 12 * K);
+        assert_eq!(held(&runs), Vec::new());
+        // Nothing to drop: every run ends before it or starts after it.
+        let mut runs = BTreeMap::new();
+        runs.insert(0, K);
+        runs.insert(4 * K, 5 * K);
+        drop_touching(&mut runs, K, 4 * K);
+        assert_eq!(held(&runs), vec![(0, K), (4 * K, 5 * K)], "the untouched");
+        // A run that only ends where the range starts stays.
+        drop_touching(&mut runs, K, K + 1);
+        assert_eq!(held(&runs), vec![(0, K), (4 * K, 5 * K)], "just outside");
     }
 }
