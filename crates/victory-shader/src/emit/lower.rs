@@ -7600,69 +7600,6 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
-    /// The bits of the float nearest the double whose dwords are `lo` and
-    /// `hi`, on 32-bit integers: round to nearest even, infinities and NaN
-    /// kept (a NaN stays quiet), a result below the smallest normal float
-    /// signed zero (flushed, as the console's default float mode does).
-    // The flush-to-zero form of v_cvt_f32_f64: kept beside the IEEE form in use until the console's
-    // float mode for this instruction is checked.
-    #[allow(dead_code)]
-    fn f64_bits_to_f32_bits(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k20, k29, k3, k23) = (k(self, 20), k(self, 29), k(self, 3), k(self, 23));
-        let sign_mask = k(self, 0x8000_0000);
-        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
-        let e = self.s.m.bin(c, Bin::LShr, hi, k20);
-        let e_mask = k(self, 0x7ff);
-        let e = self.s.m.bin(c, Bin::And, e, e_mask);
-        // The top 23 bits of the 52-bit mantissa, and the 29 below them.
-        let m_mask = k(self, 0x000f_ffff);
-        let mh = self.s.m.bin(c, Bin::And, hi, m_mask);
-        let mh = self.s.m.bin(c, Bin::Shl, mh, k3);
-        let ml = self.s.m.bin(c, Bin::LShr, lo, k29);
-        let m = self.s.m.bin(c, Bin::Or, mh, ml);
-        let rest_mask = k(self, 0x1fff_ffff);
-        let rest = self.s.m.bin(c, Bin::And, lo, rest_mask);
-        // Round to nearest even: up past half, or at half when odd.
-        let half = k(self, 0x1000_0000);
-        let one = k(self, 1);
-        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
-        let at = self.s.m.cmp(c, pred::EQ, rest, half);
-        let odd = self.s.m.bin(c, Bin::And, m, one);
-        let zero = k(self, 0);
-        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
-        let tie = self.s.m.bin(c, Bin::And, at, odd);
-        let up = self.s.m.bin(c, Bin::Or, above, tie);
-        let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
-        // steps the exponent, up to infinity.
-        let bias = k(self, 1023 - 127);
-        let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
-        let ex = self.s.m.bin(c, Bin::Shl, e32, k23);
-        let normal = self.s.m.bin(c, Bin::Add, ex, m);
-        let normal = self.s.m.bin(c, Bin::Add, normal, up);
-        let normal = self.s.m.bin(c, Bin::Or, normal, sign);
-        // Exponents out of the float's range (signed, after rebiasing).
-        let inf = k(self, 0x7f80_0000);
-        let inf = self.s.m.bin(c, Bin::Or, inf, sign);
-        let k255 = k(self, 255);
-        let big = self.s.m.cmp(c, pred::SGE, e32, k255);
-        let small = self.s.m.cmp(c, pred::SLE, e32, zero);
-        let r = self.s.m.select(c, big, inf, normal);
-        let r = self.s.m.select(c, small, sign, r);
-        // Infinity and NaN (a NaN with any mantissa bit set stays a NaN).
-        let all = k(self, 0x7ff);
-        let special = self.s.m.cmp(c, pred::EQ, e, all);
-        let any = self.s.m.bin(c, Bin::Or, mh, ml);
-        let any = self.s.m.bin(c, Bin::Or, any, rest);
-        let nan = self.s.m.cmp(c, pred::NE, any, zero);
-        let quiet = k(self, 0x0040_0000);
-        let quiet = self.s.m.select(c, nan, quiet, zero);
-        let special_bits = self.s.m.bin(c, Bin::Or, inf, quiet);
-        self.s.m.select(c, special, special_bits, r)
-    }
-
     /// The low and high dwords of an i64.
     fn split64(&mut self, x: V) -> (V, V) {
         let c = self.cur;

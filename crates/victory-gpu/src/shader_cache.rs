@@ -81,19 +81,25 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
+                // So is every string switch that changes what the translator
+                // emits (the numeric ones — `shader_opt`, `loop_limit`,
+                // `group_sync` — are keyed above by their value): without them
+                // here a run with `VICTORY_WAVE_WIDE=0` was served the
+                // translations an earlier run of the same executable had cached
+                // with the switch unset. A switch that changes a translation is
+                // added here in the same change, sorted, one per line; the ones
+                // that only print (`VICTORY_WAVE_WHY`, `VICTORY_DESC_WHY`,
+                // `VICTORY_SHADER_CENSUS`) are left out.
                 for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
-                    // It decides whether a first-lane read in a half-wave is
-                    // translated at all: a translation made with it unset must
-                    // not be served to a run that sets it.
                     "VICTORY_FIRSTLANE_OWN",
+                    "VICTORY_FIRST_HALF",
+                    "VICTORY_MESH_OUTPUT_STRICT",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_WAVE_DEEP_SKIPS",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_WAVE_WIDE",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

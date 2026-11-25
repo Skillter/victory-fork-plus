@@ -378,6 +378,29 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// What a look at a texture it uploaded whole leaves `heap_textures` to do
+/// ([`RECHECK_FRAMES`]): `looks` looks have been made, `print` is the
+/// fingerprint the upload recorded and `seen` the one the memory gives now.
+struct Looked {
+    /// The memory is other than the upload left it: upload it again.
+    changed: bool,
+    /// The look after this one: when it is due, and how many looks will have
+    /// been made then (none when the schedule is over).
+    again: Option<(u64, u8)>,
+}
+
+/// The step after one look (`heap_textures`): the look that finds a change
+/// counts as one and the schedule goes on from there. Restarting it at
+/// `RECHECK_FRAMES[0]` uploaded a texture the title rewrites for ever every
+/// fourth frame, for the rest of the run.
+fn recheck_step(frame: u64, looks: u8, print: u64, seen: u64) -> Looked {
+    let next = looks.saturating_add(1);
+    let again = RECHECK_FRAMES
+        .get(usize::from(next))
+        .map(|&wait| (frame + wait, next));
+    Looked { changed: seen != print, again }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1713,24 +1736,29 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             //
-            // A change resumes the schedule instead of restarting it: the
-            // look that found the change counts as one, so a texture the
-            // title rewrites for ever is uploaded at most as often as the
-            // schedule says and then left alone, rather than every fourth
-            // frame for the rest of the run.
-            let mut looks_after = 0u8;
+            // A change resumes the schedule instead of restarting it: both
+            // it and a look that found the memory as it was go through
+            // `recheck_step` ([`Looked`]), so a texture the title rewrites
+            // for ever is uploaded at most as often as the schedule says and
+            // then left alone, rather than every fourth frame for the rest
+            // of the run.
+            // The first upload looks again at `RECHECK_FRAMES[0]` with no
+            // look made yet; a look that finds a change replaces it with its
+            // own step.
+            let mut relook = Some((frame + RECHECK_FRAMES[0], 0u8));
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let looked = recheck_step(frame, looks, print, crate::texture::fingerprint(at, len));
+                if !looked.changed {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    match looked.again {
+                        Some((due, next)) => {
+                            host.texture_slot_recheck(index, write, due, (at, len), print, next, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
-                looks_after = looks.saturating_add(1);
+                relook = looked.again;
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -1860,10 +1888,10 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    match RECHECK_FRAMES.get(usize::from(looks_after)) {
-                        Some(wait) => host.texture_slot_recheck(
-                            index, write, frame + wait, (at, len), print, looks_after, frame,
-                        ),
+                    match relook {
+                        Some((due, looks)) => {
+                            host.texture_slot_recheck(index, write, due, (at, len), print, looks, frame)
+                        }
                         None => host.texture_slot_done(index, write, again),
                     }
                 }
@@ -2999,5 +3027,53 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The step the pass takes after looking at a texture it uploaded whole
+    /// (`heap_textures`) ends the schedule after `RECHECK_FRAMES`' five
+    /// looks, whether the memory changed each time or never. The fingerprint
+    /// is a number here, so no card is needed; the step itself is the one
+    /// the pass runs.
+    #[test]
+    fn a_texture_looked_at_again_settles_after_the_schedule() {
+        let print = 0x1234_5678_9abc_def1u64;
+        for changed in [false, true] {
+            let mut frame = 0;
+            let mut looks = 0u8;
+            let mut made = 0;
+            // The arm the pass makes for a first upload.
+            let mut due = frame + RECHECK_FRAMES[0];
+            loop {
+                frame = due;
+                made += 1;
+                // The upload's own fingerprint, or another one each look.
+                let seen = if changed { print ^ made as u64 } else { print };
+                let looked = recheck_step(frame, looks, print, seen);
+                assert_eq!(looked.changed, changed, "look {made}, changed {changed}");
+                match looked.again {
+                    Some((next_due, next_looks)) => {
+                        assert_eq!(next_looks, looks + 1, "look {made}");
+                        assert_eq!(
+                            next_due,
+                            frame + RECHECK_FRAMES[usize::from(next_looks)],
+                            "look {made}"
+                        );
+                        (due, looks) = (next_due, next_looks);
+                    }
+                    None => break,
+                }
+                assert!(made <= RECHECK_FRAMES.len(), "looked at {made} times");
+            }
+            // Five looks, then nothing: a texture the title rewrites for ever
+            // is left alone instead of uploaded every fourth frame.
+            assert_eq!(made, RECHECK_FRAMES.len(), "changed {changed}");
+        }
+        // The first look is the first wait of the schedule.
+        assert_eq!(RECHECK_FRAMES[0], 4);
     }
 }
