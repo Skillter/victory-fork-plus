@@ -5756,6 +5756,20 @@ impl<'a> Lower<'a> {
             }
         }
         let Some((at, first)) = resolved else {
+            // A descriptor the code picks out of the SM 6.6 view heap by an
+            // index it computes (`RootType::ResourceHeap`): the hardware
+            // takes that index, the host does not, and a host value for a
+            // view's title address names its dword at compile time
+            // ([`Self::view_address`]), so nothing ties the slot the code
+            // means to one. (A `Table` whose index is a root constant is
+            // pointed at the entry when the draw binds,
+            // `resource::RootIndexedView`.)
+            if address
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
+            {
+                return Err("a view heap descriptor's address read as data");
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -11647,6 +11661,47 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// A descriptor the code picks out of the SM 6.6 view heap (SM 6.6
+    /// dynamic resources): read as data, the view's title address has no
+    /// host value, and the refusal says which kind of descriptor it was.
+    #[test]
+    fn a_view_heap_descriptor_read_as_data_names_the_heap() {
+        let words = [
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0020, // s_load_dwordx4 s[8:11], s[2:3], 0x20
+            0xBF02_8008, // s_cmp_gt_i32 s8, 0
+            0xBF85_0001, // s_cbranch_scc1 label_1
+            S_ENDPGM,
+            S_ENDPGM,
+        ];
+        let heap = RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 2,
+            slot: 0,
+        };
+        let what = match lower_with(&words, vec![heap], vec![]) {
+            Ok(_) => panic!("a view heap descriptor's address has no host value"),
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(what, "a view heap descriptor's address read as data");
+        // A table's where the code holds the dword: unchanged.
+        let table = RootParam {
+            root: RootType::Table,
+            ..heap
+        };
+        let what = match lower_with(&words, vec![table], vec![]) {
+            Ok(_) => panic!("no used resource: nothing names the view"),
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(what, "a descriptor read only as data");
     }
 
     #[test]
