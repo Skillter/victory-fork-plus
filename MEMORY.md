@@ -261,9 +261,14 @@ With the card's copies off (`VICTORY_CARD_BUFFERS=0`) the same declaration is
 host work: 10.3 ms of snapshot plus 9.7 ms of compare a submission, measured
 here at 14–15 GB/s (145,752,064 B memcpy 10.3 ms, u64 piece compare 9.7 ms),
 ~80 ms a frame at 4 submissions.
-No run of this session reached the world to compare both: three runs of 3.5–10
-minutes stayed at the main menu (30 fps, 3 draws a frame, no
-`pack\core_restofworld` opened) and one was killed by a segfault.
+A world run (5,138 draws a frame, 324 ms, `run-20261125-062758.log`) divides
+the frame between both sides: 209 ms waiting for the card (107 ms of work
+queued, 78 % busy) and 165 ms of CPU (recording 41, flush 53, copies 72), so
+neither side is idle. `flow` prices those copies a second apart: 13,034
+deferred copies of 6.7 MB in 9.6 ms, 113 MB read out of title memory in place
+in 6.2 ms (18 GB/s), 25 MB snapshotted for shaders in 0.2 ms — the 72 ms is
+per-call work, not bytes. Writing into title memory is the slow direction:
+2.1 MB in 256 calls at 1.3 GB/s, a partial page's read-modify-write.
 
 ## 5.2 Missing content — clothes and materials
 
