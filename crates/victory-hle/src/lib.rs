@@ -19,6 +19,11 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+// The console's window, for the run that owns it: `launch.toml`'s focus and
+// Enter schedule lives with the swap chain (`victory_gpu::autokeys`), and the
+// binary reaches the GPU layer only through this crate.
+#[cfg(windows)]
+pub use victory_gpu::autokeys;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

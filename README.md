@@ -170,6 +170,36 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+### Unattended runs (`launch.toml`)
+
+A run can bring the title's window to the front and press Enter for it, so it
+gets past the title's menus with nobody at the keyboard. The file is
+`launch.toml` in the data folder (`%LOCALAPPDATA%\victory\data\launch.toml`),
+never in the repository, and it is read at every launch: an edit applies to the
+next run with no rebuild and no environment variable, and a run started from
+another worktree reads the same file. `VICTORY_LAUNCH_TOML=<path>` reads
+another one (for tests).
+
+```toml
+# Bring the title's window to the front once it exists.
+focus = true
+# Press Enter for the title, so a run can get past its menus while nobody is at the keyboard.
+enter = true
+# Seconds after the title starts before the first press, then between presses.
+enter_after_s = 35
+enter_every_s = 20
+# How many presses at most.
+enter_times = 12
+```
+
+Every key is optional: `focus` and `enter` are off unless set, and a key left
+out keeps its value above. A missing file is both features off; a file that
+does not parse is a warning and both features off, and never stops the title
+from booting. The presses are real keys (`SendInput`, so the focused window
+receives them); `focus` taken for them is given back after the last one. The
+log carries the policy read, on one `RUN launch focus=… enter=… after=…
+every=… times=…` line.
+
 ## Commands
 
 ```
