@@ -101,12 +101,15 @@
 
 - `resource::room` refuses only when the card is at its ceiling; a refusal is
   answered by reclaiming a copy that one idle slot alone holds. A slot seen
-  twice in 64 frames is protected from the sweep, and protection lapses after
-  600 frames without a sample of it (`resource::protected_at`): a set that
-  could only grow filled the budget and left `room` refusing for the rest of
-  the run. The admission line counts copies the sweep manages, never one the
-  host wrote (a render target keeps itself). Never raise the ceiling to make a
-  refusal go away; reclaim or admit instead.
+  twice inside 64 frames is protected from the sweep, and protection lapses
+  after 600 frames or 10 s without a sample of it — whichever comes first,
+  since 600 frames are 10 s only at 60 fps — and a sample after a gap of more
+  than 64 frames spends the count (`resource::protected_at`,
+  `resource::admit_step`): a set that could only grow filled the budget and
+  left `room` refusing for the rest of the run. The admission line counts
+  copies the sweep manages, never one the host wrote (a render target keeps
+  itself). Never raise the ceiling to make a refusal go away; reclaim or
+  admit instead.
 - Staging copies are capped in system RAM (`VICTORY_STAGING_MB`), coldest and
   not-held first: re-admitting from staging is one DMA, decoding the title's
   format is far more expensive.
