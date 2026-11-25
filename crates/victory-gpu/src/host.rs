@@ -43,6 +43,11 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
+    /// The copies of title memory into its copies in the card's memory, on
+    /// a queue of their own ([`copy_queue`]); `None` when the switch is off
+    /// or the device would not make the queue, and the copies then go in the
+    /// direct list ahead of the submission that reads them.
+    copies: Option<CopyQueue>,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -921,6 +926,19 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        // The uploads' own queue ([`copy_queue`]): a device that refuses one
+        // leaves them on the direct queue, as without the switch.
+        let copies = if copy_queue() {
+            match make_copy_queue(&device) {
+                Ok(copies) => Some(copies),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no copy queue for the copies into the card's memory; they stay on the direct queue");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -945,6 +963,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
+            copies,
             rtvs,
             rtv_size,
             dsvs,
@@ -1806,6 +1825,165 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// Whether the copies of title memory into its copies in the card's memory
+/// go on a COPY queue of their own (`VICTORY_COPY_QUEUE=1`) instead of the
+/// direct queue ahead of the submission that reads them (**off** by
+/// default).
+///
+/// Those copies are one system-memory-to-card DMA of ~140 MB a frame (the
+/// card line's "sent up"), and on the direct queue it sits between the
+/// flights before a submission and the submission's own lists. A copy queue
+/// can run it beside them, but only where nothing reads the copies: the
+/// copies write the buffers the title's shaders read, so every list that
+/// reads them waits for the copy fence, and the copy queue in turn waits for
+/// the flights already sent, which read those buffers with the bytes from
+/// before. What the split buys is one submission's DMA running while the
+/// flights before it finish, and nothing more, which is why it is off: the
+/// win it cannot give needs the copies double buffered, or the wait narrowed
+/// to the flights that named the copies being uploaded (those numbers are
+/// in `crate::shadow`'s flights, today only with the relay).
+/// [`COPY_QUEUE_STATS`] is what a run of it reports, and its third figure is
+/// whether anything overlapped at all.
+fn copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_QUEUE").is_ok_and(|v| v == "1"))
+}
+
+/// The run's copies into the card's copies on their own queue
+/// ([`copy_queue`]): batches sent, their bytes, batches whose run had
+/// finished when the next was ready (they ran beside the direct queue), and
+/// batches still running then.
+static COPY_QUEUE_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// What the copy queue and the direct queue know of each other: every batch
+/// of copies is signalled on the copy fence ([`CopyOrder::sending`]), the
+/// direct queue waits for that value before any list that reads a copy
+/// ([`CopyOrder::wait`]), and the copy queue waits for the direct queue's
+/// last send before it writes one ([`CopyOrder::direct_sent`]). One queue
+/// needs none of this: the order of that queue says it.
+#[derive(Default)]
+struct CopyOrder {
+    /// The last value signalled on the copy fence.
+    sent: u64,
+    /// The last value the direct queue was told to wait for.
+    waited: u64,
+    /// The last value signalled on the direct queue's fence.
+    direct: u64,
+}
+
+impl CopyOrder {
+    /// A batch is going to the copy queue: the value it is signalled with.
+    fn sending(&mut self) -> u64 {
+        self.sent += 1;
+        self.sent
+    }
+
+    /// The value the direct queue must wait for before a list that reads a
+    /// copy, if any batch was sent whose completion it has not waited for.
+    fn wait(&self) -> Option<u64> {
+        (self.sent > self.waited).then_some(self.sent)
+    }
+
+    /// The direct queue waits for `value`: every batch sent before it is in
+    /// the card's copies.
+    fn waited(&mut self, value: u64) {
+        self.waited = self.waited.max(value);
+    }
+
+    /// The direct queue signalled `value`.
+    fn direct_sent(&mut self, value: u64) {
+        self.direct = value;
+    }
+}
+
+/// The state a copy destination is in when the direct queue's list reads it
+/// after the copies into it: `COMMON` when they ran on the copy queue (a
+/// resource accessed on a copy queue decays to `COMMON` when that
+/// `ExecuteCommandLists` completes, and a copy queue may touch a resource
+/// only in `COMMON` or a copy state), `COPY_DEST` when they are in the same
+/// list, which promoted it and left it there.
+fn copied_state(on_copy_queue: bool) -> D3D12_RESOURCE_STATES {
+    if on_copy_queue {
+        D3D12_RESOURCE_STATE_COMMON
+    } else {
+        D3D12_RESOURCE_STATE_COPY_DEST
+    }
+}
+
+/// The copy queue ([`copy_queue`]), the fence a batch is signalled on, and
+/// the event for the one wait a full pool makes on this thread.
+struct CopyQueue {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    lists: Mutex<CopyLists>,
+}
+
+/// The copy queue's lists, and the order the two queues keep
+/// ([`CopyOrder`]). A list is recorded, sent, and given back only when the
+/// batch it recorded has completed: an allocator cannot be reset while the
+/// card runs it.
+#[derive(Default)]
+struct CopyLists {
+    order: CopyOrder,
+    /// Lists whose batch has completed: free to record again.
+    idle: Vec<Prelude>,
+    /// Batches sent and not completed: the value signalled after each and
+    /// the list that recorded it.
+    flying: std::collections::VecDeque<(u64, Prelude)>,
+}
+
+impl CopyLists {
+    /// Gives back the lists of the batches the card has finished.
+    fn free(&mut self, fence: &ID3D12Fence) {
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { fence.GetCompletedValue() };
+        while self.flying.front().is_some_and(|(value, _)| *value <= done) {
+            if let Some((_, prelude)) = self.flying.pop_front() {
+                self.idle.push(prelude);
+            }
+        }
+    }
+
+    /// A list to record the next batch in: one whose batch completed, or
+    /// the oldest batch's when none has and all are in the air.
+    fn take(&mut self, fence: &ID3D12Fence, event: HANDLE) -> Option<Prelude> {
+        self.free(fence);
+        if self.idle.is_empty()
+            && let Some((value, _)) = self.flying.front()
+        {
+            // SAFETY: our fence and event; the batch is on the card.
+            unsafe {
+                fence.SetEventOnCompletion(*value, event).ok()?;
+                let _ = WaitForSingleObject(event, INFINITE);
+            }
+            self.free(fence);
+        }
+        self.idle.pop()
+    }
+}
+
+/// The copy queue, made or not: a device that will not give a COPY queue
+/// leaves the copies on the direct queue, as without the switch.
+fn make_copy_queue(device: &ID3D12Device) -> windows::core::Result<CopyQueue> {
+    // SAFETY: plain object creation; the event is ours.
+    unsafe {
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let event = CreateEventW(None, false, false, None)?;
+        Ok(CopyQueue {
+            queue,
+            fence,
+            event,
+            lists: Mutex::new(CopyLists::default()),
+        })
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3840,6 +4018,23 @@ impl Host {
         }
     }
 
+    /// An allocator and a closed list on the copy queue ([`copy_queue`]).
+    fn make_copy_prelude(&self) -> Option<Prelude> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList =
+                self.device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)
+                    .ok()?;
+            list.Close().ok()?;
+            Some((allocator, list))
+        }
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -3990,6 +4185,116 @@ impl Host {
         }
     }
 
+    /// The copies of the dirty ranges into their copies in the card's
+    /// memory, on the copy queue ([`copy_queue`]), and the wait that makes
+    /// the direct queue see them: `direct` is the last value signalled on
+    /// the direct queue's fence, which the batch waits for (the flights
+    /// already sent read those copies with the bytes from before it), and
+    /// the value returned is the one signalled after it, which every list
+    /// the direct queue runs next waits for ([`copied_state`] for the state
+    /// the batch leaves a copy in). `None` with the switch off, no copy
+    /// queue, or no list to record in: the caller copies in its own list.
+    fn card_copies(
+        &self,
+        dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+        direct: u64,
+    ) -> Option<u64> {
+        let copies = self.copies.as_ref()?;
+        let mut lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+        let (allocator, list) = lists
+            .take(&copies.fence, copies.event)
+            .or_else(|| self.make_copy_prelude())?;
+        // Whether the batch before this one overlapped the direct queue: a
+        // batch still on the card when the next is ready held it, and is
+        // what the split buys or does not ([`COPY_QUEUE_STATS`]).
+        if lists.order.sent > 0 {
+            // SAFETY: a plain query of our fence.
+            let done = unsafe { copies.fence.GetCompletedValue() };
+            COPY_QUEUE_STATS[2 + usize::from(done < lists.order.sent)].fetch_add(1, Ordering::Relaxed);
+        }
+        let mut bytes = 0u64;
+        let mut ranges = 0u64;
+        // SAFETY: a list whose last batch has completed (`CopyLists::take`),
+        // live buffers, and ranges that lie in them.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                if direct > lists.order.direct {
+                    copies.queue.Wait(&self.fence, direct)?;
+                    lists.order.direct_sent(direct);
+                }
+                for (shadow, dirty) in dirty {
+                    let Some((staging, _, _)) = shadow.card_sides() else {
+                        continue;
+                    };
+                    for &(a, b) in dirty {
+                        list.CopyBufferRegion(
+                            &shadow.buffer,
+                            a as u64,
+                            staging,
+                            a as u64,
+                            (b - a) as u64,
+                        );
+                        bytes += (b - a) as u64;
+                        ranges += 1;
+                    }
+                    // A copy queue may touch a copy only in `COMMON` or a
+                    // copy state, and the next reader is on the direct
+                    // queue, which cannot take it in `COPY_DEST` from here:
+                    // the batch leaves it in `COMMON`, where a buffer is
+                    // read and written without a transition (D3D12's state
+                    // decay, [`copied_state`]).
+                    if !dirty.is_empty() {
+                        list.ResourceBarrier(&[transition(
+                            &shadow.buffer,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )]);
+                    }
+                }
+                list.Close()?;
+                copies.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            // Nothing reached the card: the list is closed again, free to
+            // record, and the caller copies in its own list.
+            // SAFETY: a list of ours, recorded in part or not at all.
+            let _ = unsafe { list.Close() };
+            lists.idle.push((allocator, list));
+            tracing::warn!(error = %e, "the copies into the card's memory failed on the copy queue; they go back to the direct queue");
+            return None;
+        }
+        let value = lists.order.sending();
+        // SAFETY: our copy queue and its fence; the batch is on the queue.
+        let signalled = unsafe { copies.queue.Signal(&copies.fence, value) };
+        if let Err(ref e) = signalled {
+            tracing::warn!(error = %e, "no signal for the copies into the card's memory");
+        }
+        lists.flying.push_back((value, (allocator, list)));
+        crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
+        crate::shadow::CARD_STATS[1].fetch_add(ranges, Ordering::Relaxed);
+        COPY_QUEUE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        COPY_QUEUE_STATS[1].fetch_add(bytes, Ordering::Relaxed);
+        // The direct queue waits for the batch before its next list: the
+        // hash passes below read the copies it wrote, and so does the
+        // submission. A batch nothing can be told about waits for nothing:
+        // its copies are then ordered only by the submissions that follow.
+        if signalled.is_ok()
+            && let Some(value) = lists.order.wait()
+        {
+            // SAFETY: our copy queue, its fence, and the direct queue.
+            let waited = unsafe { self.queue.Wait(&copies.fence, value) };
+            if let Err(e) = waited {
+                fail(format_args!("the direct queue could not wait for the copies into the card's memory ({e})"));
+            }
+            lists.order.waited(value);
+        }
+        Some(value)
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
     /// the last submission goes to their card side (a list of ours, run
@@ -3999,8 +4304,10 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
-    /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    /// `relay`). `direct`: the last value signalled on the direct queue's
+    /// fence, which the copy queue waits for before it writes a copy
+    /// ([`Host::card_copies`]).
+    fn card_before(&self, runs: &[&HostList], flown: bool, direct: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4057,10 +4364,18 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
+            // The copies of the dirty ranges: on the copy queue, beside the
+            // flights that are still reading those copies with the bytes
+            // from before, or (the switch off, or no list for it) in this
+            // list, ahead of the hash passes that read them.
+            let copied = self.card_copies(&dirty, direct);
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            // Where the copies left the copies: `COMMON` after the copy
+            // queue's run ([`copied_state`]), `COPY_DEST` in this list.
+            let from_state = copied_state(copied.is_some());
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -4069,15 +4384,17 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let Some((staging, twin, size)) = shadow.card_sides() else {
                             continue;
                         };
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                        if copied.is_none() {
+                            for &(a, b) in ranges {
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            }
+                            crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
+                        let Some(before) = twin else {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -4089,7 +4406,7 @@ impl Host {
                         if !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                from_state,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
@@ -5211,7 +5528,7 @@ impl Host {
             phase(PHASE_SETTLE, settling);
         }
         let carding = std::time::Instant::now();
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, *submitted);
         phase(PHASE_CARD, carding);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
@@ -7628,6 +7945,19 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            // The uploads on their own queue ([`copy_queue`]): a batch whose
+            // run had finished when the next was ready ran beside the direct
+            // queue, and that overlap is all the split buys.
+            if copy_queue() {
+                tracing::info!(
+                    "copies into the card's memory on the copy queue: {} batches, {:.1} MB a frame, \
+                     {:.0} of them finished when the next batch was ready, {:.0} still running",
+                    COPY_QUEUE_STATS[0].load(Ordering::Relaxed),
+                    COPY_QUEUE_STATS[1].load(Ordering::Relaxed) as f64 / 1e6 / frames,
+                    COPY_QUEUE_STATS[2].load(Ordering::Relaxed) as f64 / frames,
+                    COPY_QUEUE_STATS[3].load(Ordering::Relaxed) as f64 / frames
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -8749,5 +9079,46 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod copy_queue {
+    use super::{CopyOrder, copied_state};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    };
+
+    /// The rule the copy queue is built on: a batch of copies is signalled
+    /// with a value no list before it has waited for, and every list after
+    /// it that reads a copy waits for the newest one. A value waited for is
+    /// not waited for again, so a submission that reads no copy the batch
+    /// wrote waits for nothing.
+    #[test]
+    fn a_copy_batch_is_waited_for_before_a_list_reads_it() {
+        let mut order = CopyOrder::default();
+        // Nothing has been sent: the direct queue waits for nothing.
+        assert_eq!(order.wait(), None);
+        let first = order.sending();
+        assert_eq!(order.wait(), Some(first));
+        order.waited(first);
+        assert_eq!(order.wait(), None, "a batch waited for is not waited for again");
+        // A second batch is a value behind the first, and a wait of its own.
+        let second = order.sending();
+        assert!(second > first);
+        assert_eq!(order.wait(), Some(second));
+        // Waiting for an older value leaves the newer one to be waited for.
+        order.waited(first);
+        assert_eq!(order.wait(), Some(second));
+    }
+
+    /// The write of a batch reaches the direct queue only after the copy
+    /// queue's run leaves the copy: a copy read after a batch on the copy
+    /// queue is taken from `COMMON` (state decay, `copied_state`), a copy
+    /// read in the same list from `COPY_DEST`.
+    #[test]
+    fn a_copy_read_after_the_copy_queue_is_taken_from_common() {
+        assert_eq!(copied_state(true), D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(copied_state(false), D3D12_RESOURCE_STATE_COPY_DEST);
     }
 }
