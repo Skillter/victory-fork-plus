@@ -1074,9 +1074,11 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        // The uploads' own queue ([`copy_queue`]): a device that refuses one
-        // leaves them on the direct queue, as without the switch.
-        let copies = if copy_queue() {
+        // The uploads' own queue ([`copy_queue`]), and the queue the relay's
+        // readback slots copy on ([`readback_slots`]): a device that refuses
+        // one leaves the uploads on the direct queue and the fetches without
+        // slots, as without either switch.
+        let copies = if copy_queue() || readback_slots() {
             match make_copy_queue(&device) {
                 Ok(copies) => Some(copies),
                 Err(e) => {
@@ -2101,6 +2103,98 @@ fn copy_queue() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_COPY_QUEUE").is_ok_and(|v| v == "1"))
 }
 
+/// Whether a fetch of what shaders wrote to the card's memory copies into a
+/// readback slot of the flight's own, on the copy queue, rather than into one
+/// shared buffer at the tail of the direct queue (`VICTORY_READBACK_SLOTS=1`;
+/// off by default, see [`SlotRing`] for what it is for and why it is off).
+///
+/// It makes the copy queue when nothing else does, and leaves the copies into
+/// the card's copies on the direct queue: [`copy_queue`] alone decides those.
+fn readback_slots() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_READBACK_SLOTS").is_ok_and(|v| v == "1"))
+}
+
+/// The most readback slots the relay keeps: a fetch takes one for the flight
+/// it belongs to and gives it back once its bytes are merged, so no more than
+/// this many fetches are in the air before one falls back to the shared
+/// buffer.
+const READBACK_SLOTS: usize = 4;
+
+/// What a readback slot's memory is rounded to, so that a fetch of a few more
+/// pieces keeps the slot it had instead of growing it: the shared buffer
+/// rounds the same way (`Host::relay_card_fetch`).
+const SLOT_GRANULE: u64 = 16 << 20;
+
+/// One readback slot: its size, and the flight whose fetch holds it (`None`
+/// when it is free).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotUse {
+    size: u64,
+    holds: Option<u64>,
+}
+
+/// The slot given to a fetch, and what that slot's memory must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotTaken {
+    slot: usize,
+    size: u64,
+}
+
+/// The relay's readback slots (`VICTORY_READBACK_SLOTS=1`,
+/// [`Host::relay_card_fetch`]): a fetch of the pieces the compare flagged
+/// takes a free slot, tied to the flight it belongs to, and gives it back when
+/// its bytes are merged (`Host::relay_fetch_merge`). The fetch's copy then
+/// goes on the copy queue, which waits for that flight's own work and not for
+/// the frame sent after it — the wait the direct queue's tail costs
+/// (`MEMORY.md` §5.1).
+///
+/// When every slot is held the fetch goes to the shared buffer at the tail of
+/// the direct queue, as without slots: the ring costs the fallback nothing.
+#[derive(Debug, Default)]
+struct SlotRing {
+    slots: Vec<SlotUse>,
+}
+
+impl SlotRing {
+    /// A slot for `bytes` of `flight`: free and big enough, else a free one
+    /// grown to fit, else a new one while fewer than [`READBACK_SLOTS`] were
+    /// made. `None` when every slot is held.
+    fn take(&mut self, bytes: u64, flight: u64) -> Option<SlotTaken> {
+        let size = bytes.max(1).next_multiple_of(SLOT_GRANULE);
+        let at = match self.slots.iter().position(|s| s.holds.is_none() && s.size >= size) {
+            Some(at) => at,
+            None => match self.slots.iter().position(|s| s.holds.is_none()) {
+                Some(at) => {
+                    self.slots[at].size = size;
+                    at
+                }
+                None => {
+                    if self.slots.len() >= READBACK_SLOTS {
+                        return None;
+                    }
+                    self.slots.push(SlotUse { size, holds: None });
+                    self.slots.len() - 1
+                }
+            },
+        };
+        self.slots[at].holds = Some(flight);
+        Some(SlotTaken { slot: at, size })
+    }
+
+    /// The fetch holding `slot` read its bytes: the next fetch may have it.
+    /// `false` when no fetch holds it, which gives nothing back.
+    fn release(&mut self, slot: usize) -> bool {
+        match self.slots.get_mut(slot) {
+            Some(used) if used.holds.is_some() => {
+                used.holds = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The run's copies into the card's copies on their own queue
 /// ([`copy_queue`]): batches sent, their bytes, batches whose run had
 /// finished by the time the next batch was ready (they ran beside the direct
@@ -2109,6 +2203,15 @@ fn copy_queue() -> bool {
 /// third and fourth add up to its first less the batches still in the air
 /// when it ended.
 static COPY_QUEUE_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame-rate line, of the fetches of what shaders wrote to the
+/// card's memory with [`readback_slots`]: fetches that went to a slot of the
+/// flight's own and fetches that went to the shared buffer at the direct
+/// queue's tail instead, then microseconds the landing thread waited for the
+/// copy queue ahead of a placed fetch and microseconds the slot's own copies
+/// took (the two halves `Host::relay_fetch_merge` times).
+static READBACK_STATS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The direct queue's relay fetch in flight: its fence and the value that
@@ -2928,7 +3031,7 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{READBACK_SLOTS, SLOT_GRANULE, SlotRing, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2964,6 +3067,80 @@ mod relay_tests {
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    /// A fetch takes a slot of the flight's own, and no second flight's fetch
+    /// gets that slot until the first has given it back: the bytes of a
+    /// landing that reads late are where it left them.
+    #[test]
+    fn a_slot_is_not_given_twice_while_a_fetch_is_in_flight() {
+        let mut ring = SlotRing::default();
+        let first = ring.take(1 << 20, 7).expect("a slot");
+        assert_eq!(first.slot, 0);
+        // A fetch of a few bytes takes a whole granule, so that the next few
+        // more do not grow it.
+        assert_eq!(first.size, SLOT_GRANULE);
+        let second = ring.take(1 << 20, 8).expect("a second flight's slot");
+        assert_ne!(second.slot, first.slot);
+        // Merged in the order they were sent.
+        assert!(ring.release(first.slot));
+        let third = ring.take(1 << 20, 9).expect("a third flight's slot");
+        assert_eq!(third.slot, first.slot);
+        assert!(ring.release(second.slot));
+        assert!(ring.release(third.slot));
+    }
+
+    /// Every slot held: the fetch goes to the shared buffer at the tail of the
+    /// direct queue, as without slots, and a slot is had again as soon as one
+    /// flight has merged.
+    #[test]
+    fn every_slot_held_falls_back_and_a_merged_flight_frees_one() {
+        let mut ring = SlotRing::default();
+        let taken: Vec<usize> = (0..READBACK_SLOTS)
+            .filter_map(|n| ring.take(4096, n as u64 + 1).map(|t| t.slot))
+            .collect();
+        assert_eq!(taken.len(), READBACK_SLOTS);
+        assert_eq!(ring.take(4096, 99), None);
+        assert!(ring.release(READBACK_SLOTS - 1));
+        let next = ring.take(4096, 99).expect("the freed slot");
+        assert_eq!(next.slot, READBACK_SLOTS - 1);
+        for slot in taken.iter().copied().filter(|&s| s != READBACK_SLOTS - 1) {
+            assert!(ring.release(slot));
+        }
+        assert!(ring.release(next.slot));
+    }
+
+    /// A free slot smaller than the fetch grows for it rather than the ring
+    /// spending a second slot on a few more pieces, and keeps the same slot
+    /// for the next fetch that fits.
+    #[test]
+    fn a_small_slot_grows_for_a_bigger_fetch() {
+        let mut ring = SlotRing::default();
+        let first = ring.take(1 << 20, 1).expect("a slot");
+        assert!(ring.release(first.slot));
+        let bigger = ring.take(SLOT_GRANULE + 1, 2).expect("the same slot, grown");
+        assert_eq!(bigger.slot, first.slot);
+        assert_eq!(bigger.size, 2 * SLOT_GRANULE);
+        assert!(ring.release(bigger.slot));
+        let small = ring.take(1, 3).expect("a slot");
+        assert_eq!(small.slot, first.slot);
+        assert_eq!(small.size, SLOT_GRANULE);
+    }
+
+    /// A slot nothing holds gives nothing back, so a merge that runs twice (or
+    /// names a slot out of reach) cannot hand a live fetch's slot to the next.
+    #[test]
+    fn releasing_a_slot_no_fetch_holds_gives_nothing_back() {
+        let mut ring = SlotRing::default();
+        assert!(!ring.release(0));
+        let held = ring.take(4096, 5).expect("a slot");
+        assert!(ring.release(held.slot));
+        assert!(!ring.release(held.slot));
+        assert!(!ring.release(READBACK_SLOTS + 5));
+        // The double release did not free anything a fetch holds.
+        let a = ring.take(4096, 11).expect("a slot");
+        let b = ring.take(4096, 12).expect("another slot");
+        assert_ne!(a.slot, b.slot);
     }
 }
 
@@ -3609,8 +3786,17 @@ struct RelayFetch {
     event: HANDLE,
     /// The last value signalled on `fence`.
     sent: u64,
-    /// Buffer, mapping, bytes.
+    /// Buffer, mapping, bytes: the shared memory every fetch that finds no
+    /// readback slot of its own comes down in.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// The readback slots ([`SlotRing`]) with [`readback_slots`].
+    slots: SlotRing,
+    /// The memory of each slot, by index, kept as the ring grows.
+    bufs: Vec<Option<(ID3D12Resource, usize, u64)>>,
+    /// The list a slot's fetch records in, on the copy queue (a copy queue
+    /// takes lists of its own type): made the first time, and reused once its
+    /// copy has run, which the landing waits for before the next fetch.
+    copy: Option<Prelude>,
 }
 
 /// A fetch of card copies' pieces sent to the card and not waited for yet
@@ -3631,6 +3817,21 @@ struct FetchRun {
     after: u64,
     /// The copies the fetch was made in.
     runs: usize,
+    /// The readback slot its bytes come down in, given back once they are
+    /// merged: `None` when it went to the shared buffer.
+    slot: Option<usize>,
+}
+
+/// The flights a landing took, as their fetch needs them
+/// ([`Host::relay_card_fetch`]).
+#[derive(Clone, Copy)]
+struct Landed {
+    /// The newest flight among them: what a readback slot is tied to.
+    number: u64,
+    /// The last value signalled on the direct queue's fence behind them, which
+    /// a placed fetch's copy waits for. The card has run it, that being what a
+    /// landing is (`landable`), so the wait is over before it is asked for.
+    fence: u64,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3885,6 +4086,19 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[5] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    if readback_slots() {
+        let r: Vec<f64> = READBACK_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "readback slots per frame (VICTORY_READBACK_SLOTS=1): {:.1} fetches of card copies' pieces went to a slot of \
+             the flight's own on the copy queue and {:.1} to the direct queue's tail (every slot held, or no memory or \
+             list for one), where the landing thread waited {:.1} ms behind the copy queue's own work and {:.1} ms for \
+             the slot's copies",
+            r[0],
+            r[1],
+            r[2] / 1000.0,
+            r[3] / 1000.0,
         );
     }
     if lazy_merge() {
@@ -4731,7 +4945,10 @@ impl Host {
         dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
         direct: u64,
     ) -> Option<u64> {
-        let copies = self.copies.as_ref()?;
+        // The queue exists for the relay's readback slots too
+        // ([`readback_slots`]): the uploads go on it only with their own
+        // switch.
+        let copies = self.copies.as_ref().filter(|_| copy_queue())?;
         let mut lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
         let (allocator, list) = lists
             .take(&copies.fence, copies.event)
@@ -5143,7 +5360,49 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                slots: SlotRing::default(),
+                bufs: Vec::new(),
+                copy: None,
             })
+        }
+    }
+
+    /// A fetch's own readback ([`SlotRing`]): a slot given to `flight`, the
+    /// memory of that slot, and the list the copy records in on the copy
+    /// queue. `None` when the switch is off, there is no copy queue, every
+    /// slot is held, or the memory or the list cannot be had: the fetch then
+    /// comes down in the shared buffer at the tail of the direct queue, as
+    /// without slots.
+    fn relay_fetch_slot(
+        &self,
+        fetch: &mut RelayFetch,
+        total: u64,
+        flight: u64,
+    ) -> Option<(usize, ID3D12Resource, usize, Prelude)> {
+        if !readback_slots() {
+            return None;
+        }
+        let taken = fetch.slots.take(total, flight)?;
+        // The ring and the memory of its slots grow together.
+        while fetch.bufs.len() < fetch.slots.slots.len() {
+            fetch.bufs.push(None);
+        }
+        if fetch.bufs[taken.slot].as_ref().is_none_or(|(_, _, size)| *size < taken.size)
+            && let Some((buffer, data)) = self.shared_buffer(taken.size)
+        {
+            fetch.bufs[taken.slot] = Some((buffer, data as usize, taken.size));
+        }
+        if fetch.copy.is_none() {
+            fetch.copy = self.make_copy_prelude();
+        }
+        match (&fetch.bufs[taken.slot], &fetch.copy) {
+            (Some((buffer, data, _)), Some((allocator, list))) => {
+                Some((taken.slot, buffer.clone(), *data, (allocator.clone(), list.clone())))
+            }
+            _ => {
+                fetch.slots.release(taken.slot);
+                None
+            }
         }
     }
 
@@ -5157,7 +5416,18 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_fetch(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) -> Option<FetchRun> {
+    ///
+    /// With [`readback_slots`] and a free slot, the copy goes on the copy
+    /// queue instead and waits only for `landed.fence`: the landed flights'
+    /// own work, which the card has run. It then does not stand behind the
+    /// frame sent after them, which is the wait `MEMORY.md` §5.1 prices in a
+    /// landing that copies 65 MB back ([`SlotRing`]).
+    fn relay_card_fetch(
+        &self,
+        plans: &[&CardPlan],
+        landed: Landed,
+        fetch: &mut Option<RelayFetch>,
+    ) -> Option<FetchRun> {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -5227,15 +5497,35 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
-        }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
-            fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
-        };
         f.sent += 1;
-        let ((allocator, list), fence, sent) = (f.list.clone(), f.fence.clone(), f.sent);
+        let sent = f.sent;
+        // A readback slot of the flight's own, copied on the copy queue ahead
+        // of everything sent after that flight, or the shared buffer at the
+        // tail of the direct queue ([`SlotRing`]).
+        let own = self.relay_fetch_slot(f, total, landed.number);
+        let (slot, buffer, data) = match &own {
+            Some((slot, buffer, data, _)) => (Some(*slot), buffer.clone(), *data),
+            None => {
+                if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
+                    let size = total.next_multiple_of(SLOT_GRANULE);
+                    f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                }
+                let Some((buffer, data, _)) = f.buffer.clone() else {
+                    fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
+                };
+                (None, buffer, data)
+            }
+        };
+        if slot.is_some() {
+            READBACK_STATS[0].fetch_add(1, Ordering::Relaxed);
+        } else if readback_slots() {
+            READBACK_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let (allocator, list) = match &own {
+            Some((_, _, _, list)) => list.clone(),
+            None => f.list.clone(),
+        };
+        let fence = f.fence.clone();
         // The copy queue's batches write the same card-side buffers this fetch
         // reads, and it is a queue of its own: the fetch waits for the last
         // batch signalled so far ([`CopyOrder`]), and the batches recorded from
@@ -5275,32 +5565,65 @@ impl Host {
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 let mut published = false;
                 let enqueued = (|| -> windows::core::Result<()> {
-                    if let Some(copies) = copies {
-                        // The copy queue's last signalled batch, and the value
-                        // this fetch ends at, in one hold of its lists: a batch
-                        // recorded from here on waits for the fetch before it
-                        // writes a buffer the fetch reads, whether or not a
-                        // batch was sent before this one.
-                        let wait = {
-                            let lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
-                            let wait = fetch_waits(&lists.order);
-                            *FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some((fence.clone(), sent * 2));
-                            wait
-                        };
-                        published = true;
-                        if let Some(wait) = wait {
-                            self.queue.Wait(&copies.fence, wait)?;
+                    match copies {
+                        // The flight's own slot: the copy queue, which waits
+                        // for that flight's work — which the card has run —
+                        // and for nothing sent after it. Batches recorded
+                        // from here on are behind it in this queue's order,
+                        // so nothing is published for them to wait for.
+                        //
+                        // shortcut: where the direct queue's tail read a
+                        // later flight's bytes after that flight's writes,
+                        // this copy may read a piece while a later flight
+                        // writes it, or while an upload puts a range of title
+                        // bytes into the copy (`card_copies` on the direct
+                        // queue, which the fetch used to be in order with),
+                        // so a torn part of a piece can come down. The merge
+                        // takes only bytes that differ from the CPU's side and
+                        // skips ranges a later send put up, and the flight that
+                        // wrote the piece flags it again and merges its own
+                        // bytes, but the title can see the torn part until it
+                        // lands. That, and that no run has measured it, is why
+                        // VICTORY_READBACK_SLOTS is off by default.
+                        Some(copies) if slot.is_some() => {
+                            let _held = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+                            copies.queue.Wait(&self.fence, landed.fence)?;
+                            copies.queue.Signal(&fence, sent * 2 - 1)?;
+                            copies.queue.ExecuteCommandLists(&lists);
+                            copies.queue.Signal(&fence, sent * 2)?;
+                        }
+                        copies => {
+                            if let Some(copies) = copies {
+                                // The copy queue's last signalled batch, and the
+                                // value this fetch ends at, in one hold of its
+                                // lists: a batch recorded from here on waits for
+                                // the fetch before it writes a buffer the fetch
+                                // reads, whether or not a batch was sent before
+                                // this one.
+                                let wait = {
+                                    let lists = copies.lists.lock().unwrap_or_else(|e| e.into_inner());
+                                    let wait = fetch_waits(&lists.order);
+                                    *FETCH_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some((fence.clone(), sent * 2));
+                                    wait
+                                };
+                                published = true;
+                                if let Some(wait) = wait {
+                                    self.queue.Wait(&copies.fence, wait)?;
+                                }
+                            }
+                            // A signal before the fetch: when it completes,
+                            // everything sent before the fetch has run, and
+                            // the time until it did is the waiting behind that
+                            // work, not the fetch's own.
+                            self.queue.Signal(&fence, sent * 2 - 1)?;
+                            self.queue.ExecuteCommandLists(&lists);
+                            // The fetch's own value, last: a batch waits for
+                            // it, so it must be on the queue before the order
+                            // is let go.
+                            self.queue.Signal(&fence, sent * 2)?;
                         }
                     }
-                    // A signal before the fetch: when it completes, everything
-                    // sent before the fetch has run, and the time until it did
-                    // is the waiting behind that work, not the fetch's own.
-                    self.queue.Signal(&fence, sent * 2 - 1)?;
-                    self.queue.ExecuteCommandLists(&lists);
-                    // The fetch's own value, last: a batch waits for it, so it
-                    // must be on the queue before the order is let go.
-                    self.queue.Signal(&fence, sent * 2)?;
                     Ok(())
                 })();
                 let after = match enqueued {
@@ -5330,7 +5653,7 @@ impl Host {
                 fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)"))
             }
         };
-        Some(FetchRun { pieces, data, total, sent, after, runs: runs.len() })
+        Some(FetchRun { pieces, data, total, sent, after, runs: runs.len(), slot })
     }
 
     /// [`Host::relay_card_fetch`]'s wait: the card is waited for, and what
@@ -5338,8 +5661,8 @@ impl Host {
     /// (`Shadow::card_merge_relay`). Runs after the copies in the PC's
     /// memory are merged, so the card runs the fetch while the landing
     /// thread has work of its own.
-    fn relay_fetch_merge(&self, run: FetchRun, fetch: &Option<RelayFetch>) {
-        let FetchRun { pieces, data, total, sent, after, runs } = run;
+    fn relay_fetch_merge(&self, run: FetchRun, fetch: &mut Option<RelayFetch>) {
+        let FetchRun { pieces, data, total, sent, after, runs, slot } = run;
         let Some(fetched) = fetch.as_ref() else {
             return;
         };
@@ -5370,6 +5693,12 @@ impl Host {
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         RELAY_STATS[5].fetch_add(drained.as_micros() as u64, Ordering::Relaxed);
         crate::flow::put(crate::flow::Site::Fetched, total as usize, own.as_nanos() as u64);
+        if slot.is_some() {
+            // A fetch placed on the copy queue: the waiting behind that
+            // queue's own work, and the slot's copies ([`READBACK_STATS`]).
+            READBACK_STATS[2].fetch_add(drained.as_micros() as u64, Ordering::Relaxed);
+            READBACK_STATS[3].fetch_add(own.as_micros() as u64, Ordering::Relaxed);
+        }
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -5389,6 +5718,12 @@ impl Host {
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        // The slot's bytes are in title memory: the next fetch may have it.
+        if let Some(slot) = slot
+            && let Some(fetched) = fetch.as_mut()
+        {
+            fetched.slots.release(slot);
+        }
     }
 
     /// [`relay`], on the thread that lands flights: what their shaders
@@ -5398,7 +5733,7 @@ impl Host {
     /// closed to refreshes. `run` is the card copies' fetch this landing
     /// made, if any: it is waited for between the two, so the card runs it
     /// while this thread compares and merges the others.
-    fn merge_flights(&self, flights: &[&Flight], run: Option<FetchRun>, fetch: &Option<RelayFetch>) {
+    fn merge_flights(&self, flights: &[&Flight], run: Option<FetchRun>, fetch: &mut Option<RelayFetch>) {
         if flights.is_empty() {
             // The fetch was sent all the same, and its list must not be
             // reset until it has run.
@@ -5477,10 +5812,14 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                let landed = Landed {
+                    number: flights.iter().map(|f| f.number).max().unwrap_or(0),
+                    fence: flights.iter().map(|f| f.fence).max().unwrap_or(0),
+                };
                 // The fetch goes to the queue first and is waited for
                 // after the copies in the PC's memory are merged: the card
                 // runs it while this thread compares and merges its own.
-                let run = self.relay_card_fetch(&plans, fetch);
+                let run = self.relay_card_fetch(&plans, landed, fetch);
                 // The flights this landing does not merge ([`lazy_merge`]):
                 // those the line after them in this landing tells the title
                 // nothing about. They keep their ranges held, so no refresh
