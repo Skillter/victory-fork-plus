@@ -177,6 +177,29 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// What the loads from one descriptor table that an instruction uses say the
+/// view of an unused load from it is: the image kind they agree on (`Some(dim)`
+/// for each sibling, `None` for one used as something other than an image),
+/// with `false` where the table mixes kinds and only the commonest speaks for
+/// the load.
+fn sibling_kind(siblings: impl Iterator<Item = Option<u8>>) -> Option<(u8, bool)> {
+    let mut counts: Vec<(u8, u32)> = Vec::new();
+    for dim in siblings {
+        // A sibling used as a buffer, or as nothing at all: no agreement.
+        let dim = dim?;
+        match counts.iter_mut().find(|c| c.0 == dim) {
+            Some(c) => c.1 += 1,
+            None => counts.push((dim, 1)),
+        }
+    }
+    // A tie leaves no majority to speak for the load.
+    let (&(first, n), rest) = counts.split_first()?;
+    if rest.iter().any(|c| c.1 >= n) {
+        return None;
+    }
+    Some((first, rest.is_empty()))
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -5569,6 +5592,11 @@ impl<'a> Lower<'a> {
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
+    //
+    // Where nothing uses a load as a descriptor (the code picked an entry by an
+    // index it holds and read only this copy for a size), a sibling load of the
+    // same table that an image instruction uses stands for it, as
+    // [`sibling_kind`] describes.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -5622,8 +5650,48 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        // A load the code only measures, that nothing uses as a descriptor (an
+        // entry picked from a table by an index the code holds, where only this
+        // copy is read for its size): every descriptor in one table is declared
+        // the same way, so a sibling load of a whole image descriptor (8 dwords;
+        // a buffer's 4 count elements, which need the range's stride) from the
+        // same parameter that an image instruction *does* use says what this
+        // one's view is. The handle still comes from this load's own operands,
+        // which hold here.
+        let sibling = || {
+            if count != 8 {
+                return None;
+            }
+            let a = address?;
+            let mut candidates = Vec::new();
+            for (s, b) in x.res.scalar.iter() {
+                if *s == site || b.param != a.param {
+                    continue;
+                }
+                if x.p.blocks[s.0].insts[s.1].name() != inst.name() {
+                    continue;
+                }
+                let Some((at, first)) = use_of(*s) else {
+                    continue;
+                };
+                if first != 0 {
+                    continue;
+                }
+                // An image's kind, or nothing where the sibling is used as
+                // something else: a buffer in the same table is no agreement.
+                let dim = match x.p.blocks[at.0].insts[at.1].fields {
+                    Fields::Image { dim, .. } => Some(dim),
+                    _ => None,
+                };
+                candidates.push((dim, (at, first)));
+            }
+            let kinds = candidates.iter().map(|c| c.0);
+            let (_, exact) = sibling_kind(kinds)?;
+            candidates.first().map(|c| (c.1, exact))
+        };
+        let mut exact_kind = true;
+        let mut resolved = use_of(site).or_else(twin);
+        if resolved.is_none() {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5671,7 +5739,13 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+            // `exact`: every sibling is an image of one kind, so its type
+            // nibble and dimensions stand for this load's.
+            if let Some((u, exact)) = sibling() {
+                resolved = Some(u);
+                exact_kind = exact;
+            }
+            if resolved.is_none() && std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
                     "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
                     inst.machine.offset,
@@ -5680,6 +5754,8 @@ impl<'a> Lower<'a> {
                     self.x.res.lane_copied.contains(&site)
                 );
             }
+        }
+        let Some((at, first)) = resolved else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -5749,11 +5825,21 @@ impl<'a> Lower<'a> {
             Some(kind) => {
                 let one = self.s.m.i32(1);
                 let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
+                let (height, depth) = if exact_kind {
+                    match kind {
+                        1 => (one, one),
+                        2 => (field(self, 1), one),
+                        6 => (one, field(self, 1)),
+                        _ => (field(self, 1), field(self, 2)),
+                    }
+                } else {
+                    // shortcut: a table whose used entries mix image kinds takes
+                    // the first kind's type nibble, and its height from the
+                    // second `getDimensions` word and its depth or layers from
+                    // the third, which every image kind lays out that way. A
+                    // program that reads the type of an entry of another kind
+                    // reads the first kind's.
+                    (field(self, 1), field(self, 2))
                 };
                 let levels = if uav { one } else { field(self, 3) };
                 let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
@@ -11327,6 +11413,75 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    /// The sibling rule of `sibling_kind`: the kind they agree on (exact),
+    /// the commonest where a table mixes kinds, and nothing where one sibling
+    /// is used as something else or two kinds are as common.
+    #[test]
+    fn a_table_s_view_is_the_one_its_siblings_agree_on() {
+        use super::sibling_kind;
+        assert_eq!(sibling_kind([Some(2), Some(2)].into_iter()), Some((2, true)));
+        assert_eq!(sibling_kind([Some(2)].into_iter()), Some((2, true)));
+        // A sibling used as a buffer, not an image.
+        assert_eq!(sibling_kind([Some(2), None].into_iter()), None);
+        // Two kinds as common as each other: nothing speaks for the load.
+        assert_eq!(sibling_kind([Some(2), Some(4)].into_iter()), None);
+        // A table that mixes kinds: the commoner one, not exact.
+        assert_eq!(
+            sibling_kind([Some(2), Some(2), Some(4)].into_iter()),
+            Some((2, false))
+        );
+        // No sibling at all.
+        assert_eq!(sibling_kind([].into_iter()), None);
+    }
+
+    /// A descriptor the code reads for its size and nothing uses as one: a
+    /// sibling load of the same table that an image instruction does use
+    /// stands for it, so the size-only load lowers as that image's.
+    #[test]
+    fn a_descriptor_read_only_for_its_size_takes_its_kind_from_a_sibling() {
+        // s_load_dwordx8 of an entry of the table at s9 that nothing uses,
+        // its dword 2 (height - 1) and dword 3 (base level) read as numbers
+        // and stored to LDS, next to a load of another entry of the same
+        // table that image_load does use.
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x7E08_0504, // v_readfirstlane_b32 s4, v4
+            0xF40C_0201,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], null
+            0xF40C_0401,
+            0x0800_0000, // s_load_dwordx8 s[16:23], s[2:3], s4
+            0xF000_1700,
+            0x0004_0D06, // image_load v[13:15], v6, s[16:23]
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0x7E06_020B, // v_mov_b32 v3, s11
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 10,
+            base_register: 0,
+            user_data: 9,
+            slot: 1,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 9,
+            slot: 1,
+        }];
+        lower_with(&words, layout, used).unwrap();
     }
 
     #[test]

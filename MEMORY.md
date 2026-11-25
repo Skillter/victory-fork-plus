@@ -227,6 +227,13 @@ draws are dropped ... stage=... error=converter shader.dxil v1: GFX10 code at
 0x....`. Each is a bounded rule in
 `crates/victory-shader/src/emit/lower.rs`.
 
+Archive-wide census (`victory translate --list` over `shaders.rpf`, 26,599
+containers, 26,148 programs), refusal counts by reason, before → after the
+sibling-descriptor rule of `emit::lower::descriptor_data`: `a descriptor read
+only as data` 40 → 5 (all five `shadowmask:CS_TraceShadowRays_*`, a buffer
+address read as data), every other reason unchanged, vertex and pixel DXIL
+14,176 → 14,211, compute 2,724, mesh 8,762.
+
 ## 5.3 Light in shadow — black interiors
 
 Not a bug: the fork's ray-traced bounce light and RT lamp/sun shadows are not
