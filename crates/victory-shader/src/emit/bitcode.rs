@@ -566,6 +566,14 @@ impl Module {
         live
     }
 
+    /// The names of the module's functions, its `dx.op` calls included: the
+    /// bit stream packs names as chars, so a test reads them here rather than
+    /// in the container.
+    #[cfg(test)]
+    pub(crate) fn declared_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
