@@ -39,6 +39,12 @@
   the resolved value changes; a root-signature change or a new list drops them.
 - The capped heap points past-the-end reads at a null slot for a reason: a
   real read past the heap end hung an NVIDIA GPU.
+- A buffer view of no elements is the console's for the rest of its buffer:
+  `descriptor::host::view_count` works the length out and
+  `descriptor::host::buffer_copy` refreshes and writes back that rest. A view
+  left null reads as zeros.
+- A view the host still refuses is counted per reason and logged once with its
+  reason and its buffer (`descriptor::host::refused_census`).
 
 ## Pipelines and signatures
 

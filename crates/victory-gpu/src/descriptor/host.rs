@@ -454,7 +454,8 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 }
 
 /// Buffer views left null because the host would refuse them
-/// ([`buffer_view_ok`]), since the start.
+/// ([`buffer_view_ok`]), since the start: their reasons are counted apart
+/// (`REFUSED_REASONS`) and each is logged once.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the host device is gone, and why (the first time it is asked
@@ -1763,11 +1764,28 @@ fn view_extent() -> bool {
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    if len == 0 {
-        return None;
-    }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+    let extent = view_extent().then(|| buffer_extent(view)).flatten();
+    let len = if len > 0 {
+        len
+    } else {
+        // A view of no elements reads the rest of its buffer (`elements_left`):
+        // the copy is refreshed and what shaders write goes back for all of it,
+        // as for a view of some.
+        // shortcut: the whole rest of the buffer is declared, the title's ring
+        // offsets moving through it every frame; the copy-back keeps its bytes
+        // once per submission, and its parts not held yet (a 174 MB heap the
+        // world declares dozens of times a frame already).
+        let (base, width) = extent?;
+        if address < base || address - base >= width.max(1) {
+            return None;
+        }
+        let left = (base + width).saturating_sub(address);
+        if left == 0 {
+            return None;
+        }
+        left
+    };
+    if let Some((base, width)) = extent
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
@@ -1820,41 +1838,222 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
         .flatten()
 }
 
-/// Whether the host accepts a buffer view with these fields of a buffer of
-/// `width` bytes. It removes the device for one it does not (view creation
-/// returns nothing), and the console is laxer: the title's heap holds
-/// views past their memory's end, of no elements, of typeless formats
-/// without the raw flag, with strides the host has no structured buffers
-/// for. Since every buffer view of the heap is made for shaders that pick
-/// them by index, one such view ended the run (2026-11-24, run 10).
-fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
-    use crate::resource::family;
-    let f = format.0 as u32;
-    let element = if raw {
-        // raw: R32 typeless, counted in dwords, starting on 16 bytes
-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
-            return false;
+/// Why the host takes no buffer view of a descriptor, counted apart from the
+/// others (`REFUSED_REASONS`) and logged once in its own words
+/// ([`refusal`]). The console is laxer than the host on every one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// No elements: what the console reads as the rest of the buffer.
+    NoElements,
+    /// A raw view that is not R32 typeless without a stride.
+    RawShape,
+    /// A raw view that does not begin on 16 bytes.
+    RawStart,
+    /// A structured view of a stride the host has no structured buffers for.
+    StructuredShape,
+    /// A typed view of a format the host has no element size for.
+    TypedFormat,
+    /// A view past the end of its buffer's host copy.
+    PastTheEnd,
+}
+
+impl Refused {
+    /// Every reason, in the order `REFUSED_REASONS` counts them.
+    const ALL: [Refused; 6] = [
+        Refused::NoElements,
+        Refused::RawShape,
+        Refused::RawStart,
+        Refused::StructuredShape,
+        Refused::TypedFormat,
+        Refused::PastTheEnd,
+    ];
+    const COUNT: usize = Refused::ALL.len();
+
+    /// What the reason is, in the log's words.
+    fn name(self) -> &'static str {
+        match self {
+            Refused::NoElements => "the view has no elements",
+            Refused::RawShape => "a raw view that is not R32 typeless without a stride",
+            Refused::RawStart => "a raw view that does not begin on 16 bytes",
+            Refused::StructuredShape => "a structured view of a stride the host does not take",
+            Refused::TypedFormat => "a typed view of a format with no element size",
+            Refused::PastTheEnd => "a view past the end of its buffer",
         }
-        4
-    } else if stride > 0 {
+    }
+}
+
+/// Buffer views left null, by reason, since the start ([`REFUSED_VIEWS`] is
+/// their total and the frame line prints these).
+static REFUSED_REASONS: [std::sync::atomic::AtomicU64; Refused::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; Refused::COUNT];
+
+/// The reasons already logged, one line each: the counters say how many.
+static REFUSED_LOGGED: [std::sync::Once; Refused::COUNT] = [const { std::sync::Once::new() }; Refused::COUNT];
+
+/// Whether the host accepts a buffer view with these fields of a buffer of
+/// `width` bytes, or why it does not ([`Refused`], counted and logged
+/// apart). It removes the device for a view it does not take (view creation
+/// returns nothing), and the console is laxer: the title's heap holds views
+/// past their memory's end, of no elements, of typeless formats without the
+/// raw flag, with strides the host has no structured buffers for. Since every
+/// buffer view of the heap is made for shaders that pick them by index, one
+/// such view ended the run (2026-11-24, run 10).
+fn buffer_view_ok(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> Result<(), Refused> {
+    let element = buffer_element(format, stride, raw)?;
+    if raw && !first.is_multiple_of(4) {
+        return Err(Refused::RawStart);
+    }
+    if count == 0 {
+        return Err(Refused::NoElements);
+    }
+    match first.checked_add(u64::from(count)).and_then(|end| end.checked_mul(element)) {
+        Some(end) if end <= width => Ok(()),
+        _ => Err(Refused::PastTheEnd),
+    }
+}
+
+/// Bytes per element of a buffer view of these fields, or why the host takes
+/// no such view: the format, the stride and the raw flag are all the element
+/// is worked out from.
+fn buffer_element(format: DXGI_FORMAT, stride: u32, raw: bool) -> Result<u64, Refused> {
+    use crate::resource::family;
+    if raw {
+        // raw: R32 typeless, counted in dwords, starting on 16 bytes
+        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 {
+            return Err(Refused::RawShape);
+        }
+        return Ok(4);
+    }
+    if stride > 0 {
         // structured: no format, a stride the host takes
         if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
-            return false;
+            return Err(Refused::StructuredShape);
         }
-        u64::from(stride)
-    } else {
-        // typed: a format with a size that is not typeless
-        let typeless = family(f) == f && family(f + 1) == f;
-        match crate::resource::element(f) {
-            Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
-            _ => return false,
-        }
-    };
-    count > 0
-        && first
-            .checked_add(u64::from(count))
-            .and_then(|end| end.checked_mul(element))
-            .is_some_and(|end| end <= width)
+        return Ok(u64::from(stride));
+    }
+    // typed: a format with a size that is not typeless
+    let f = format.0 as u32;
+    let typeless = family(f) == f && family(f + 1) == f;
+    match crate::resource::element(f) {
+        Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => Ok(bytes),
+        _ => Err(Refused::TypedFormat),
+    }
+}
+
+/// The elements a buffer view of no elements has: the console's reads the
+/// rest of the buffer the view is of. The host takes no view of none (it
+/// removes the device for one), and one left null reads as zeros where the
+/// title's buffer is (`null_for`), so the length is worked out instead:
+/// from `first` to the end of the buffer, which lies `offset` bytes into a
+/// host copy of `width` and is `len` bytes long. `None` if nothing is left.
+fn elements_left(first: u64, element: u64, offset: u64, len: u64, width: u64) -> Option<u32> {
+    let end = offset.saturating_add(len).min(width);
+    let bytes = end.checked_sub(first.checked_mul(element)?)?;
+    // A view of more than a u32 of elements covers all the host can name.
+    (bytes >= element).then(|| u32::try_from(bytes / element).unwrap_or(u32::MAX))
+}
+
+/// The elements a buffer view is made with: a view of no elements is the
+/// console's for the rest of its buffer ([`elements_left`]), any other keeps
+/// its count. `buffer` says whether the descriptor's dimension is a buffer's
+/// (a descriptor of another dimension has no elements to read past, and its
+/// fields are another's), and the host copy the view is on is `offset` bytes
+/// in, `len` bytes of a buffer, `width` bytes wide.
+#[allow(clippy::too_many_arguments)]
+fn view_count(
+    buffer: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    offset: u64,
+    len: u64,
+    width: u64,
+) -> u32 {
+    if count > 0 || !buffer {
+        return count;
+    }
+    buffer_element(format, stride, raw)
+        .ok()
+        .and_then(|element| elements_left(first, element, offset, len, width))
+        .unwrap_or(0)
+}
+
+/// Counts a buffer view left null, and logs the first of its reason: the
+/// fields that decided it and the buffer it is of, in `buffer` (address and
+/// bytes).
+#[allow(clippy::too_many_arguments)]
+fn refused(
+    why: Refused,
+    unordered: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+    buffer: (u64, u64),
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REFUSED_VIEWS.fetch_add(1, Relaxed);
+    REFUSED_REASONS[why as usize].fetch_add(1, Relaxed);
+    REFUSED_LOGGED[why as usize].call_once(|| {
+        tracing::warn!(
+            "{}",
+            refusal(why, unordered, format, first, count, stride, raw, width, buffer)
+        )
+    });
+}
+
+/// The line a buffer view left null is logged with, once per reason: what
+/// the host would not take, the fields that decided it, and the buffer it is
+/// of.
+#[allow(clippy::too_many_arguments)]
+fn refusal(
+    why: Refused,
+    unordered: bool,
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+    buffer: (u64, u64),
+) -> String {
+    format!(
+        "buffer view the host would refuse left null: {reason}; {}format={format} first={first} \
+         count={count} stride={stride} raw={raw} width={width}, of the buffer {address:#x}+{bytes}",
+        if unordered { "unordered; " } else { "" },
+        reason = why.name(),
+        format = format.0,
+        address = buffer.0,
+        bytes = buffer.1,
+    )
+}
+
+/// Buffer views left null, by reason, as the frame line prints them; `None`
+/// when none was.
+pub(crate) fn refused_census() -> Option<String> {
+    by_reason(Refused::ALL.map(|why| REFUSED_REASONS[why as usize].load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// [`refused_census`] of counts in [`Refused::ALL`]'s order.
+fn by_reason(counts: [u64; Refused::COUNT]) -> Option<String> {
+    let parts: Vec<String> = Refused::ALL
+        .iter()
+        .zip(counts)
+        .filter(|&(_, n)| n > 0)
+        .map(|(why, n)| format!("{} {n}", why.name()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 fn buffer_srv(
@@ -1898,17 +2097,22 @@ fn buffer_srv(
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "buffer view the host would refuse left null"
-        );
+    // A view of no elements is the console's for the rest of its buffer (see
+    // `elements_left`).
+    let count = view_count(
+        desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER,
+        desc.Format,
+        first,
+        count,
+        stride,
+        raw,
+        offset,
+        len,
+        width,
+    );
+    buffer.NumElements = count;
+    if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        refused(why, false, desc.Format, first, count, stride, raw, width, (address, len));
         return None;
     }
     // The console has no component mapping; one the host does not know is the default's.
@@ -1978,17 +2182,22 @@ fn buffer_uav(
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "unordered buffer view the host would refuse left null"
-        );
+    // A view of no elements is the console's for the rest of its buffer (see
+    // `elements_left`).
+    let count = view_count(
+        desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
+        desc.Format,
+        first,
+        count,
+        stride,
+        raw,
+        offset,
+        len,
+        width,
+    );
+    buffer.NumElements = count;
+    if let Err(why) = buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        refused(why, true, desc.Format, first, count, stride, raw, width, (address, len));
         return None;
     }
     let host = host()?;
@@ -2579,15 +2788,28 @@ mod tests {
         // bytes before the view's memory: bytes 192..2192.
         let (first, count) = raw_window(32, 8, 100, 20).unwrap();
         assert_eq!((first, count), (48, 500));
-        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096));
+        assert_eq!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096), Ok(()));
         // the format a raw view must name; the structured one's is refused
-        assert!(!buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096),
+            Err(Refused::RawShape)
+        );
         // past the buffer, not on 16 bytes, no elements
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000),
+            Err(Refused::PastTheEnd)
+        );
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first + 1, count, 0, true, 4096),
+            Err(Refused::RawStart)
+        );
         assert!(raw_window(4, 0, 100, 20).is_none());
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
+        assert_eq!(
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096),
+            Err(Refused::NoElements)
+        );
         // a structured view the host takes as it is
-        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+        assert_eq!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096), Ok(()));
     }
 
     /// The queue of textures picked by index serves the slots looked at
@@ -2885,5 +3107,108 @@ mod tests {
         assert_eq!((ring.free, ring.at), (8, 56));
         assert_eq!(ring.take(16), None);
         assert_eq!(ring.take(8), Some((56, 8)));
+    }
+
+    /// The two shapes the log of run 2026-11-25 (02:56) holds are told apart:
+    /// a raw view that begins 8 bytes into its buffer, which the host cannot
+    /// move, and a raw view of no elements, which the console reads as the
+    /// rest of its buffer and of which the host takes none.
+    #[test]
+    fn the_refused_shapes_of_the_log_are_told_apart() {
+        let raw = |first: u64, count: u32, width: u64| {
+            buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, width)
+        };
+        // `first=2 count=32 stride=0 raw=true width=4194304` (line 11087).
+        assert_eq!(raw(2, 32, 4_194_304), Err(Refused::RawStart));
+        // The same view on 16 bytes: the host takes it.
+        assert_eq!(raw(4, 32, 4_194_304), Ok(()));
+        // `first=10880256 count=0 stride=0 raw=true width=182452224` (line
+        // 7328): no elements.
+        assert_eq!(raw(10_880_256, 0, 182_452_224), Err(Refused::NoElements));
+        // Read as the rest of the 174 MB buffer, the same view is taken:
+        // 43,521,024 bytes in, 34,732,800 dwords to the buffer's end.
+        assert_eq!(elements_left(10_880_256, 4, 0, 182_452_224, 182_452_224), Some(34_732_800));
+        assert_eq!(raw(10_880_256, 34_732_800, 182_452_224), Ok(()));
+    }
+
+    /// A view of no elements is given the rest of its own buffer, not the rest
+    /// of the copy the buffer lies in; a view of some keeps its count, and a
+    /// descriptor of another dimension is left alone.
+    #[test]
+    fn only_a_view_of_no_elements_gets_the_rest_of_its_buffer() {
+        let count = |buffer, first, count, offset, len, width| {
+            view_count(buffer, DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, offset, len, width)
+        };
+        // The log's shape: the rest of the 174 MB buffer (43,521,024 bytes in,
+        // 138,931,200 bytes to its end).
+        assert_eq!(count(true, 10_880_256, 0, 0, 182_452_224, 182_452_224), 34_732_800);
+        // A view of some keeps what it asked for.
+        assert_eq!(count(true, 2, 32, 0, 4_194_304, 4_194_304), 32);
+        // A descriptor of another dimension has no elements to read past.
+        assert_eq!(count(false, 10_880_256, 0, 0, 182_452_224, 182_452_224), 0);
+        // A shape the host takes no view of is left at none (and refused).
+        assert_eq!(
+            view_count(true, DXGI_FORMAT_UNKNOWN, 10_880_256, 0, 0, true, 0, 182_452_224, 182_452_224),
+            0
+        );
+        // A 4 MiB buffer 8 MiB into a 174 MiB copy: the 4 MiB after it.
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 182_452_224), 1_048_576);
+        // From its last dword: one dword left; from its end, and past it: none.
+        assert_eq!(count(true, 3_145_727, 0, 8_388_608, 4_194_304, 182_452_224), 1);
+        assert_eq!(count(true, 3_145_728, 0, 8_388_608, 4_194_304, 182_452_224), 0);
+        assert_eq!(count(true, 4_000_000, 0, 8_388_608, 4_194_304, 182_452_224), 0);
+        // The copy ends before the buffer does: what is there is all there is.
+        assert_eq!(count(true, 2_097_152, 0, 8_388_608, 4_194_304, 10_485_760), 524_288);
+        // A structured view counts elements of its stride.
+        assert_eq!(elements_left(0, 32, 0, 1_048_576, 1_048_576), Some(32_768));
+    }
+
+    /// Every reason is counted and logged apart from the others, and the
+    /// refusal line names the reason and the buffer the view is of.
+    #[test]
+    fn a_refusal_names_its_reason_and_its_buffer_and_is_counted_apart() {
+        for (i, why) in Refused::ALL.iter().enumerate() {
+            assert_eq!(*why as usize, i, "{why:?}");
+            assert!(!why.name().is_empty());
+        }
+        assert_eq!(Refused::ALL.len(), Refused::COUNT);
+        assert_eq!(by_reason([0; Refused::COUNT]), None);
+        let mut counts = [0; Refused::COUNT];
+        counts[Refused::NoElements as usize] = 6494;
+        counts[Refused::RawStart as usize] = 12;
+        let counted = by_reason(counts).unwrap();
+        assert!(counted.contains("the view has no elements 6494"), "{counted}");
+        assert!(counted.contains("a raw view that does not begin on 16 bytes 12"), "{counted}");
+        assert!(!counted.contains("typed"), "{counted}");
+        // The line of the log's shape: the reason, the fields that decided it,
+        // and the buffer (its address and bytes).
+        let line = refusal(
+            Refused::NoElements,
+            true,
+            DXGI_FORMAT_R32_TYPELESS,
+            10_880_256,
+            0,
+            0,
+            true,
+            182_452_224,
+            (0xae00_0000, 182_452_224),
+        );
+        assert!(line.contains("the view has no elements"), "{line}");
+        assert!(line.contains("unordered"), "{line}");
+        assert!(line.contains("format=39 first=10880256 count=0 stride=0 raw=true"), "{line}");
+        assert!(line.contains("0xae000000+182452224"), "{line}");
+        let line = refusal(
+            Refused::RawStart,
+            false,
+            DXGI_FORMAT_R32_TYPELESS,
+            2,
+            32,
+            0,
+            true,
+            4_194_304,
+            (0x1000_0000, 4_194_304),
+        );
+        assert!(line.contains("does not begin on 16 bytes"), "{line}");
+        assert!(line.contains("first=2 count=32"), "{line}");
     }
 }
