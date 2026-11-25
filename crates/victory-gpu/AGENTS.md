@@ -218,6 +218,12 @@
 - `capture` and `copystat` are compiled only with
   `feature = "diagnostics"`. `VICTORY_GPU_TIMING` forces `late_stage` to 0;
   `VICTORY_D3D12_DRED` names the faulting command.
+- `gpusplit` (`VICTORY_GPU_SPLIT=1`, diagnostics only) puts one timestamp in
+  front of every run of commands sharing a kind and a host pipeline and prints
+  `where the card's time went: <group> [<shaders>] N draws X ms a frame (Y µs a
+  draw)` every 5 s, heaviest group first. A segment runs to the next group's
+  first command, our own fire-and-forget passes are outside it, and it forces
+  `late_stage` to 0 like the timing switch: compare runs that both have it on.
 - `draw` counts what a draw emits on the host list and what those caches
   spare, per 5 s in every build (`draw::commands_line`), including the
   barriers and state an indirect clamp emits; `draw::windowed_line` splits

@@ -896,6 +896,8 @@ pub(crate) fn commands_line(draws: u64, presented: u64) {
         tracing::info!("{line}");
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    crate::gpusplit::line(presented as f64);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if let Some(line) = crate::list::census::line(draws) {
         tracing::info!("{line}");
     }
@@ -2999,6 +3001,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        crate::gpusplit::mark(list, crate::gpusplit::Group::Compute, self.pipeline);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         emitted(Command::Dispatch, 1);
@@ -3099,6 +3103,8 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpusplit::mark(list, crate::gpusplit::Group::Mesh, self.pipeline);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
@@ -3461,6 +3467,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            crate::gpusplit::mark(list, crate::gpusplit::Group::Draw, self.pipeline);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3562,6 +3570,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            crate::gpusplit::mark(list, crate::gpusplit::Group::Draw, self.pipeline);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3780,6 +3790,12 @@ impl State {
                         root: self.host_roots[1],
                     };
                     let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                    // The clamp's dispatch (and its two waits) is the group
+                    // `VICTORY_GPU_SPLIT` charges for it, so the timestamp
+                    // goes in before it records: a clamp that refuses leaves
+                    // a segment of no time, not a wrong one.
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpusplit::mark(list, crate::gpusplit::Group::Clamp, 0);
                     // More than the record asked for: a window clamped ahead,
                     // whose unfilled slots must not spend the list's budget.
                     let bounded = if windowed && records > 1 {
@@ -3851,6 +3867,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::gpusplit::mark(list, crate::gpusplit::Group::Indirect, self.pipeline);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
