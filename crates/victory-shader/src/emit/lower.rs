@@ -396,6 +396,14 @@ enum MaskData {
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
+///
+/// The programs still stopping here save EXEC and walk the pair as a work set:
+/// `water_shading:CS_TransmissionVolumetricsSubmerged_bbfb2953` copies it into `s[24:25]`
+/// (`s_mov_b64` after `v_ffbl_b32`, its loop body at `0x1a50`) and resumes one bit at a time.
+/// Those bits are lanes that do not run where the pair is copied, so no ballot there has them:
+/// the pair is a number only where it still holds EXEC (the save), and reading it as one asks
+/// for the save to be materialised there and the pair carried as numbers through the loop.
+/// `Structured::active` answers the narrower question of which masks a ballot can serve.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
