@@ -63,6 +63,10 @@
   no elements of another dimension (`Refused::NoElements`).
 - A view the host still refuses is counted per reason and logged once with its
   reason and its buffer (`descriptor::host::refused_census`).
+- A shader that picks a buffer from a view heap by an index it computes reads
+  that slot's title address from `descriptor::HostHeap::addresses_gpu` (two
+  dwords a slot, root SRV `victory_shader::emit::SLOT_VIEW_ADDRESSES`), written
+  where the slot's element stride is, as one aligned eight-byte store.
 
 ## Pipelines and signatures
 

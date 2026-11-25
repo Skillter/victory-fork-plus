@@ -65,6 +65,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// For each view-heap slot's address the program read
+    /// ([`super::shader::SLOT_VIEW_ADDRESSES`]): whether the read's byte
+    /// offset was that slot shifted by three — the load's own heap index, in
+    /// the module — rather than a constant the compile fixed.
+    #[cfg(test)]
+    pub heap_address_indexed: Vec<bool>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -233,6 +239,10 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// The byte offset of each view-heap slot's address read
+    /// ([`Self::heap_address`]), for the tests to see it is the slot's.
+    #[cfg(test)]
+    heap_address_bytes: Vec<V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1533,6 +1543,8 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            #[cfg(test)]
+            heap_address_bytes: Vec::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2230,6 +2242,8 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let heap_address_indexed = self.heap_address_indexed();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2240,6 +2254,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            heap_address_indexed,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5758,17 +5774,40 @@ impl<'a> Lower<'a> {
         let Some((at, first)) = resolved else {
             // A descriptor the code picks out of the SM 6.6 view heap by an
             // index it computes (`RootType::ResourceHeap`): the hardware
-            // takes that index, the host does not, and a host value for a
-            // view's title address names its dword at compile time
-            // ([`Self::view_address`]), so nothing ties the slot the code
-            // means to one. (A `Table` whose index is a root constant is
-            // pointed at the entry when the draw binds,
-            // `resource::RootIndexedView`.)
+            // takes that index and hands the code the view's dwords; the
+            // host keeps the slot's title address by the same index
+            // ([`Self::heap_address`], `shader.rs` `SLOT_VIEW_ADDRESSES`),
+            // which is what such code wants of it — it takes the address as
+            // a pointer to the structure behind the view, and a descriptor
+            // of a table names its address at compile time instead
+            // ([`Self::view_address`]).
             if address
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::ResourceHeap)
             {
-                return Err("a view heap descriptor's address read as data");
+                let Some((lo, hi)) = self.heap_address(site, count).ok().flatten() else {
+                    return Err("a view heap descriptor's address read as data");
+                };
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    let v = match k {
+                        0 => Some(lo),
+                        1 => hi,
+                        // The slot's stride and format: no host value, as
+                        // for a table's view.
+                        _ => None,
+                    };
+                    match v {
+                        Some(x) => self.write(inst, reg, x, None),
+                        None => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
             }
             return Err("a descriptor read only as data");
         };
@@ -6351,6 +6390,97 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    /// One dword of the host's table of view addresses
+    /// (`shader.rs` `SLOT_VIEW_ADDRESSES`) at byte offset `at`.
+    fn heap_address_dword(&mut self, h: V, at: V) -> V {
+        let b = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            b,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, iu, mask, align],
+        );
+        let f = self.s.m.extract(b, r, 0);
+        self.as_int(f)
+    }
+
+    /// For each recorded view-heap address read ([`Self::heap_address_bytes`]):
+    /// whether its byte offset is the slot shifted by three (and, for the
+    /// high dword, four bytes on). A read at a constant is a read of one
+    /// fixed slot, whatever index the load computed.
+    #[cfg(test)]
+    fn heap_address_indexed(&self) -> Vec<bool> {
+        self.heap_address_bytes
+            .iter()
+            .map(|&v| {
+                let shift = |v: V| matches!(self.s.m.bin_of(v), Some((Bin::Shl, ..)));
+                shift(v)
+                    || match self.s.m.bin_of(v) {
+                        Some((Bin::Add, a, _)) => shift(a),
+                        _ => false,
+                    }
+            })
+            .collect()
+    }
+
+    /// The title address (low dword, bits from 32 up) of the buffer view at
+    /// the heap slot the descriptor load at `load` names, as the host keeps
+    /// it by slot (`shader.rs` `SLOT_VIEW_ADDRESSES`): indexed with the
+    /// load's own heap index ([`Self::heap_index`]) in the current block,
+    /// the high dword only where the instruction reads it (`count` dwords).
+    /// None where the load does not begin its slot: a heap slot is 32 bytes,
+    /// and dwords from inside one name another descriptor than the index
+    /// picks.
+    fn heap_address(&mut self, load: Site, count: u32) -> Result<Option<(V, Option<V>)>, Why> {
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES};
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        // The heap index is the load's address over the 32 bytes of a slot
+        // ([`Self::heap_index`]), so the load meets the slot's first dword
+        // only from a slot's start: with its bytes in no immediate (a slot
+        // the code holds, the console's own way of naming a descriptor),
+        // that start is the address register's, which the console compiler
+        // takes in 32-byte units.
+        // shortcut: a slot the code holds and reads from its middle (an
+        // immediate there) is still refused: its index rounds down to the
+        // slot, whose first dword is not what the load reads.
+        let aligned = match a.dynamic {
+            Some(_) => a.offset == 0,
+            None => a.offset % 32 == 0,
+        };
+        if !aligned {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(load, 0, false)?;
+        // Inside the table whatever the index (lanes that do not run compute
+        // one too): a root view has no bounds of its own.
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        // Two dwords per slot: eight bytes.
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
+        #[cfg(test)]
+        self.heap_address_bytes.push(byte);
+        let lo = self.heap_address_dword(h, byte);
+        let hi = (count >= 2).then(|| {
+            let four = self.s.m.i32(4);
+            let at = self.s.m.bin(c, Bin::Add, byte, four);
+            #[cfg(test)]
+            self.heap_address_bytes.push(at);
+            self.heap_address_dword(h, at)
+        });
+        Ok(Some((lo, hi)))
     }
 
     /// The bytes per element of the buffer view `src` names, if the program
@@ -11663,30 +11793,80 @@ mod tests {
         lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
-    /// A descriptor the code picks out of the SM 6.6 view heap (SM 6.6
-    /// dynamic resources): read as data, the view's title address has no
-    /// host value, and the refusal says which kind of descriptor it was.
-    #[test]
-    fn a_view_heap_descriptor_read_as_data_names_the_heap() {
-        let words = [
+    /// A program that loads a descriptor from the view heap parameter with
+    /// its `s_load_dwordx4` at byte `offset`: `0x20` and `0x40` begin the
+    /// first and second slot past `s2`'s, `0x10` is inside one.
+    fn heap_load(offset: u32) -> Vec<u32> {
+        vec![
             0xBE83_0380, // s_mov_b32 s3, 0
-            0xF408_0201,
-            0xFA00_0020, // s_load_dwordx4 s[8:11], s[2:3], 0x20
+            0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], soffset null
+            (125 << 25) | offset, // …at `offset` (197: s125 is the null SGPR)
             0xBF02_8008, // s_cmp_gt_i32 s8, 0
             0xBF85_0001, // s_cbranch_scc1 label_1
             S_ENDPGM,
             S_ENDPGM,
-        ];
-        let heap = RootParam {
+        ]
+    }
+
+    /// The SM 6.6 `ResourceHeap` parameter [`heap_load`] reads from: one
+    /// user-data dword at `s2`.
+    fn heap_parameter() -> RootParam {
+        RootParam {
             root: RootType::ResourceHeap,
             table_offset_dwords: 0,
             sgprs: 1,
             base_register: 0,
             user_data: 2,
             slot: 0,
-        };
-        let what = match lower_with(&words, vec![heap], vec![]) {
-            Ok(_) => panic!("a view heap descriptor's address has no host value"),
+        }
+    }
+
+    /// A descriptor the code picks out of the SM 6.6 view heap (SM 6.6
+    /// dynamic resources) and reads the dwords of: the first two are the
+    /// title address of the buffer view there, which the host keeps by heap
+    /// slot (`shader.rs` `SLOT_VIEW_ADDRESSES`) — the title's ray-tracing
+    /// programs take it as a pointer to the structure behind the view, and
+    /// the index is a value only the running shader has. The read is
+    /// indexed by the load's own heap index: the load's byte offset walks
+    /// the table, so two offsets name two slots.
+    #[test]
+    fn a_view_heap_descriptors_address_is_read_from_the_hosts_table_of_slots() {
+        let heap = heap_parameter();
+        let first = lower_with(&heap_load(0x20), vec![heap], vec![])
+            .expect("the heap slot names an address");
+        assert!(first.root_srvs.contains(&crate::emit::SLOT_VIEW_ADDRESSES));
+        // Both dwords of the address are read at the slot's byte: the
+        // index the load computed, shifted by three, and four bytes on. A
+        // constant there would name one fixed slot whatever index the
+        // program computed, which is the thing this program cannot do.
+        assert_eq!(
+            first.heap_address_indexed,
+            [true, true],
+            "the address is not read at the heap slot's index"
+        );
+        // The same program one slot along reads the same table.
+        let second = lower_with(&heap_load(0x40), vec![heap], vec![])
+            .expect("the heap slot names an address");
+        assert_eq!(second.heap_address_indexed, [true, true]);
+        // The read, its clamp and the index it goes by are DXIL the validator
+        // takes (without `dxil.dll`, nothing is checked).
+        for lowered in [first, second] {
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut lowered.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+        }
+    }
+
+    /// Dwords from inside a heap slot name another descriptor than the index
+    /// picks, so the address of one is still refused by name — as it is of a
+    /// table's view no used resource names.
+    #[test]
+    fn a_view_heap_descriptors_address_inside_a_slot_is_refused_by_name() {
+        let what = match lower_with(&heap_load(0x10), vec![heap_parameter()], vec![]) {
+            Ok(_) => panic!("a heap slot begins on 32 bytes"),
             Err(crate::ShaderError::Unsupported { what, .. }) => what,
             Err(error) => panic!("{error}"),
         };
@@ -11694,9 +11874,9 @@ mod tests {
         // A table's where the code holds the dword: unchanged.
         let table = RootParam {
             root: RootType::Table,
-            ..heap
+            ..heap_parameter()
         };
-        let what = match lower_with(&words, vec![table], vec![]) {
+        let what = match lower_with(&heap_load(0x20), vec![table], vec![]) {
             Ok(_) => panic!("no used resource: nothing names the view"),
             Err(crate::ShaderError::Unsupported { what, .. }) => what,
             Err(error) => panic!("{error}"),

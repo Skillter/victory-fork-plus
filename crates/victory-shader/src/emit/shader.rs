@@ -27,6 +27,25 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that takes the title address out of a buffer view it picks from the view
+/// heap at an index it computes (`RootType::ResourceHeap`): a raw buffer of
+/// [`SLOT_VIEW_ADDRESSES_COUNT`] dwords, two per heap slot, the low 32 bits
+/// of the title address of the buffer view at slot `i` below its bits from
+/// 32 up. Both 0 for a slot that holds no buffer view, or one whose memory
+/// the host does not have: the code then reads no address, rather than one
+/// the host made up.
+/// The console's descriptor holds that address, and the code the title's
+/// ray-tracing programs run takes it as a pointer to the structure behind
+/// the view (`super::USER_VIEW_ADDRESS` names the same dwords of a table,
+/// where the slot is a compile-time constant); the host's own record of a
+/// heap slot (`descriptor::record`) names no address, and where the code's
+/// index is a runtime value the compile has nothing to fold.
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
+/// Dwords of the [`SLOT_VIEW_ADDRESSES`] buffer: two per heap slot, for the
+/// slots [`SLOT_STRIDES_COUNT`] names.
+pub const SLOT_VIEW_ADDRESSES_COUNT: u32 = SLOT_STRIDES_COUNT * 2;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the

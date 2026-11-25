@@ -48,6 +48,17 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer view at each title slot,
+    /// two dwords each (low, high), for shaders that read the address out of
+    /// a descriptor they pick by an index they compute
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload buffer of
+    /// `SLOT_VIEW_ADDRESSES_COUNT` dwords, its GPU address and its mapping.
+    /// Zero where the slot holds no buffer view, or one whose memory the
+    /// host does not have: a shader reads no address there rather than one
+    /// the host made up, and the title's own gate on the descriptor decides
+    /// what to do with that (the console's descriptor would hold none
+    /// either).
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -697,6 +708,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEW_ADDRESSES_COUNT) * 4;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "title address by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -709,6 +733,7 @@ impl HostHeap {
             ring: std::sync::Arc::new(Mutex::new(Ring::new(extra))),
             ident: next_ident(),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1344,6 +1369,17 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    /// The GPU address of the table of view addresses by title slot (view
+    /// heaps).
+    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
+        self.addresses.as_ref().map(|s| s.1)
+    }
+
+    /// That table's buffer, for a list to hold.
+    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        self.addresses.as_ref().map(|s| &s.0)
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
@@ -1622,6 +1658,17 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The address the console's descriptor holds: where the view
+            // reads title memory, or 0. One aligned eight-byte store, so a
+            // shader reads either address and never half of one.
+            let address = slot_address(view);
+            // SAFETY: inside the mapping, eight bytes per slot; a shader
+            // reads it while we write (either value is one the slot had).
+            unsafe { (*data as *mut u64).add(index as usize).write_volatile(address) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -1986,6 +2033,16 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// The title address the console's descriptor for `view` holds: where the
+/// part of the buffer the view reads begins, or 0 where the slot holds
+/// something other than a buffer view the host has the memory of
+/// ([`buffer_range`]). A shader that picks a descriptor from the heap by an
+/// index it computes reads it ([`HostHeap::note_buffer`],
+/// `victory_shader::emit::SLOT_VIEW_ADDRESSES`).
+fn slot_address(view: Option<&View>) -> u64 {
+    view.and_then(buffer_range).map_or(0, |(at, _)| at)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -3214,6 +3271,75 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    /// A placed buffer view of `elements` elements of 4 bytes at title
+    /// address `at`, its first element `first` elements in.
+    fn placed_buffer(at: u64, first: u64, elements: u32) -> View {
+        // The ten words of the descriptor, as `srv_desc` reads them (the
+        // union of `D3D12_SHADER_RESOURCE_VIEW_DESC` begins at its fourth):
+        // format, dimension, then first element, elements, stride, flags.
+        let desc = [
+            0,
+            1, // D3D12_SRV_DIMENSION_BUFFER
+            0,
+            0,
+            first as u32,
+            (first >> 32) as u32,
+            elements,
+            0,
+            1, // D3D12_BUFFER_SRV_FLAG_RAW: 4 bytes an element
+            0,
+            at as u32,
+            (at >> 32) as u32,
+            0,
+            0,
+            0,
+            0,
+        ];
+        View::Placed(false, [1, 0, 0, 0, 0x4000, 0, 0, 0, 0, 0, 0, 0, 0, 0], desc)
+    }
+
+    /// The address a heap slot's descriptor holds is the title address the
+    /// buffer view there reads its first element at, and zero where the slot
+    /// holds a texture view or nothing: a shader that picks a descriptor
+    /// from the heap by an index it computes reads it, and a zero says the
+    /// host has no address to give rather than one it made up.
+    #[test]
+    fn a_slots_view_address_is_where_its_buffer_view_begins() {
+        let at = 0x7fee_0000_1234u64;
+        assert_eq!(slot_address(Some(&placed_buffer(at, 0, 16))), at);
+        // The first element moves the address, as the console's does.
+        assert_eq!(slot_address(Some(&placed_buffer(at, 3, 16))), at + 12);
+        // A placed texture view (the buffer discriminant is 0), and a slot
+        // with no view.
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
+        assert_eq!(slot_address(Some(&texture)), 0);
+        assert_eq!(slot_address(None), 0);
+    }
+
+    /// The host writes that address into the heap's table of them, two
+    /// dwords a slot, where the title writes the descriptor.
+    #[test]
+    fn a_slots_view_address_reaches_the_table_of_them() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = &heap.addresses else {
+            return; // no host GPU (the table is made with the heap)
+        };
+        let at = 0x7fee_0000_4321u64;
+        heap.note_buffer(5, Some(&placed_buffer(at, 2, 4)), false);
+        // SAFETY: inside the mapping, eight bytes a slot, as the shader
+        // reads them.
+        let written = unsafe { *(*data as *const u64).add(5) };
+        assert_eq!(written, at + 8);
+        // A texture view in the slot: no address.
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
+        heap.note_buffer(5, Some(&texture), false);
+        // SAFETY: as above.
+        let written = unsafe { *(*data as *const u64).add(5) };
+        assert_eq!(written, 0);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

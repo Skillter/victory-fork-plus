@@ -66,7 +66,9 @@ shaders and emulates the one instruction.
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- One shadow-mask trace program (`CS_TraceShadowRays_FullAdaptive`) does not
+  translate yet: at its 0xae80 a lane mask holding lanes elsewhere is read as
+  data. The other four trace programs do translate and validate.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order

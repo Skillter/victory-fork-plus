@@ -1407,6 +1407,21 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours, not the title's: the title address of the
+                        // buffer view at each heap slot, which a shader that
+                        // picks one by an index it computes reads as data
+                        // (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
+                        match self.heap_addresses(list) {
+                            Some(gpu) => {
+                                self.set_root_arg(list, compute, param, RootKind::Srv, gpu);
+                            }
+                            None => {
+                                once!("a shader reads view addresses from a view heap that is not set");
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1709,6 +1724,32 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// For a shader that reads the title address out of a buffer view it
+    /// picks from the view heap by an index it computes: the GPU address of
+    /// the heap's table of view addresses, kept on `list`.
+    /// The host writes that table as the title writes descriptors
+    /// ([`HostHeap::note_buffer`]), so unlike [`State::heap_buffers`] there
+    /// is nothing here to make ready.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.addresses_gpu()?;
+        // One key per list, as textures and the strides table have: no title
+        // resource is there.
+        const ONCE: usize = usize::MAX - 0x5d;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.addresses_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
