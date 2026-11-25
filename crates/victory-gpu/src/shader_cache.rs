@@ -4,6 +4,9 @@
 //! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
+//! Opening the cache first prunes it (a month idle, then a 2 GiB cap): the
+//! key carries this build's hash, so every rebuild orphans a generation and
+//! nothing else ever removed one.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -22,14 +25,24 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
+/// Keeps translated shaders in `dir` from now on, after dropping the entries
+/// no build will ask for again.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    match open_pruned(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// Opening the cache is the one moment pruning cannot race a reader: the key
+/// carries the BLAKE3 of the executable, so every rebuild orphans a whole
+/// generation, and nothing else ever removed one.
+fn open_pruned(dir: PathBuf) -> anyhow::Result<Cache> {
+    let cache = Cache::open(dir)?;
+    cache.prune();
+    Ok(cache)
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -390,6 +403,27 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn opening_the_cache_drops_old_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("aa").join("stale-entry");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"a generation of another build").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let cache = open_pruned(dir.path().to_path_buf()).unwrap();
+        assert!(!stale.exists(), "an entry no build can ask for any more");
+        // The cache still works: a new translation is stored and read back.
+        assert_eq!(cached(&cache, &[9; 32], b"fresh", |_| Ok(shader())), Ok(shader()));
+        assert_eq!(walk(dir.path()).len(), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

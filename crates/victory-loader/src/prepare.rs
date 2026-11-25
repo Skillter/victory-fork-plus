@@ -24,10 +24,19 @@ pub struct PreparedImage {
     pub original_hash: blake3::Hash,
 }
 
+/// Prefix and suffix of the patched copy's file name, around the first 16 hex
+/// digits of the original's BLAKE3. `images::prune` matches copies by this
+/// shape, so a copy this crate did not write is never removed.
+pub const IMAGE_NAME_PREFIX: &str = "victory-image-";
+pub const IMAGE_NAME_SUFFIX: &str = ".dll";
+
 impl PreparedImage {
     /// File name for the patched copy, unique per original build.
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        format!(
+            "{IMAGE_NAME_PREFIX}{}{IMAGE_NAME_SUFFIX}",
+            &self.original_hash.to_hex()[..16]
+        )
     }
 }
 
