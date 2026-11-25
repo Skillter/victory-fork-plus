@@ -43,6 +43,9 @@ enum RootKind {
     Cbv,
     Srv,
     Uav,
+    /// A one-view table (`State::root_srv_table`, `State::root_uav`): the
+    /// same slot's handle, set the same way, draw after draw.
+    Table,
 }
 
 /// A root argument the list has set.
@@ -107,6 +110,49 @@ impl RootArgs {
     }
 }
 
+/// The 32-bit constants a list holds at each (compute, parameter), under the
+/// root signature they were set with, so a draw that needs the same values
+/// there leaves the call out: a stage's user data is the same dwords for
+/// every draw of a pipeline whose tables were served from the same slots.
+/// Cleared wherever [`RootArgs`] is ([`State::forget_roots`]).
+#[derive(Default)]
+struct RootValues {
+    /// By (compute, parameter), ascending; values set under another root
+    /// signature are set again (the call is undefined after one).
+    set: Vec<(bool, u32, usize, Vec<u32>)>,
+}
+
+impl RootValues {
+    /// Whether the call must be made: the parameter holds other values, or
+    /// was set under another root signature.
+    fn again(&mut self, signature: usize, compute: bool, param: u32, values: &[u32]) -> bool {
+        match self
+            .set
+            .binary_search_by(|(space, at, _, _)| (*space, *at).cmp(&(compute, param)))
+        {
+            Ok(k) => {
+                let (_, _, set, held) = &mut self.set[k];
+                if *set == signature && held.as_slice() == values {
+                    return false;
+                }
+                *set = signature;
+                held.clear();
+                held.extend_from_slice(values);
+                true
+            }
+            Err(k) => {
+                self.set
+                    .insert(k, (compute, param, signature, values.to_vec()));
+                true
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.set.clear();
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -121,6 +167,21 @@ pub(crate) struct IndexView {
     address: u64,
     size: u32,
     format: u32,
+}
+
+/// Whether two views ask the list for the same buffer at the same offset: a
+/// draw that binds the one the list holds leaves its call out
+/// ([`State::prepare_for`]). Not `PartialEq`: the D3D12 types derive none.
+fn same_vertex(a: &D3D12_VERTEX_BUFFER_VIEW, b: &D3D12_VERTEX_BUFFER_VIEW) -> bool {
+    a.BufferLocation == b.BufferLocation
+        && a.SizeInBytes == b.SizeInBytes
+        && a.StrideInBytes == b.StrideInBytes
+}
+
+fn same_index(a: &D3D12_INDEX_BUFFER_VIEW, b: &D3D12_INDEX_BUFFER_VIEW) -> bool {
+    a.BufferLocation == b.BufferLocation
+        && a.SizeInBytes == b.SizeInBytes
+        && a.Format.0 == b.Format.0
 }
 
 /// Host states of a depth target, and of a texture shaders read.
@@ -401,6 +462,14 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// The vertex-buffer views the list holds from slot 0 on, and how many
+    /// (`u32::MAX`: the list holds views [`State::rectangles`] set, which
+    /// no draw of the title's states); and the index buffer the list holds.
+    /// A draw that binds the same views leaves both calls out: nothing else
+    /// in this module sets them, and a host list keeps them across every
+    /// command ([`State::prepare_for`]).
+    host_vertex: ([D3D12_VERTEX_BUFFER_VIEW; 32], u32),
+    host_index: Option<D3D12_INDEX_BUFFER_VIEW>,
     /// Tables made afresh in this list: (table, slot count) → the record
     /// bytes last seen there, the dynamic slots they were made in and the
     /// registry revision they were made under ([`Fresh`]). The records are
@@ -433,6 +502,9 @@ pub(crate) struct State {
     /// What the list last set at each root argument ([`RootArgs`]): a draw
     /// that repeats one leaves the call out.
     root_args: RootArgs,
+    /// What it last set at each parameter's 32-bit constants
+    /// ([`RootValues`]), likewise.
+    root_values: RootValues,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -588,6 +660,148 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
+}
+
+/// A host-list command the recording path emits, or a call left out
+/// because the list already holds that state. Counted in every build with
+/// one relaxed add per call, and summed per 5 s by [`commands_line`]: the
+/// evidence for what a draw of ours costs on the list, and what the caches
+/// spare (a list keeps its pipeline, root signature, heaps and root
+/// arguments across every other command on it).
+///
+/// Barriers are counted where the draw path asks for a texture's state
+/// (`crate::list::ensure_state`), which records one only when the state
+/// changes; the copies and the twin barriers behind a draw are `host`'s and
+/// `shadow`'s, and `copystat` counts those.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Command {
+    /// `DrawInstanced` and `DrawIndexedInstanced`.
+    Draw,
+    /// `SetPipelineState`.
+    Pipeline,
+    /// `SetGraphicsRootSignature` and `SetComputeRootSignature`.
+    Signature,
+    /// `SetDescriptorHeaps` (and the root signature it makes unset).
+    Heaps,
+    /// `Set*RootDescriptorTable`: a root SRV or UAV bound as a one-view
+    /// table ([`State::root_srv_table`], [`State::root_uav`]).
+    RootTable,
+    /// `Set*RootConstantBufferView`, `...ShaderResourceView`,
+    /// `...UnorderedAccessView`.
+    RootView,
+    /// `Set*Root32BitConstants`: a stage's user data.
+    Root32,
+    /// `IASetVertexBuffers`.
+    Vertex,
+    /// `IASetIndexBuffer`.
+    Index,
+    /// `OMSetRenderTargets`, from the title's own call.
+    Targets,
+    /// `IASetPrimitiveTopology`, likewise.
+    Topology,
+    /// `Dispatch` and `DispatchMesh`, from the title's own calls.
+    Dispatch,
+    /// `ExecuteIndirect`, from the title's own calls.
+    Execute,
+    /// The clamp dispatch of ours behind each run of indirect records
+    /// (`crate::indirect::bound`).
+    Clamp,
+    /// `ResourceBarrier`, from a draw's targets and depth buffer
+    /// (`crate::list::ensure_state`): recorded only when a texture moves.
+    Barrier,
+}
+
+/// One label per [`Command`], in its order.
+const LABELS: [(Command, &str); 15] = [
+    (Command::Draw, "draw"),
+    (Command::Pipeline, "pipeline"),
+    (Command::Signature, "root signature"),
+    (Command::Heaps, "heaps"),
+    (Command::RootTable, "root tables"),
+    (Command::RootView, "root views"),
+    (Command::Root32, "root constants"),
+    (Command::Vertex, "vertex buffers"),
+    (Command::Index, "index buffers"),
+    (Command::Targets, "targets"),
+    (Command::Topology, "topology"),
+    (Command::Dispatch, "dispatches"),
+    (Command::Execute, "indirect runs"),
+    (Command::Clamp, "our indirect clamps"),
+    (Command::Barrier, "barriers"),
+];
+const COMMANDS: usize = LABELS.len();
+
+/// Calls recorded on the host list, and calls left out, by [`Command`].
+static EMITTED: [AtomicU64; COMMANDS] = [const { AtomicU64::new(0) }; COMMANDS];
+static SPARED: [AtomicU64; COMMANDS] = [const { AtomicU64::new(0) }; COMMANDS];
+
+/// `n` of `command` were recorded on the host list.
+pub(crate) fn emitted(command: Command, n: u64) {
+    EMITTED[command as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// One `command` was not recorded: the list already holds that state.
+fn spared(command: Command) {
+    SPARED[command as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`spared`] for a cache outside this module (`crate::list`).
+pub(crate) fn spared_command(command: Command) {
+    spared(command);
+}
+
+/// A window's counts, taken once: what it emitted and what it spared.
+struct Counts {
+    emitted: [u64; COMMANDS],
+    spared: [u64; COMMANDS],
+}
+
+impl Counts {
+    fn take() -> Counts {
+        Counts {
+            emitted: EMITTED.each_ref().map(|c| c.swap(0, Ordering::Relaxed)),
+            spared: SPARED.each_ref().map(|c| c.swap(0, Ordering::Relaxed)),
+        }
+    }
+
+    /// The line for `draws` draws recorded over `presented` frames. Not
+    /// `Display`: nothing else wants this shape, and a test asserts it.
+    fn text(&self, draws: u64, presented: u64) -> String {
+        let sum = |counts: &[u64; COMMANDS]| counts.iter().sum::<u64>() as f64;
+        if draws == 0 {
+            return format!(
+                "commands per draw: none ({} recorded and {} left out as the list already held \
+                 them, over {presented} frames)",
+                sum(&self.emitted),
+                sum(&self.spared),
+            );
+        }
+        let per = |n: f64| n / draws as f64;
+        let listed = |counts: &[u64; COMMANDS], zero: bool| {
+            LABELS
+                .iter()
+                .filter(|(command, _)| zero || counts[*command as usize] != 0)
+                .map(|(command, label)| {
+                    format!("{label} {:.2}", per(counts[*command as usize] as f64))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "commands per draw: {:.2} on the host list for {draws} draws in {presented} frames \
+             ({}); {:.2} left out as the list already held them ({})",
+            per(sum(&self.emitted)),
+            listed(&self.emitted, true),
+            per(sum(&self.spared)),
+            listed(&self.spared, false),
+        )
+    }
+}
+
+/// Logs the commands per draw of the window that just ended: one line, every
+/// 5 s, beside the frame's lines and in every build (`crate::queue::present`).
+pub(crate) fn commands_line(draws: u64, presented: u64) {
+    tracing::info!("{}", Counts::take().text(draws, presented));
 }
 
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
@@ -811,6 +1025,7 @@ impl State {
             list.list
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
         };
+        emitted(Command::Topology, 1);
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -937,6 +1152,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        emitted(Command::Targets, 1);
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -986,10 +1202,10 @@ impl State {
     /// list has nothing set, so what the title set so far is set again.
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
-    /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// none); root arguments, root constants, vertex and index buffers are
+    /// set by every draw until the list has theirs. The dynamic descriptor
+    /// slots and the tables made in them stay: the parts before the cut have
+    /// not run yet, and they are given back when the title's list is reset.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -997,8 +1213,11 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
-        // The new host list has no root argument set.
-        self.root_args.clear();
+        // The new host list has no root argument, no 32-bit constant and no
+        // draw buffer set.
+        self.forget_roots();
+        self.host_vertex.1 = u32::MAX;
+        self.host_index = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1213,11 +1432,22 @@ impl State {
                 StrideInBytes: v.stride,
             };
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
+        // The views the list holds: a draw that binds the same ones leaves
+        // both calls out (nothing else in this module sets them, and they
+        // survive every other command on a list).
+        if count > 0 && (self.host_vertex.1 != count as u32 || {
+            let held = &self.host_vertex.0[..count];
+            !views[..count]
+                .iter()
+                .zip(held)
+                .all(|(a, b)| same_vertex(a, b))
+        }) {
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
+            emitted(Command::Vertex, 1);
+            self.host_vertex = (views, count as u32);
+        } else if count > 0 {
+            spared(Command::Vertex);
         }
         if indexed {
             let v = self.index;
@@ -1230,8 +1460,14 @@ impl State {
                 SizeInBytes: v.size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if !self.host_index.is_some_and(|held| same_index(&held, &view)) {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+                emitted(Command::Index, 1);
+                self.host_index = Some(view);
+            } else {
+                spared(Command::Index);
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1284,8 +1520,11 @@ impl State {
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
+            emitted(Command::Heaps, 1);
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
+        } else {
+            spared(Command::Heaps);
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -1305,20 +1544,26 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
+            emitted(Command::Signature, 1);
             self.host_roots[usize::from(compute)] = root;
             // A root signature switch leaves the root arguments undefined:
             // every one this draw sets is set again.
-            self.root_args.clear();
+            self.forget_roots();
+        } else {
+            spared(Command::Signature);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            emitted(Command::Pipeline, 1);
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep_pair(&p.pso, &p.root);
+        } else {
+            spared(Command::Pipeline);
         }
         let mut made = std::mem::take(&mut self.scratch_made);
         for stage in &p.stages {
@@ -1375,12 +1620,32 @@ impl State {
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                let n = dwords as usize;
+                let signature = self.host_roots[usize::from(compute)];
+                if self
+                    .root_values
+                    .again(signature, compute, param, &values[..n])
+                {
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(
+                                param,
+                                dwords,
+                                values.as_ptr().cast(),
+                                0,
+                            );
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(
+                                param,
+                                dwords,
+                                values.as_ptr().cast(),
+                                0,
+                            );
+                        }
                     }
+                    emitted(Command::Root32, 1);
+                } else {
+                    spared(Command::Root32);
                 }
                 self.scratch_values = values;
             }
@@ -1489,11 +1754,11 @@ impl State {
         true
     }
 
-    /// Sets a root CBV, SRV or UAV at `param`: a draw that repeats the value
-    /// the list has there leaves the call out, as the pipeline, the root
-    /// signature and the heaps are left out. A cut's new host list has none
-    /// of them ([`State::replay`]), and neither has one under another root
-    /// signature.
+    /// Sets a root CBV, SRV or UAV at `param`, or a one-view table: a draw
+    /// that repeats the value the list has there leaves the call out, as the
+    /// pipeline, the root signature and the heaps are left out. A cut's new
+    /// host list has none of them ([`State::replay`]), and neither has one
+    /// under another root signature.
     fn set_root_arg(
         &mut self,
         list: &HostList,
@@ -1504,20 +1769,53 @@ impl State {
     ) {
         let signature = self.host_roots[usize::from(compute)];
         if !self.root_args.again(signature, compute, param, kind, value) {
+            spared(if kind == RootKind::Table {
+                Command::RootTable
+            } else {
+                Command::RootView
+            });
             return;
         }
         // SAFETY: an open list; the value is a GPU address in live memory the
-        // list holds.
+        // list holds, or a handle in the bound view heap.
         unsafe {
             match (compute, kind) {
                 (false, RootKind::Cbv) => list.list.SetGraphicsRootConstantBufferView(param, value),
                 (false, RootKind::Srv) => list.list.SetGraphicsRootShaderResourceView(param, value),
                 (false, RootKind::Uav) => list.list.SetGraphicsRootUnorderedAccessView(param, value),
+                (false, RootKind::Table) => {
+                    list.list.SetGraphicsRootDescriptorTable(
+                        param,
+                        D3D12_GPU_DESCRIPTOR_HANDLE { ptr: value },
+                    )
+                }
                 (true, RootKind::Cbv) => list.list.SetComputeRootConstantBufferView(param, value),
                 (true, RootKind::Srv) => list.list.SetComputeRootShaderResourceView(param, value),
                 (true, RootKind::Uav) => list.list.SetComputeRootUnorderedAccessView(param, value),
+                (true, RootKind::Table) => {
+                    list.list.SetComputeRootDescriptorTable(
+                        param,
+                        D3D12_GPU_DESCRIPTOR_HANDLE { ptr: value },
+                    )
+                }
             }
         }
+        emitted(
+            if kind == RootKind::Table {
+                Command::RootTable
+            } else {
+                Command::RootView
+            },
+            1,
+        );
+    }
+
+    /// A root signature or a new host list: every root argument and every
+    /// set of 32-bit constants is undefined there, so the next draw sets
+    /// all of them again.
+    fn forget_roots(&mut self) {
+        self.root_args.clear();
+        self.root_values.clear();
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1619,14 +1917,9 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        // A draw of the list that binds the same slot at the same parameter
+        // leaves this call out (the slot is cached per list, so it repeats).
+        self.set_root_arg(list, compute, param, RootKind::Table, handle.ptr);
         true
     }
 
@@ -1702,14 +1995,9 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        // As above: the slot is per address per list, so the same draw of the
+        // list binds the same handle at the same parameter.
+        self.set_root_arg(list, compute, param, RootKind::Table, handle.ptr);
         true
     }
 
@@ -2484,6 +2772,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        emitted(Command::Dispatch, 1);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2584,6 +2873,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
+                    emitted(Command::Dispatch, 1);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -2943,6 +3233,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            emitted(Command::Draw, 1);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2961,7 +3252,7 @@ impl State {
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -3008,6 +3299,10 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            emitted(Command::Vertex, 1);
+            // The list no longer holds the views a draw of the title's set
+            // (`State::prepare_for`): the next one sets its own again.
+            self.host_vertex.1 = u32::MAX;
         }
         true
     }
@@ -3039,6 +3334,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            emitted(Command::Draw, 1);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3277,9 +3573,12 @@ impl State {
             self.mesh_scissor(list, false);
         }
         crate::indirect::done(list, &bounded);
+        emitted(Command::Execute, 1);
         if kind == DISPATCH {
+            emitted(Command::Dispatch, 1);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            emitted(Command::Draw, 1);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -4155,6 +4454,131 @@ mod tests {
         // The compute space is another set of parameters.
         assert!(args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
         assert!(!args.again(signature, true, 0, RootKind::Cbv, 0xc000_0000));
+    }
+
+    /// The same 32-bit constants at a parameter are set once; another root
+    /// signature, another value or a cleared list sets them again.
+    #[test]
+    fn repeated_root_constants_are_set_once() {
+        let mut values = RootValues::default();
+        let signature = 0x1000_0000usize;
+        let user = [0x10u32, 0x20, 0x30, 0x40];
+        let mut calls = 0;
+        for _ in 0..1_000 {
+            if values.again(signature, false, 1, &user) {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 1, "SetGraphicsRoot32BitConstants calls for one draw's user data");
+        // A table served from another slot moves the offset the shader is
+        // told: another value at the same parameter, set again.
+        assert!(values.again(signature, false, 1, &[0x10, 0x20, 0x30, 0x50]));
+        // Another root signature leaves the parameter undefined.
+        assert!(values.again(0x2000_0000, false, 1, &[0x10, 0x20, 0x30, 0x50]));
+        // The compute space is another set of parameters.
+        assert!(values.again(0x2000_0000, true, 1, &[0x10, 0x20, 0x30, 0x50]));
+        assert!(!values.again(0x2000_0000, true, 1, &[0x10, 0x20, 0x30, 0x50]));
+        // A new host list has none of them.
+        values.clear();
+        assert!(values.again(0x2000_0000, true, 1, &[0x10, 0x20, 0x30, 0x50]));
+    }
+
+    /// The draw-buffer views a list holds are compared field by field: the
+    /// D3D12 types derive no comparison, and a draw whose buffers resolve to
+    /// the same host bytes is the same state.
+    #[test]
+    fn a_draw_buffer_view_is_the_same_state_only_with_the_same_bytes() {
+        let a = D3D12_VERTEX_BUFFER_VIEW {
+            BufferLocation: 0x1000_0000,
+            SizeInBytes: 0x400,
+            StrideInBytes: 32,
+        };
+        let b = D3D12_VERTEX_BUFFER_VIEW {
+            StrideInBytes: 24,
+            ..a
+        };
+        assert!(same_vertex(&a, &a));
+        assert!(!same_vertex(&a, &b));
+        let i = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: 0x1000_0000,
+            SizeInBytes: 0x400,
+            Format: DXGI_FORMAT(57),
+        };
+        let j = D3D12_INDEX_BUFFER_VIEW {
+            Format: DXGI_FORMAT(58),
+            ..i
+        };
+        assert!(same_index(&i, &i));
+        assert!(!same_index(&i, &j));
+    }
+
+    /// The commands-per-draw line: every command named with its ratio, and
+    /// only the calls a cache spared that happened.
+    #[test]
+    fn the_commands_per_draw_line_names_each_command() {
+        let mut emitted = [0u64; COMMANDS];
+        emitted[Command::Draw as usize] = 4;
+        emitted[Command::Vertex as usize] = 6;
+        emitted[Command::Index as usize] = 4;
+        emitted[Command::RootTable as usize] = 8;
+        emitted[Command::Root32 as usize] = 8;
+        let mut spared = [0u64; COMMANDS];
+        spared[Command::Vertex as usize] = 2;
+        spared[Command::Pipeline as usize] = 4;
+        let text = Counts { emitted, spared }.text(4, 2);
+        assert!(text.starts_with("commands per draw: "), "{text}");
+        // 30 calls over 4 draws.
+        assert!(text.contains("7.50 on the host list for 4 draws in 2 frames"), "{text}");
+        assert!(text.contains("draw 1.00"), "{text}");
+        assert!(text.contains("vertex buffers 1.50"), "{text}");
+        assert!(text.contains("root tables 2.00"), "{text}");
+        assert!(text.contains("1.50 left out as the list already held them"), "{text}");
+        assert!(text.contains("pipeline 1.00"), "{text}");
+        // A command a cache never spared is not named in that list.
+        assert!(!text[text.find("left out").unwrap()..].contains("index buffers"), "{text}");
+        // A window with no draws says so rather than dividing by zero.
+        let none = Counts {
+            emitted: [0; COMMANDS],
+            spared: [0; COMMANDS],
+        }
+        .text(0, 3);
+        assert!(none.starts_with("commands per draw: none"), "{none}");
+    }
+
+    /// The commands-per-draw line of a synthetic frame, from the counters the
+    /// recording path itself bumps: two draws of one pipeline that the list
+    /// already holds, whose vertex buffers the second reuses. Prints the line
+    /// for `--nocapture`, where a run's log shows the same shape.
+    #[test]
+    fn a_synthetic_frame_of_two_draws_reads_as_a_run_prints_it() {
+        // Whatever another test left.
+        let _ = Counts::take();
+        for draw in 0..2 {
+            emitted(Command::Draw, 1);
+            emitted(Command::Root32, 2);
+            spared(Command::Pipeline);
+            // The second draw's buffers are the first's: spared, not set.
+            if draw == 0 {
+                emitted(Command::Vertex, 1);
+            } else {
+                spared(Command::Vertex);
+            }
+        }
+        let text = Counts::take().text(2, 3);
+        println!("{text}");
+        // 2 draws, 1 vertex-buffer set, 4 root-constant sets: 7 calls.
+        assert!(
+            text.starts_with("commands per draw: 3.50 on the host list for 2 draws in 3 frames"),
+            "{text}"
+        );
+        for expected in [
+            "draw 1.00",
+            "vertex buffers 0.50",
+            "root constants 2.00",
+            "1.50 left out as the list already held them (pipeline 1.00, vertex buffers 0.50)",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
     }
 
     /// A descriptor the title rewrote between two draws resolves to another

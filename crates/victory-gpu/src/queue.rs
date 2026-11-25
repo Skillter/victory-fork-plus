@@ -745,6 +745,27 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Commands per draw, every 5 s in every build (`crate::draw::commands_line`):
+/// what the recording path emits per draw and what the list's caches leave
+/// out. The frame's other lines print from inside the meter, which a run may
+/// stop driving; this one counts presents, so a window always ends.
+fn commands_line() {
+    static WINDOW: std::sync::Mutex<Option<(std::time::Instant, u64, u64)>> =
+        std::sync::Mutex::new(None);
+    let mut window = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let drawn = crate::draw::drawn();
+    let (since, frames, from) = window.unwrap_or((now, 0, drawn));
+    let (frames, from) = (frames + 1, from.min(drawn));
+    if now.duration_since(since) >= std::time::Duration::from_secs(5) {
+        *window = Some((now, 0, drawn));
+        drop(window);
+        crate::draw::commands_line(drawn - from, frames);
+    } else {
+        *window = Some((since, frames, from));
+    }
+}
+
 /// Frames presented so far, for the summary `victory run` writes at exit.
 pub fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -779,6 +800,7 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    commands_line();
     // The run's frame count, for the `STOP` block: a count of a static, so a
     // path that ends the process elsewhere still has it.
     victory_core::meter::meter().count("frames_n", 1);

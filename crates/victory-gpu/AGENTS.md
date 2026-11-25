@@ -60,8 +60,13 @@
   two heaps, and a run goes back to the ring it came from or to none. A run
   given back twice is credited once (`Ring::give_back`), so `free` never passes
   the ring's capacity.
-- Root arguments are cached per list (`draw::RootArgs`) and re-issued only when
-  the resolved value changes; a root-signature change or a new list drops them.
+- Root arguments, a parameter's 32-bit constants and the draw buffers are
+  cached per list (`draw::RootArgs`, `draw::RootValues`, `State::host_vertex`):
+  a call repeats only when the resolved value changes, a root-signature change
+  or a new list drops the root ones, and `draw::rectangles` marks the vertex
+  buffers unknown (it sets its own). A draw therefore emits its pipeline
+  switches, its live root arguments and one draw; what else it emits is a
+  redundancy `draw` counts (see Diagnostics).
 - The capped heap points past-the-end reads at a null slot for a reason: a
   real read past the heap end hung an NVIDIA GPU.
 - A buffer view of no elements is the console's for the rest of its buffer:
@@ -142,6 +147,10 @@
 - `capture` and `copystat` are compiled only with
   `feature = "diagnostics"`. `VICTORY_GPU_TIMING` forces `late_stage` to 0;
   `VICTORY_D3D12_DRED` names the faulting command.
+- `draw` counts what a draw emits on the host list and what those caches
+  spare, per 5 s in every build (`draw::commands_line`): a per-draw cost that
+  line does not show is `host`'s barriers and copies, not a command of the
+  draw's.
 - `flow` counts in every build, and logs after each frame line: which call
   site moved how many bytes between title memory and ours, in how long, and
   at what rate. `copystat` names the ranges and the memory kinds behind them.
