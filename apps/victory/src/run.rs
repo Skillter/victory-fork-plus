@@ -19,6 +19,14 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Logging starts here, after the config has named the data directory
+    // the log belongs in and before anything worth reading happens. A data
+    // directory that cannot hold it (asset policy, permissions) leaves the
+    // run on stderr rather than refusing to start it.
+    match cfg.data_subdir("logs") {
+        Ok(dir) => victory_core::logging::init_run("info", &dir),
+        Err(_) => victory_core::logging::init("info"),
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

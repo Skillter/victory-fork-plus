@@ -179,7 +179,10 @@ victory config
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+info and above). `victory run` also writes the same log to
+`<data-dir>\logs\run.log`, truncated at the start of each run, so a run that
+outlives its terminal still leaves a record. `VICTORY_LOG_FILE=<path>` puts
+that file somewhere else; `VICTORY_LOG_FILE=0` keeps the log on stderr only.
 
 ## Debugging
 
@@ -192,6 +195,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_LOG_FILE=<path>` | also write the log to that file; `0` disables the file |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
