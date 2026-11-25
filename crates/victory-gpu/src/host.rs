@@ -5853,6 +5853,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    // Every copy out of title memory is counted, and one big enough is timed
+    // and its pages sampled before and after the read: the 5 s line divides
+    // the bytes by the time and sets the process's page faults beside them
+    // (`crate::fault`). The count ends where the copy does, on every path out.
+    let mut copying = crate::fault::copying(src as usize, dst as usize, len);
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -5884,6 +5889,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
         return;
     }
+    // The sparse read below is the one path a copy can take that is not a
+    // copy: counted in every build, so the 5 s line shows it in a release one
+    // too (`crate::fault`). The diagnostics table counts it per frame as well,
+    // which is the line that has the ranges beside it.
+    copying.fell_back();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
@@ -6654,6 +6664,15 @@ impl Meter {
             let draws = (drawn - self.reported_drawn) as f64 / frames;
             (self.logged, self.reported, self.reported_drawn) =
                 (std::time::Instant::now(), 0, drawn);
+            // What the copies out of title memory ran at, beside the process's
+            // page faults and memory (`crate::fault`): a scene that streams
+            // from the pagefile is the one that loses its frame time to copies
+            // that are not copies. Taken before the two counters below are
+            // drained, so both lines describe one window.
+            crate::fault::line(
+                printed,
+                [COPY_BACK[0].load(Ordering::Relaxed), COPY_BACK[1].load(Ordering::Relaxed)],
+            );
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

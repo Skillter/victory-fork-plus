@@ -1048,12 +1048,22 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
                 (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
             )
         } != 0;
+        crate::fault::asked(n);
         for (i, entry) in info[..n].iter().enumerate() {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            let read = if valid {
+                true
+            } else {
+                // Not in the working set says nothing about there being a page
+                // ([`crate::fault`] counts these: one kernel call and one
+                // fault each, wherever a range is asked about in pages).
+                crate::fault::absent();
+                crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte)
+            };
+            if read {
                 there += 1;
             } else if all {
                 return (there, of);
