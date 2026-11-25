@@ -1133,7 +1133,7 @@ fn create() -> windows::core::Result<Host> {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
-fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6785,6 +6785,22 @@ impl Host {
 
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
+    /// The host device (`crate::cardmeter`).
+    pub(crate) fn device(&self) -> &ID3D12Device {
+        &self.device
+    }
+
+    /// The host queue (`crate::tiles`).
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
+    /// Ticks a second of the queue's timestamps; 0 if it has none.
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
+    }
+
     pub(crate) fn log_messages(&self) -> Option<String> {
         let Some(queue) = &self.messages else {
             return None;

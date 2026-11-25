@@ -17,20 +17,34 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+#[allow(dead_code)]
+mod drvwatch;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod spread;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 mod fault;
+// slop-opti-test's experiment: what main's rewrite left with no caller
+// (merge report). Kept whole, inert.
+#[allow(dead_code)]
 pub mod fence;
 #[cfg(windows)]
 mod flow;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -42,9 +56,20 @@ pub mod object;
 pub mod pipeline;
 mod present;
 #[cfg(windows)]
+#[allow(dead_code)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+// slop-opti-test's experiment: what main's rewrite left with no caller
+// (merge report). Kept whole, inert.
+#[allow(dead_code)]
+mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -55,6 +80,9 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
@@ -77,5 +105,6 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping,
+    writing as kernel_will_write,
 };

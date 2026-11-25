@@ -226,10 +226,13 @@ not every lane runs`, `a lane mask holding lanes elsewhere read as data`, `a
 descriptor's address or format read as data`, `a 16-bit image atomic`), so the
 title **clears the frame it presents and never draws into it**: `present.
 fallback.cleared` 302 times in `run-20261125-132005.log`, and the window shows
-its overlays over black. Refusing the package again (`VICTORY_FSPX` off by
-default, `run-20261125-135405.log`) restores the path the title took before:
-`the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
-loading screen.
+its overlays over black. Refusing the package (`VICTORY_FSPX=0`) restores the
+path the title took before — `the window a present closes ... written=true` and
+13.8 fps / 72.4 ms on the loading screen (`run-20261125-135405.log`) — but the
+title then presents a frame nothing fills, and the picture is **white**
+(`run-20261125-163149.log`). Reading it is the default since `ee44bca`:
+`VICTORY_FSPX=1` measured 3.0-3.2 fps / 315-332 ms against 1.9 fps / 522 ms,
+`run-20261125-165547.log`.
 
 *(re-measured, `victory translate` with `VICTORY_FSPX=1`, 25 Nov)* three of the
 package's refusals were instructions with no arm at all, and they are gone:

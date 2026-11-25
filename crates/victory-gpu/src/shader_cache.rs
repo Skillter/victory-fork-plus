@@ -134,6 +134,20 @@ fn rekey(key: [u8; 32], spec: Option<&std::ffi::OsStr>) -> [u8; 32] {
     }
 }
 
+/// The offline warm-up (`victory translate --warm`): `container` is
+/// translated into the cache unless it is there already. `Ok(true)`: it
+/// was translated now. Needs [`use_shader_cache`] and the same host facts
+/// the run will have (the fingerprint `build.rs` made at build time).
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+    };
+    cached(cache, build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
