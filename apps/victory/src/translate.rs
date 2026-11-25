@@ -150,6 +150,24 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// What the walk leaves for after it (see [`Survey`]).
+    survey: std::sync::Arc<Mutex<Survey>>,
+}
+
+/// What a mesh program is missing in the walk: the pixel program it is paired
+/// with. Its declared outputs may go over D3D12's cap (four bytes a component
+/// at the group's maxima), and only the pixel program says which of them
+/// nothing reads — a pairing the runtime knows when it makes the pipeline and
+/// the walk does not, so a mesh container the cap refuses is translated after
+/// every file has been walked, cut to the union of the interfaces of the pixel
+/// programs that may be paired with it (`emit::fit`).
+#[derive(Default)]
+struct Survey {
+    /// The input signature of every pixel program met, declared and read,
+    /// with its example line.
+    pixels: Vec<(String, Vec<emit::fit::Components>)>,
+    /// Mesh containers over the cap, with their example line.
+    meshes: Vec<(Vec<u8>, String)>,
 }
 
 /// `translate --warm <file>`: the containers whose hash the file names are
@@ -269,6 +287,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let survey = std::sync::Arc::new(Mutex::new(Survey::default()));
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -297,6 +316,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            survey: survey.clone(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -307,7 +327,8 @@ pub fn run(
             });
         }
     }
-    let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    fit_meshes(&mut t, &survey, &kept, &pairs, validate, dll.as_deref(), pipelines);
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -387,6 +408,114 @@ pub fn run(
     Ok(())
 }
 
+/// Translates the mesh containers the walk left behind, cut to what the pixel
+/// programs that may be paired with them read.
+///
+/// A mesh program the cap refuses is untranslatable as it is (see [`Survey`]);
+/// cut, it fits. One no cut fits, or whose cut still does not translate, is
+/// translated as the title has it, so its failure stays in the tally.
+fn fit_meshes(
+    t: &mut Tally,
+    survey: &std::sync::Arc<Mutex<Survey>>,
+    kept: &Kept,
+    pairs: &[(String, String)],
+    validate: bool,
+    dll: Option<&Path>,
+    pipelines: bool,
+) {
+    let (pixels, meshes) = {
+        let mut survey = lock(survey);
+        (std::mem::take(&mut survey.pixels), std::mem::take(&mut survey.meshes))
+    };
+    if meshes.is_empty() {
+        return;
+    }
+    let mut checks = Checks {
+        keep: (!pairs.is_empty()).then(|| kept.clone()),
+        validator: validate.then(|| Validator::load(dll).ok()).flatten(),
+        host: pipelines.then(|| Host::new(false).ok().map(|h| (h, host::stub_ps()))).flatten(),
+        survey: survey.clone(),
+    };
+    for (bytes, example) in meshes {
+        let label = || example.clone();
+        let cut = fit_mesh(&bytes, &example, &pixels);
+        let bytes = cut.unwrap_or(bytes);
+        let Ok(container) = Container::parse(&bytes) else {
+            continue;
+        };
+        let Some(dxil) = container.part(FourCC::DXIL) else {
+            continue;
+        };
+        match native_programs(dxil.data) {
+            Ok(programs) => translate_programs(&container, programs, &label, t, &mut checks),
+            Err(e) => t.fail(e.to_string(), label),
+        }
+    }
+}
+
+/// The interface family a record name names: the last hex group before
+/// `_Wrapped`, which every stage the console compiler built for one interface
+/// shares (`MS_VS_PedTransformSkin_Decals_70522ddb_Wrapped` and the pixel
+/// programs drawn with it all end in `_70522ddb_Wrapped`). The walk sees no
+/// pipelines, so this is the only pairing the archive names.
+fn family_of(label: &str) -> Option<&str> {
+    label.split_whitespace().find_map(|word| {
+        let name = word.strip_suffix("_Wrapped")?;
+        let (_, suffix) = name.rsplit_once('_')?;
+        (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit())).then_some(suffix)
+    })
+}
+
+/// A mesh container cut to what the pixel programs that may be paired with it
+/// read. `None` when no pixel program's inputs the mesh produces, or when no
+/// cut fits it.
+fn fit_mesh(
+    mesh: &[u8],
+    label: &str,
+    pixels: &[(String, Vec<emit::fit::Components>)],
+) -> Option<Vec<u8>> {
+    let outputs = emit::fit::output_interface(mesh);
+    if outputs.is_empty() {
+        return None;
+    }
+    // A pixel program may be the pair when the mesh declares every component
+    // of its inputs: D3D12 links a pixel input to a mesh output of the same
+    // semantic, and refuses the pipeline when one is missing. System values
+    // (position, front face) are the rasterizer's, not the mesh's.
+    let covers = |c: &emit::fit::Components| {
+        c.kind != 0
+            || outputs
+                .iter()
+                .any(|o| o.name == c.name && o.index == c.index && c.mask & !o.mask == 0)
+    };
+    let family = family_of(label);
+    let cut = |same_family: bool| -> Option<Vec<u8>> {
+        let mut union: Vec<emit::fit::Components> = Vec::new();
+        for c in pixels
+            .iter()
+            .filter(|(label, _)| {
+                !same_family || family.is_some_and(|family| family_of(label) == Some(family))
+            })
+            .map(|(_, interface)| interface)
+            .filter(|interface| interface.iter().all(covers))
+            .flatten()
+        {
+            match union.iter_mut().find(|u| u.name == c.name && u.index == c.index) {
+                Some(u) => {
+                    u.mask |= c.mask;
+                    u.read |= c.read;
+                }
+                None => union.push(c.clone()),
+            }
+        }
+        if union.is_empty() {
+            return None;
+        }
+        emit::fit::pair(mesh, &emit::fit::interface_container(&union)).map(|(mesh, _)| mesh)
+    };
+    cut(true).or_else(|| cut(false))
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -452,13 +581,6 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    if !lock(seen).insert(code) {
-        t.duplicates += 1;
-        if t.list {
-            t.lines.push(format!("{}  duplicate", example()));
-        }
-        return;
-    }
     // The same choice `victory_shader::emit::translate` makes: the `DXIL`
     // part's `XDAT` table, or the `FSPX` package of a console compute shader.
     let programs = match container.part(FourCC::DXIL) {
@@ -469,6 +591,29 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // What a later mesh program is cut to (`Survey`): every pixel program's
+    // interface, including the ones whose code is translated already — two
+    // containers that share code still declare signatures of their own.
+    if programs.iter().any(|p| p.stage == HwStage::Ps) {
+        let interface = emit::fit::interface_of(&container);
+        if !interface.is_empty() {
+            lock(&checks.survey).pixels.push((example(), interface));
+        }
+    }
+    if !lock(seen).insert(code) {
+        t.duplicates += 1;
+        if t.list {
+            t.lines.push(format!("{}  duplicate", example()));
+        }
+        return;
+    }
+    // A mesh program over D3D12's output cap cannot be translated as it is,
+    // and only the pixel programs it is paired with say which components
+    // nothing reads: leave it for after the walk (`fit_meshes`).
+    if programs.iter().any(|p| p.stage == HwStage::Ms) && emit::fit::over_cap_of(&container) {
+        lock(&checks.survey).meshes.push((bytes.into_owned(), example()));
+        return;
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
