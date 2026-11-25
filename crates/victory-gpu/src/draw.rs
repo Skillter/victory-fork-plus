@@ -842,6 +842,10 @@ impl Counts {
 /// 5 s, beside the frame's lines and in every build (`crate::queue::present`).
 pub(crate) fn commands_line(draws: u64, presented: u64) {
     tracing::info!("{}", Counts::take().text(draws, presented));
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(line) = crate::list::census::line(draws) {
+        tracing::info!("{line}");
+    }
 }
 
 /// A root SRV's dynamic slot in a list, and the host copy it shows.

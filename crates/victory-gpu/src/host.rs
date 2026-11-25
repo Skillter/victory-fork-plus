@@ -6053,18 +6053,28 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
+        // One ask for the resource's host side: the copy it holds is the key
+        // the states are kept by, and it names the texture the barrier moves
+        // (a second ask, for `host_resource`, answered the same question).
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        // SAFETY: the list holds `copy` until it is reset, so the texture
+        // outlives every barrier the list records through this.
+        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        let key = std::sync::Arc::as_ptr(&copy) as usize;
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+        let held = states.get(&key).map(|(_, last, _)| *last);
+        // `wanted` is a console state; `held` one the texture's flags allow.
+        match moving(held, wanted, |w| legal_state(texture, w)) {
+            Move::Settled => None,
+            Move::FirstUse(to) => {
+                states.insert(key, (to, to, copy));
                 None
             }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+            Move::Moved(from, to) => {
+                if let Some(held) = states.get_mut(&key) {
+                    held.1 = to;
+                }
+                Some((texture, from))
             }
         }
     }
@@ -8670,6 +8680,41 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// What a state request does to a texture in a list, by the state the list
+/// holds for it ([`HostList::transition`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Move {
+    /// The list's first use of the texture: its prelude brings the texture
+    /// there at submission, so nothing is recorded now.
+    FirstUse(u32),
+    /// The list holds that state: nothing moves.
+    Settled,
+    /// From the state held to the one wanted: the barrier the list records.
+    Moved(u32, u32),
+}
+
+/// [`Move`] for a request of `wanted` (a console state) when the list holds
+/// `held` (the last host state it moved the texture to), with `legal` giving
+/// the host state the texture's flags allow.
+///
+/// A request equal to the held state settles it without asking `legal`: the
+/// map only ever holds a state the flags allow, so a request equal to one
+/// asks for no bit they forbid, and the exact answer is "nothing moves"
+/// either way. That is the pre-test that matters: a draw asks for its
+/// targets, its depth buffer and every texture it reads on every draw, and
+/// they are already there (18.6 of 33 a draw; run 20261125-094023).
+fn moving(held: Option<u32>, wanted: u32, legal: impl Fn(u32) -> u32) -> Move {
+    let Some(last) = held else {
+        let to = legal(wanted);
+        return Move::FirstUse(to);
+    };
+    if last == wanted {
+        return Move::Settled;
+    }
+    let to = legal(wanted);
+    if to == last { Move::Settled } else { Move::Moved(last, to) }
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
@@ -9152,5 +9197,69 @@ mod copy_queue {
     fn a_copy_read_after_the_copy_queue_is_taken_from_common() {
         assert_eq!(copied_state(true), D3D12_RESOURCE_STATE_COMMON);
         assert_eq!(copied_state(false), D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+}
+
+#[cfg(test)]
+mod states {
+    use super::{Move, legal_for, moving};
+
+    const COMMON: u32 = 0;
+    const RENDER_TARGET: u32 = 0x4;
+    const DEPTH_WRITE: u32 = 0x10;
+    const PIXEL_SHADER_READ: u32 = 0x40;
+    /// A depth target's flags: render target and unordered access are not
+    /// allowed on it.
+    const DEPTH_FLAGS: u32 = 0x2;
+
+    /// A request the list already holds settles without the texture's flags
+    /// being read, and records nothing: most asks of a frame are one.
+    #[test]
+    fn a_state_the_list_holds_settles_without_reading_the_flags() {
+        let read = std::cell::Cell::new(0);
+        let decision = moving(Some(PIXEL_SHADER_READ), PIXEL_SHADER_READ, |w| {
+            read.set(read.get() + 1);
+            w
+        });
+        assert_eq!(decision, Move::Settled);
+        assert_eq!(read.get(), 0, "a settled request reads no flags");
+    }
+
+    /// A state that really changes moves: the barrier is recorded, from the
+    /// state held to the one wanted.
+    #[test]
+    fn a_state_that_changes_moves() {
+        assert_eq!(
+            moving(Some(PIXEL_SHADER_READ), RENDER_TARGET, |w| w),
+            Move::Moved(PIXEL_SHADER_READ, RENDER_TARGET)
+        );
+    }
+
+    /// The console lets the title ask for a state its resource's flags
+    /// forbid. A request the flags cut back to the state held moves nothing;
+    /// one they cut back to another state still moves.
+    #[test]
+    fn a_request_the_flags_cut_back_moves_only_what_it_changes() {
+        let depth = |w| legal_for(DEPTH_FLAGS, w);
+        assert_eq!(
+            moving(Some(DEPTH_WRITE), RENDER_TARGET | DEPTH_WRITE, depth),
+            Move::Settled,
+            "the flags drop the render target bit: the depth state stands"
+        );
+        assert_eq!(
+            moving(Some(DEPTH_WRITE), RENDER_TARGET, depth),
+            Move::Moved(DEPTH_WRITE, COMMON),
+            "a texture asked into a state its flags forbid moves to none"
+        );
+    }
+
+    /// The list's first use of a texture records nothing (its prelude moves
+    /// it at submission), and keeps the state the flags allow.
+    #[test]
+    fn a_first_use_records_nothing() {
+        assert_eq!(
+            moving(None, RENDER_TARGET | PIXEL_SHADER_READ, |w| legal_for(DEPTH_FLAGS, w)),
+            Move::FirstUse(PIXEL_SHADER_READ)
+        );
     }
 }
