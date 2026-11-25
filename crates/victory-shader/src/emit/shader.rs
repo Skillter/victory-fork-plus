@@ -468,6 +468,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // One interpolation mode per register: D3D interpolates a row one
+        // way (the reads of its elements can ask for two, see
+        // [`container::share_row_interp`]).
+        for elements in [&mut self.inputs, &mut self.outputs, &mut self.prims] {
+            container::share_row_interp(elements);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

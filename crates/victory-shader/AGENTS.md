@@ -88,5 +88,13 @@ all agree on; anything else stays unfolded.
   address adds `LDS_DYNAMIC_MARGIN` on top of the immediate offsets.
 - `HostShader` is the output boundary; `victory-gpu`'s shader cache encodes
   its fields. Coordinate any layout change.
+- A signature register declares one interpolation mode, because D3D
+  interpolates a row one way: `emit::container::share_row_interp` keeps the
+  mode of the element that owns the row (the lowest column a program reads,
+  else the lowest column) and moves an element that differs to a register of
+  its own, carrying its column — the console interpolated channel by channel
+  and D3D12 links stages by semantic, not register, so both modes survive.
+  An integer component type is always `constant`; with no register left (32
+  a stage) the row takes one mode.
 - `emit::host` compiles only with the `host` feature and creates real D3D12
   pipelines; keep it out of the library's default path.
