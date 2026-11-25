@@ -188,6 +188,13 @@ impl Meter {
                 // the loser re-reads the slot and finds the winner's.
                 None => {
                     if self.names[index].set(Name { text: name, kind }).is_ok() {
+                        // The run's clock starts with its first metric: a
+                        // window the end of the run reports is the span the
+                        // totals cover, and a clock first read inside
+                        // `totals` would date the run from that read. The
+                        // 2026-11-25 19:24 run lasted 903 s and its `STOP
+                        // meter` line said `window_ms=0`.
+                        let _ = self.clock();
                         return Some(index);
                     }
                     continue;
@@ -418,6 +425,23 @@ mod tests {
             .find(|metric| metric.name == "presented_n")
             .expect("presented_n");
         assert_eq!(presented.count, 3);
+    }
+
+    /// A run's totals name the run: the span they cover starts with the first
+    /// metric, not with the moment they are read. (Before this held, the
+    /// 2026-11-25 19:24 run - 903 s, 7,997 frames - printed `window_ms=0` and
+    /// 406,883 draws in it.)
+    #[test]
+    fn the_total_covers_the_time_since_the_first_metric() {
+        let meter = Meter::new();
+        meter.count("presented_n", 1);
+        std::thread::sleep(Duration::from_millis(15));
+        let totals = meter.totals();
+        assert!(
+            totals.window >= Duration::from_millis(15),
+            "the totals' window is the run, not the read: {:?}",
+            totals.window
+        );
     }
 
     #[test]

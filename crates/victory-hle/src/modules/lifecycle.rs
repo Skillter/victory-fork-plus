@@ -308,11 +308,18 @@ pub fn wait_for_previous() {
 /// message says nothing about the run as a whole. Emitted inside [`end`],
 /// before the process is terminated: a line written after the hard exit would
 /// never be written at all.
+///
+/// The figures are the ones the `STOP` block states
+/// ([`victory_gpu::report::stated_run`]), not a second reading of the same
+/// counters: the block walks the run's cache directories before it is written
+/// (1.7 s, 797 MB of pipelines and 2,047 MB of shaders on the 2026-11-25 19:24
+/// run), and a line read after that walk described a different run than the
+/// block under it - 904.7 s, 8,003 frames, 8.8 fps beside the block's 903 s,
+/// 7,997, 8.9. Only when nothing stated a run (no footer was rendered at all,
+/// which a run too early in start-up to have one is) are the counters read
+/// here.
 fn summary(how: &str) {
-    let secs = started().map_or(0.0, |start| start.elapsed().as_secs_f64());
-    // Read straight from the queue: this crate already depends on
-    // `victory-gpu`, and the counter is a relaxed load of a static.
-    let frames = victory_gpu::queue::presented();
+    let (secs, frames) = summary_figures();
     if frames > 0 && secs > 0.0 {
         let fps = frames as f64 / secs;
         tracing::info!(
@@ -320,6 +327,21 @@ fn summary(how: &str) {
         );
     } else {
         tracing::info!("run summary: {how}; the title ran {secs:.1} s");
+    }
+}
+
+/// How long the title ran and how many frames it presented, as [`summary`]
+/// states them: the figures of the `STOP` block already written, or - when no
+/// block has been rendered yet - the clock and the queue's count.
+fn summary_figures() -> (f64, u64) {
+    match victory_gpu::report::stated_run() {
+        Some((duration, frames)) => (duration.as_secs_f64(), frames),
+        // Read straight from the queue: this crate already depends on
+        // `victory-gpu`, and the counter is a relaxed load of a static.
+        None => (
+            started().map_or(0.0, |start| start.elapsed().as_secs_f64()),
+            victory_gpu::queue::presented(),
+        ),
     }
 }
 
@@ -422,6 +444,7 @@ mod tests {
     /// `victory run` writes, rendered from the counters this path still has.
     #[test]
     fn the_two_ends_of_a_suspend_write_one_stop_block() {
+        let _turn = RECORDS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         note_run_start();
         assert!(
             last_records("title suspended"),
@@ -439,6 +462,32 @@ mod tests {
         assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
         assert!(text.contains("\"title suspended\""), "{text}");
     }
+
+    /// The summary line under the block describes the same run as the block:
+    /// its figures are the ones the block stated, not the clock and the queue
+    /// read again after the block's cache walk. On the 2026-11-25 19:24 run
+    /// that walk took 1.7 s, and the summary said 904.7 s, 8,003 frames and
+    /// 8.8 fps beside the block's 903 s, 7,997 and 8.9.
+    #[test]
+    fn the_summary_quotes_the_block_under_it() {
+        // Renders a footer, as the end of a run does, and holds the block's
+        // figures against the summary's.
+        let _turn = RECORDS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        note_run_start();
+        let block =
+            victory_gpu::report::RunFooter::from_counters("title suspended", Duration::from_secs(2))
+                .render();
+        let (secs, frames) = summary_figures();
+        assert_eq!(secs, 2.0, "the block's duration, not the clock since start-up: {block}");
+        assert!(
+            block.contains(&format!("duration_s=2 frames={frames}")),
+            "the summary's frame count is the block's: {block}"
+        );
+    }
+
+    /// See [`the_summary_quotes_the_block_under_it`]: the two tests that render
+    /// a footer share the process's stated run, so they take turns.
+    static RECORDS_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn oversized_windows_shrink_to_the_screen() {
