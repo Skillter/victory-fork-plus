@@ -36,7 +36,7 @@ riskier widening retry; `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` let
 ## Mesh output counts
 
 - `SetMeshOutputCounts` is one call per program, before every output store:
-  `emit::lower::output_counts` follows the console's request
+  `emit::counts::output_counts` follows the console's request
   (`s_sendmsg GS_ALLOC_REQ`, `m0 = vertices | primitives << 12`) back to the
   two `v_readfirstlane_b32` values that pack it, and the call lands at the end
   of their block. A request it cannot follow (two of them, counts in different

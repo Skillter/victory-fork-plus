@@ -291,7 +291,7 @@ against an average of a dozen groups each: the title's own submission, which
 the console pays too. The frame line prints the groups the title asked for
 beside what a group is promised at most (`host.rs::MESH_GROUPS`,
 `pipeline::host::mesh_declared`): 128 output vertices and 128 primitives each,
-3 to 12 million a frame. "At most" is literal now: `emit::lower::output_counts`
+3 to 12 million a frame. "At most" is literal now: `emit::counts::output_counts`
 follows the console's allocation request (`s_sendmsg GS_ALLOC_REQ`,
 `m0 = vertices | primitives << 12`) back to the two `v_readfirstlane_b32`
 values that pack it, and a group is promised that pair, clamped to 128 and
