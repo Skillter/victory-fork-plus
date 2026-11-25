@@ -78,6 +78,9 @@
 - The swap chain is sized from the window's client rectangle, never the frame,
   and the frame is drawn into it by the present pass with a viewport that keeps
   its shape (letterbox): a Win32 flip chain's `DXGI_SCALING_STRETCH` cannot.
+  The pass's view of the frame names the frame's own format unless the frame is
+  typeless (`host::frame_view`): a `_UNORM` view of a typed `_UNORM_SRGB`
+  resource is one D3D12 refuses in silence.
 - The pipelines folder keeps the live library and one older generation.
   `library::prune` drops a `.tmp` that no save finished and any generation
   unread for 30 days, and never the file this run opened or mapped.

@@ -6128,7 +6128,8 @@ impl Host {
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
-/// family's.
+/// family's, in the format a flip chain takes (the four a `DXGI_SWAP_EFFECT_FLIP_*`
+/// swap chain offers: 8-bit RGBA and BGRA, 10-bit RGB and 16-bit float).
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -6137,6 +6138,68 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
     })
+}
+
+/// Whether `format` is its family's typeless one: the one format a view desc
+/// may not name, and the one any typed format of the family may view.
+fn typeless(format: DXGI_FORMAT) -> bool {
+    let own = format.0 as u32;
+    crate::resource::family(own) == own && crate::resource::family(own + 1) == own
+}
+
+/// Whether a `Texture2D` sampled as `float4` can name a view of `format`: an
+/// integer one samples as `uint4` or `int4`, which the pass's shader cannot
+/// read.
+fn samples_float(format: DXGI_FORMAT) -> bool {
+    const INTEGER: [DXGI_FORMAT; 5] = [
+        DXGI_FORMAT_R8G8B8A8_UINT,
+        DXGI_FORMAT_R8G8B8A8_SINT,
+        DXGI_FORMAT_R16G16B16A16_UINT,
+        DXGI_FORMAT_R16G16B16A16_SINT,
+        DXGI_FORMAT_R10G10B10A2_UINT,
+    ];
+    !INTEGER.contains(&format)
+}
+
+/// The format the present pass's view of a frame names, for a frame of
+/// `format` presented into a swap chain of `swap`.
+///
+/// A view desc names a typed format its resource allows: a typeless frame takes
+/// any typed format of its family, so the swap chain's, and a typed frame takes
+/// its own, exactly. D3D12 makes a `_UNORM` view of a typed `_UNORM_SRGB`
+/// resource illegal (only a driver's fully typed casting would allow it), and
+/// `CreateShaderResourceView` returns nothing, so naming the swap chain's there
+/// is a silent black window.
+///
+/// `None` for a frame the pass cannot read at all — an integer one — which
+/// keeps the copy path in place.
+fn frame_view(format: DXGI_FORMAT, swap: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    if !samples_float(format) {
+        return None;
+    }
+    Some(if typeless(format) { swap } else { format })
+}
+
+/// Says once, each way, what the present pass reads a frame with: a view D3D12
+/// refuses is silent, so the two formats behind a black window are in the log
+/// and nowhere else.
+fn note_frame_view(format: DXGI_FORMAT, swap: DXGI_FORMAT, view: Option<DXGI_FORMAT>) {
+    static OWN: OnceLock<()> = OnceLock::new();
+    static NONE: OnceLock<()> = OnceLock::new();
+    match view {
+        Some(view) if view != swap && OWN.set(()).is_ok() => tracing::info!(
+            frame_format = format.0,
+            swap_format = swap.0,
+            view_format = view.0,
+            "the frame is read with its own format: the swap chain's is not one D3D12 allows for its resource"
+        ),
+        None if NONE.set(()).is_ok() => tracing::warn!(
+            frame_format = format.0,
+            swap_format = swap.0,
+            "the frame's format is not one the present pass reads as float: DXGI stretches it instead"
+        ),
+        _ => {}
+    }
 }
 
 /// The largest rectangle of `client` with the shape of `frame`: the frame
@@ -6362,10 +6425,12 @@ fn present_states() -> (D3D12_BLEND_DESC, D3D12_RASTERIZER_DESC) {
 struct PresentDraw<'a> {
     /// The frame, in a state pixel shaders may read.
     frame: &'a ID3D12Resource,
-    /// The back buffer, in the render target state, of `format` and of the size
-    /// the client area names.
+    /// The back buffer, in the render target state, of the pipeline's format
+    /// and of the size the client area names.
     back: &'a ID3D12Resource,
-    format: DXGI_FORMAT,
+    /// What the view of `frame` names: the frame's own format, or the swap
+    /// chain's for a typeless frame ([`frame_view`]).
+    view: DXGI_FORMAT,
     /// The rectangle of `back` the frame goes in ([`fit`]).
     rect: Fit,
 }
@@ -6384,13 +6449,13 @@ fn record_present_pass(
     let PresentDraw {
         frame,
         back,
-        format,
+        view,
         rect,
     } = draw;
     let (root, pipeline) = pipeline;
     let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PRESENT_VIEWS;
-    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: format,
+    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: view,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -6411,7 +6476,7 @@ fn record_present_pass(
     // SAFETY: an open list; a slot of our heap; live resources and objects (the
     // pass's own live as long as the process).
     unsafe {
-        host.device.CreateShaderResourceView(frame, Some(&view), cpu);
+        host.device.CreateShaderResourceView(frame, Some(&srv), cpu);
         list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         // The bars: nothing is drawn outside the rectangle, so they are cleared.
         list.ClearRenderTargetView(target, &[0.0, 0.0, 0.0, 1.0], None);
@@ -6839,10 +6904,17 @@ impl Host {
         // when the frame and the client area are one size; and, without the pass
         // or for a frame whose texture refuses shader reads, DXGI's plain stretch
         // of the frame's own size.
-        let drawn = p
-            .pass
-            .filter(|_| readable(&desc))
-            .and_then(|pass| pass.pipeline(format).map(|pipeline| (pass, pipeline)));
+        //
+        // The view names a format the frame's own resource allows
+        // ([`frame_view`]): the swap chain's only for a typeless frame, the
+        // frame's own otherwise. `None` is a frame the pass cannot read, which
+        // leaves the copy path below in place rather than draw with a view
+        // D3D12 would refuse silently.
+        let view = frame_view(desc.Format, format);
+        note_frame_view(desc.Format, format, view);
+        let drawn = p.pass.filter(|_| readable(&desc)).zip(view).and_then(
+            |(pass, view)| pass.pipeline(format).map(|pipeline| (pass, pipeline, view)),
+        );
         let (chain, show) = match drawn {
             Some(_) if client != size => (client, Show::Drawn(fit(size, client)?)),
             _ => (size, Show::Copy),
@@ -6934,7 +7006,7 @@ impl Host {
             move_to(list, texture, state, source);
             list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)]);
             match (show, drawn) {
-                (Show::Drawn(rect), Some((pass, pipeline))) => record_present_pass(
+                (Show::Drawn(rect), Some((pass, pipeline, view))) => record_present_pass(
                     self,
                     list,
                     pass,
@@ -6942,7 +7014,7 @@ impl Host {
                     PresentDraw {
                         frame: texture,
                         back: &back,
-                        format,
+                        view,
                         rect,
                     },
                 ),
@@ -7109,6 +7181,85 @@ fn move_to(
 #[cfg(test)]
 mod present_tests {
     use super::{Fit, fit};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    };
+
+    /// A view of the frame names a format the frame's own resource allows. The
+    /// swap chain's is one only for a typeless frame; a typed frame is read with
+    /// its own format, because D3D12 refuses a `_UNORM` view of a typed
+    /// `_UNORM_SRGB` resource, and `CreateShaderResourceView` returns nothing to
+    /// say so.
+    #[test]
+    fn an_srgb_frame_is_read_with_its_own_format() {
+        // The sRGB frame the audit's black window came from: it presents into
+        // the family's linear swap chain format...
+        assert_eq!(
+            super::swap_format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        // ...and its view must name the resource's own format, not that one.
+        assert_eq!(
+            super::frame_view(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+        );
+        // The plain frame: the two agree, so nothing about today's run changes.
+        assert_eq!(
+            super::frame_view(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        // A typeless frame: the swap chain's format views it, and a view may not
+        // name the typeless format itself.
+        assert_eq!(
+            super::frame_view(DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_ne!(
+            super::frame_view(DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_TYPELESS)
+        );
+    }
+
+    /// Every frame the pass can present is read with a format its resource
+    /// allows: its own when typed, the swap chain's when typeless, never a
+    /// typeless one; an integer frame is left to the copy path.
+    #[test]
+    fn a_view_of_the_frame_names_a_format_the_frame_allows() {
+        let integer = [12, 14, 25, 30, 32];
+        let frames = [
+            9, 10, 11, 12, 13, 14, 23, 24, 25, 27, 28, 29, 30, 31, 32, 87, 90, 91,
+        ];
+        for format in frames {
+            let frame = DXGI_FORMAT(format);
+            let Some(swap) = super::swap_format(frame) else {
+                panic!("frame {format} has no swap chain format");
+            };
+            match super::frame_view(frame, swap) {
+                Some(view) => {
+                    assert!(
+                        !super::typeless(view),
+                        "frame {format}: a view may not name the typeless format {view:?}"
+                    );
+                    assert!(
+                        !integer.contains(&format),
+                        "frame {format} is integer-typed: it cannot be read as float"
+                    );
+                    let allowed = if super::typeless(frame) { swap } else { frame };
+                    assert_eq!(view, allowed, "frame {format}");
+                }
+                None => assert!(
+                    integer.contains(&format),
+                    "frame {format} is refused but is not integer-typed"
+                ),
+            }
+        }
+        // The family of the other swap chain format, for shape.
+        assert_eq!(
+            super::frame_view(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+    }
 
     /// The pass must write every colour channel: a `Default` blend description
     /// writes none, which turns the window black with no error to read.
