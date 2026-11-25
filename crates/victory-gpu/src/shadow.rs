@@ -4342,3 +4342,169 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// What one refresh of a host copy costs, and of what: synthetic numbers of
+/// the world's shape, no title, no device. Run by hand:
+/// `cargo test -p victory-gpu --lib what_a_refresh_costs -- --ignored --nocapture`.
+#[cfg(all(test, windows))]
+mod refresh_bench {
+    use super::{ID3D12Resource, PAGE, Shadow};
+    use std::time::Instant;
+
+    /// The region the copies are over: the world's big heap, 192 MB.
+    const REGION: usize = 192 << 20;
+    /// The refreshes one submission asks for.
+    const CALLS: usize = 4_000;
+
+    /// Title memory to read from and watch: committed, write-watched, so
+    /// that `crate::watch::writes` answers for it as it does in a run.
+    fn watched(len: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh allocation, freed by the caller.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0, "write-watched memory");
+        // The address may have held another test's memory.
+        crate::watch::title_memory_remapped(p, len);
+        p
+    }
+
+    /// The ranges a submission refreshes: small ones mostly, a few wide, as
+    /// the world's lists name them.
+    fn ranges(region: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(CALLS);
+        let mut at = 0usize;
+        let mut n = 0usize;
+        while out.len() < CALLS {
+            let len = [256, 1024, 4096, 16 << 10, 64 << 10, 256 << 10][n % 6];
+            out.push((region + at, region + at + len));
+            at = (at + len * 3) % (REGION - (256 << 10));
+            n += 1;
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "benchmark: run by hand"]
+    fn what_a_refresh_costs() {
+        let region = watched(REGION);
+        // Every page of it written, as the world's CPU threads leave its
+        // heap, so that the asking names them and the refresh copies them.
+        for p in 0..REGION / PAGE {
+            // SAFETY: our own committed region, one byte a page.
+            unsafe { (region as *mut u8).add(p * PAGE).write_volatile(0x5a) };
+        }
+        // Six copies over the region, as the world has over its heap.
+        let mut data: Vec<Vec<u8>> = (0..6).map(|_| vec![0u8; REGION]).collect();
+        let shadows: Vec<std::mem::ManuallyDrop<Shadow>> = data
+            .iter_mut()
+            .map(|d| {
+                use windows::core::Interface;
+                // SAFETY: never dropped: no object stands behind the buffer.
+                let buffer =
+                    unsafe { ID3D12Resource::from_raw(std::ptr::NonNull::dangling().as_ptr()) };
+                std::mem::ManuallyDrop::new(Shadow::new(
+                    buffer,
+                    d.as_mut_ptr(),
+                    0,
+                    region as u64,
+                    REGION as u64,
+                ))
+            })
+            .collect();
+        let ranges = ranges(region);
+        // The submission's one asking covers them all (the default).
+        crate::watch::ask_once(&ranges);
+
+        // (1) The journal's answer for one refresh's range.
+        let started = Instant::now();
+        let mut pages = 0usize;
+        for &(a, b) in &ranges {
+            pages += crate::watch::writes(a, b, true).map_or(0, |(_, w)| w.len());
+        }
+        let answer = started.elapsed();
+
+        // (2) The ranges the world's shaders may write: 2,618 pieces of the
+        // heap (its 192 MB in 64 KiB pages), declared as `writing` does.
+        let declared: Vec<(usize, usize)> = (0..REGION / PAGE)
+            .map(|p| (region + p * PAGE, region + (p + 1) * PAGE))
+            .collect();
+        for s in &shadows {
+            let mut pending = s.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for &(a, b) in &declared {
+                pending.add(a, b);
+            }
+        }
+
+        // (3) `Pending::over` with them, warm and after a free (which makes
+        // the union stale: the next `over` rebuilds it over every range).
+        let started = Instant::now();
+        let mut held = 0usize;
+        for &(a, b) in &ranges {
+            held += shadows[0].pending.lock().unwrap_or_else(|e| e.into_inner()).over(a, b).len();
+        }
+        let warm = started.elapsed();
+        let started = Instant::now();
+        for &(a, b) in &ranges {
+            shadows[0].pending.lock().unwrap_or_else(|e| e.into_inner()).free(a, b);
+            held += shadows[0].pending.lock().unwrap_or_else(|e| e.into_inner()).over(a, b).len();
+        }
+        let stale = started.elapsed();
+
+        // (4) Whole refreshes against the journal and the declarations,
+        // with the pages written again: the first askings spent the watch.
+        // The declared pieces are let go first: a refresh of a range a
+        // shader declared copies nothing (`Pending::over`).
+        for s in &shadows {
+            let mut pending = s.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for &(a, b) in &declared {
+                pending.free(a, b);
+            }
+        }
+        for p in 0..REGION / PAGE {
+            // SAFETY: our own committed region, one byte a page.
+            unsafe { (region as *mut u8).add(p * PAGE).write_volatile(0xa5) };
+        }
+        let started = Instant::now();
+        let mut bytes = 0usize;
+        for (n, &(a, b)) in ranges.iter().enumerate() {
+            bytes += shadows[n % 6].update(a, b - a);
+        }
+        let update = started.elapsed();
+
+        // (5) The same with the copies' bytes held as ours (the state a
+        // copy is in after `copy_back_with` put them into title memory).
+        for s in &shadows {
+            s.backed.lock().unwrap_or_else(|e| e.into_inner()).add(region, region + REGION);
+        }
+        let started = Instant::now();
+        let mut kept = 0usize;
+        for (n, &(a, b)) in ranges.iter().enumerate() {
+            kept += shadows[n % 6].update(a, b - a);
+        }
+        let backed = started.elapsed();
+
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / CALLS as f64;
+        println!(
+            "{CALLS} refreshes over {} MB in 6 copies, {pages} pages answered: journal {:.2} us a call; \
+             Pending::over {:.2} us warm, {:.2} us after a free ({held} ranges held); \
+             Shadow::update {:.2} us a call ({bytes} B copied); with the bytes held as ours \
+             {:.2} us a call ({kept} B copied)",
+            REGION >> 20,
+            us(answer),
+            us(warm),
+            us(stale),
+            us(update),
+            us(backed),
+        );
+    }
+}

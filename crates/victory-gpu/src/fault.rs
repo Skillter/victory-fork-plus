@@ -387,7 +387,7 @@ pub(crate) fn line(window: Duration, back: [u64; 2]) {
          source {:.0}%, destination {:.0}% (of {:.1} MB copied in copies of {} KB and more, {:.0}% \
          of the source bytes were not in memory: {:.1} MB, {:.1} MB/s at best from the pagefile); \
          the committed question asked about {:.0} pages, {:.0} of them the kernel called not \
-         committed, in {:.0} calls of VirtualQuery ({:.0} pages answered from the runs it already \
+         committed, in {:.0} calls of VirtualQuery ({:.1} MB answered from the runs it already \
          held)",
         rate(w.bytes, w.us),
         mb(w.bytes),
@@ -416,7 +416,7 @@ pub(crate) fn line(window: Duration, back: [u64; 2]) {
         w.asked as f64,
         w.outside as f64,
         w.outside_calls as f64,
-        w.outside_known as f64,
+        mb(w.outside_known),
     );
 }
 
