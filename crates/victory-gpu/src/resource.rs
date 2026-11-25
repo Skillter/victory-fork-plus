@@ -237,6 +237,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The console formats the host is asked to render to or write as unordered
+/// access, and the host format that stands in for each when it refuses: the
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115) as 8-bit RGBA,
+/// and R9G9B9E5_SHAREDEXP (67) as half float, because the host's own
+/// formats cannot hold those uses ([`target_format`]).
+const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
+
+/// Where console `format` sits in [`STAND_INS`] and the host format that
+/// stands in for it (`DXGI_FORMAT`), if it has one.
+fn stand_in(format: u32) -> Option<(usize, u32)> {
+    STAND_INS
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, (f, _))| f == format)
+        .map(|(i, (_, host))| (i, host))
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -249,16 +267,17 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// reports neither RENDER_TARGET nor TYPED_UNORDERED_ACCESS_VIEW for it, and
 /// `CreateCommittedResource` refuses either flag (0x80070057) while a render
 /// target *view* of that format is one the device removes itself for. Half
-/// float stands in, which holds every value the shared exponent does and
-/// more.
+/// float stands in (`DXGI_FORMAT_R16G16B16A16_FLOAT`, 10 — not 11, which is
+/// the UNORM of the same shape and clamps every value past 1.0 that the
+/// exposure chain carries), which holds every value the shared exponent does
+/// and more.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 11)];
-    let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
+    let Some((i, stand_in)) = stand_in(format) else {
         return format;
     };
     #[cfg(windows)]
@@ -286,13 +305,17 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(
+                        format = f,
+                        stand_in = STAND_INS[i].1,
+                        "the host does not render to this format: the stand-in is used"
+                    );
                 }
                 refused
             })
         });
         if refused[i] {
-            return STAND_INS[i].1;
+            return stand_in;
         }
     }
     format
@@ -2940,6 +2963,33 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// The console's shared exponent target (67) stands in as half float, not
+    /// as the UNORM of the same shape: the exposure chain's values past 1.0
+    /// are what the UNORM format clamps. Half float is also a render target
+    /// and a typed unordered access format on every host, so the stand-in
+    /// needs no capability check of its own.
+    #[test]
+    fn the_shared_exponent_target_stands_in_as_half_float() {
+        const HALF_FLOAT: u32 = 10;
+        const UNORM: u32 = 11;
+        assert_eq!(stand_in(67), Some((2, HALF_FLOAT)));
+        assert_ne!(stand_in(67), Some((2, UNORM)), "UNORM clamps every HDR value to 1.0");
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
+            };
+            assert_eq!(HALF_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT.0 as u32);
+            assert_eq!(UNORM, DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32);
+        }
+        // The 16-bit colour formats stand in as 8-bit RGBA; a format the host
+        // renders to as it is has no stand-in.
+        assert_eq!(stand_in(86), Some((0, 28)));
+        assert_eq!(stand_in(115), Some((1, 28)));
+        assert_eq!(stand_in(10), None);
+        assert_eq!(stand_in(28), None);
     }
 
     #[test]

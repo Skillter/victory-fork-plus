@@ -68,6 +68,12 @@ pub(crate) struct Target {
     pub(crate) sample_count: u32,
     /// `D3D12_RESOURCE_DIMENSION`.
     dimension: u32,
+    /// `D3D12_RESOURCE_DESC::MipLevels` and `DepthOrArraySize`: the pass copies
+    /// a whole resource into the swap chain's buffer, which has one mip and one
+    /// slice, so a texture with more cannot stand in for the frame
+    /// (`CopyResource` of it is refused and shows nothing at all).
+    pub(crate) mip_levels: u16,
+    pub(crate) depth_or_array_size: u16,
     /// A shader read it since the last present as well.
     sampled: bool,
 }
@@ -256,6 +262,8 @@ fn target(at: usize, sampled: bool) -> Option<Target> {
         flags: d.Flags.0 as u32,
         sample_count: d.SampleDesc.Count,
         dimension: d.Dimension.0 as u32,
+        mip_levels: d.MipLevels,
+        depth_or_array_size: d.DepthOrArraySize,
         sampled,
     })
 }
@@ -281,6 +289,10 @@ pub(crate) fn pick(
             t.width > 0
                 && t.height > 0
                 && t.dimension == TEXTURE_2D
+                // The pass copies the whole resource into the swap chain's
+                // buffer: one mip, one slice.
+                && t.mip_levels == 1
+                && t.depth_or_array_size == 1
                 && presentable(t)
                 && (f64::from(t.width) / f64::from(t.height) - shape).abs()
                     <= shape * ASPECT_TOLERANCE
@@ -349,6 +361,8 @@ mod tests {
             flags: 0,
             sample_count: 1,
             dimension: super::TEXTURE_2D,
+            mip_levels: 1,
+            depth_or_array_size: 1,
             sampled,
         }
     }
@@ -550,6 +564,31 @@ mod tests {
         assert_eq!(
             pick((1920, 1080), &since(false, vec![depth]), |_| true),
             Err(Why::Nothing)
+        );
+    }
+
+    /// A target of more than one mip, or of more than one slice, is no frame:
+    /// the pass copies the whole resource into the swap chain's buffer, which
+    /// is one mip and one slice, and the host refuses that copy — the window
+    /// then shows nothing at all rather than the frame it had.
+    #[test]
+    fn a_target_with_mips_or_slices_is_no_frame() {
+        let mut mips = target(0x10, 1280, 720, false);
+        mips.mip_levels = 4;
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![mips]), |_| true),
+            Err(Why::Nothing)
+        );
+        let mut array = target(0x20, 1280, 720, false);
+        array.depth_or_array_size = 6;
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![array]), |_| true),
+            Err(Why::Nothing)
+        );
+        // One mip and one slice is the back buffer's own shape: picked.
+        assert_eq!(
+            pick((1920, 1080), &since(false, vec![target(0x30, 1280, 720, false)]), |_| true),
+            Ok(0)
         );
     }
 }

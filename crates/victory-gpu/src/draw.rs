@@ -104,6 +104,19 @@ impl RootArgs {
         }
     }
 
+    /// The arguments of one space are undefined there (a root signature of
+    /// that space was set): the next draw that asks for one sets it again.
+    /// The space's entries stay where they are, so a parameter the next draw
+    /// sets again needs no allocation (zero is no live signature, as
+    /// [`State::host_roots`] holds it for a list that has none).
+    fn forget(&mut self, compute: bool) {
+        for (space, _, arg) in &mut self.set {
+            if *space == compute {
+                arg.signature = 0;
+            }
+        }
+    }
+
     /// A host list with nothing set (a cut, [`State::replay`]).
     fn clear(&mut self) {
         self.set.clear();
@@ -144,6 +157,18 @@ impl RootValues {
                 self.set
                     .insert(k, (compute, param, signature, values.to_vec()));
                 true
+            }
+        }
+    }
+
+    /// The constants of one space are undefined there (a root signature of
+    /// that space was set): the next draw that asks for them sets them again,
+    /// into the buffer it already holds (zero is no live signature, as
+    /// [`State::host_roots`] holds it for a list that has none).
+    fn forget(&mut self, compute: bool) {
+        for (space, _, set, _) in &mut self.set {
+            if *space == compute {
+                *set = 0;
             }
         }
     }
@@ -1698,9 +1723,10 @@ impl State {
             }
             emitted(Command::Signature, 1);
             self.host_roots[usize::from(compute)] = root;
-            // A root signature switch leaves the root arguments undefined:
-            // every one this draw sets is set again.
-            self.forget_roots();
+            // A root signature of this space leaves its own root arguments
+            // undefined: every one this draw sets is set again. The other
+            // space's stand.
+            self.forget_space(compute);
         } else {
             spared(Command::Signature);
         }
@@ -1962,12 +1988,25 @@ impl State {
         );
     }
 
-    /// A root signature or a new host list: every root argument and every
-    /// set of 32-bit constants is undefined there, so the next draw sets
-    /// all of them again.
+    /// A new host list: every root argument and every set of 32-bit
+    /// constants is undefined there, so the next draw sets all of them
+    /// again. A root signature of one space is [`State::forget_space`].
     fn forget_roots(&mut self) {
         self.root_args.clear();
         self.root_values.clear();
+    }
+
+    /// A root signature of one space (graphics or compute) replaced the
+    /// list's: that space's root arguments and 32-bit constants are
+    /// undefined, and the next draw or dispatch sets its own again. The
+    /// other space keeps its own: D3D12 keeps the graphics root arguments
+    /// across a `SetComputeRootSignature` (and the compute ones across a
+    /// graphics signature), so a title clamp's compute signature must not
+    /// make every draw after it set every graphics constant and view again
+    /// (~2.4 root-constant calls a draw).
+    fn forget_space(&mut self, compute: bool) {
+        self.root_args.forget(compute);
+        self.root_values.forget(compute);
     }
 
     /// The clamp `crate::indirect` recorded for an indirect run of `records`
@@ -1976,18 +2015,20 @@ impl State {
     /// `SetPipelineState` (which a dispatch reads) and a root signature of
     /// its own, so `bind` sets both again. `held` is what it left (its own
     /// pipeline and signature, or the ones the list already held when it
-    /// spared them), and a root signature it changed makes every compute
-    /// root argument undefined. A clamp of no record records no command at
-    /// all, and a record whose window another run already clamped
-    /// (`Window`) records no clamp, so in both cases the list keeps what it
-    /// has and `bind` spares the pipeline it would otherwise set again.
+    /// spared them), and a root signature it changed makes the compute root
+    /// arguments undefined — the graphics ones are the list's still, and
+    /// every draw after a clamp reads them without setting them again. A
+    /// clamp of no record records no command at all, and a record whose
+    /// window another run already clamped (`Window`) records no clamp, so in
+    /// both cases the list keeps what it has and `bind` spares the pipeline
+    /// it would otherwise set again.
     fn hold_clamp(&mut self, records: u32, held: &crate::indirect::Held) {
         if records == 0 {
             return;
         }
         if self.host_roots[1] != held.root {
             self.host_roots[1] = held.root;
-            self.forget_roots();
+            self.forget_space(true);
         }
         self.host_pipeline = held.pipeline;
     }
@@ -3227,10 +3268,9 @@ impl State {
             // the answer too ([`Memo`], [`crate::shadow::revision`]).
             let words = Fingerprint::of(table, n);
             let identity = (table, n);
-            // Read once for the entry and for the one it becomes: the slots
-            // hold the host copies these records' descriptors find now.
-            let now = crate::shadow::revision();
-            let seen = self.fresh_table(identity, words, now);
+            // Read for the entry this may replace: its slots hold the host
+            // copies these records' descriptors found when it was made.
+            let seen = self.fresh_table(identity, words, crate::shadow::revision());
             if let Some(seen) = seen
             {
                 for &i in &entries {
@@ -3266,8 +3306,12 @@ impl State {
             // Records other than those these slots were made for: the
             // identity of this table's contents is a new generation, taken
             // from the one it replaced. The run is the list's ring, given
-            // back whole by `State::tables_done`.
-            self.fresh_made(identity, words, first, now);
+            // back whole by `State::tables_done`. Recorded after the slots
+            // are made below: the makes find host copies and may make some,
+            // which bumps the registry's revision, and the entry says which
+            // revision its slots name — tagged with the number read before
+            // them it would be stale at once and every later draw would make
+            // the table again.
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3318,6 +3362,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_made(identity, words, first, crate::shadow::revision());
             made.push((slot, first * 32));
         }
         self.scratch_slots = fresh;
@@ -3648,7 +3693,11 @@ impl State {
         // arguments at their own offset, and nothing of ours recorded. A
         // malformed record then reaches the card unchecked, so this arm is for
         // measuring what a clamp costs, not for playing.
-        let (bounded, at, clamped) = if !crate::indirect::clamp_on() {
+        // The third: whether a clamp of this run moved a scratch buffer to
+        // `INDIRECT_ARGUMENT`, which is the only case `done` has to undo. A
+        // record a window holds is read from a buffer `done` left in `COMMON`
+        // (`Window`), and the title's own buffer is in `COMMON` throughout.
+        let (bounded, at, moved) = if !crate::indirect::clamp_on() {
             args.refresh(list, arguments, len);
             if let Some((s, at)) = &counter {
                 s.refresh(list, *at, 4);
@@ -3697,10 +3746,14 @@ impl State {
             if hit.is_none() && windowed && self.window.is_some() {
                 windowed_note(Windowed::Bounds);
             }
-            let (bounded, at) = match hit {
+            let (bounded, at, moved) = match hit {
                 Some(hit) => {
                     windowed_note(Windowed::Hit);
-                    hit
+                    // Nothing was clamped and nothing moved: the record is one
+                    // an earlier clamp wrote, and `done` below returned the
+                    // scratch buffer to `COMMON` then, so this run reads it
+                    // from there.
+                    (hit.0, hit.1, false)
                 }
                 None => {
                     // A record a short step after the last window's last one
@@ -3770,10 +3823,13 @@ impl State {
                         records,
                         scratch: bounded.clone(),
                     });
-                    (bounded, 0)
+                    // The clamp transitions the scratch buffer
+                    // `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`
+                    // (`crate::indirect`), whether or not it clamped a record.
+                    (bounded, 0, true)
                 }
             };
-            (bounded, at, true)
+            (bounded, at, moved)
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
@@ -3782,7 +3838,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if clamped {
+            if moved {
                 crate::indirect::done(list, &bounded);
             }
             why(DropReason::Unbindable, "prepare failed");
@@ -3810,7 +3866,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        if clamped {
+        if moved {
             crate::indirect::done(list, &bounded);
         }
         emitted(Command::Execute, 1);
@@ -4806,6 +4862,112 @@ mod tests {
         state.hold_clamp(16, &crate::indirect::Held { pipeline: 0x9130, root: 0x9131 });
         assert_eq!(state.host_roots, [0x51, 0x9131]);
         assert!(state.root_values.again(0x52, true, 0, &[1, 2, 3, 4]));
+    }
+
+    /// A root signature of one space leaves the other space's root arguments
+    /// and 32-bit constants standing: D3D12 keeps the graphics ones across a
+    /// `SetComputeRootSignature` and the compute ones across a graphics
+    /// signature, so a clamp (which sets a compute signature of its own) must
+    /// not make every draw after it set every graphics constant and view
+    /// again — the calls `State::set_root_arg` and `State::root_constants`
+    /// leave out are the ones the list already holds.
+    #[test]
+    fn a_signature_of_one_space_undefines_only_that_spaces_arguments() {
+        let mut state = State::default();
+        // A draw: graphics signature 0x51, one root CBV and its user data.
+        assert!(state.root_args.again(0x51, false, 0, RootKind::Cbv, 0x1000));
+        assert!(state.root_values.again(0x51, false, 0, &[1, 2, 3, 4]));
+        // A dispatch: compute signature 0x62.
+        state.forget_space(true);
+        assert!(state.root_args.again(0x62, true, 0, RootKind::Cbv, 0x2000));
+        assert!(state.root_values.again(0x62, true, 0, &[5, 6]));
+        // The next draw binds the graphics signature the list holds and asks
+        // for the values it set: nothing of the graphics space was undefined,
+        // so it records none of them (with the whole-cache clear it recorded
+        // all five).
+        assert!(!state.root_args.again(0x51, false, 0, RootKind::Cbv, 0x1000), "the CBV stands");
+        assert!(!state.root_values.again(0x51, false, 0, &[1, 2, 3, 4]), "the constants stand");
+        // A draw binding another graphics signature sets both again, exactly
+        // as the whole-cache clear made it: a signature of its own space
+        // undefines every argument of that space.
+        state.forget_space(false);
+        assert!(state.root_args.again(0x52, false, 0, RootKind::Cbv, 0x1000));
+        assert!(state.root_values.again(0x52, false, 0, &[1, 2, 3, 4]));
+        // And the compute space kept its own through that.
+        assert!(!state.root_args.again(0x62, true, 0, RootKind::Cbv, 0x2000));
+        assert!(!state.root_values.again(0x62, true, 0, &[5, 6]));
+        // A new host list has none of them (`State::replay`, a cut).
+        state.forget_roots();
+        assert!(state.root_args.again(0x51, false, 0, RootKind::Cbv, 0x1000));
+        assert!(state.root_values.again(0x51, false, 0, &[1, 2, 3, 4]));
+    }
+
+    /// The commands a draw after a dispatch records: `State::set_root_arg` and
+    /// `State::root_constants` record one each, and nothing else of the root
+    /// state moves, so a call that answers "already set" is a command the list
+    /// does not get. The draw that follows a compute dispatch records none of
+    /// its own — the whole-cache clear made it record both — and a draw that
+    /// re-binds the signature the list holds records none either, which is
+    /// what a pipeline that binds records today: its draw, and no root
+    /// argument.
+    #[test]
+    fn a_draw_after_a_dispatch_records_no_root_argument_again() {
+        /// The root commands one draw (or dispatch) records: one per call
+        /// that answers that the list does not hold the value.
+        fn record(state: &mut State, signature: usize, compute: bool) -> u64 {
+            let mut calls = 0;
+            if compute {
+                // A dispatch: a root UAV and the user data it reads.
+                if state.root_args.again(signature, true, 0, RootKind::Uav, 0x2000) {
+                    calls += 1;
+                }
+                if state.root_values.again(signature, true, 0, &[5, 6]) {
+                    calls += 1;
+                }
+            } else {
+                // A draw: a root CBV and the user data it reads.
+                if state.root_args.again(signature, false, 0, RootKind::Cbv, 0x1000) {
+                    calls += 1;
+                }
+                if state.root_values.again(signature, false, 0, &[1, 2, 3, 4]) {
+                    calls += 1;
+                }
+            }
+            calls
+        }
+        let mut state = State::default();
+        assert_eq!(record(&mut state, 0x51, false), 2, "a draw's two");
+        // The dispatch sets a compute signature of its own.
+        state.forget_space(true);
+        assert_eq!(record(&mut state, 0x62, true), 2, "the dispatch's two");
+        // The graphics root arguments stand: the draw records no root command
+        // at all, where a whole-cache clear made it record both again.
+        assert_eq!(record(&mut state, 0x51, false), 0, "the draw's own stand");
+        // Bound again with the signature the list holds, as a pipeline that
+        // binds does: still none.
+        assert_eq!(record(&mut state, 0x51, false), 0);
+    }
+
+    /// A signature that undefines a space's constants does not give their
+    /// buffers back: the draw that sets them again fills the vec the list
+    /// held, so a root signature switch costs no allocation.
+    #[test]
+    fn a_signature_switch_reuses_the_constant_buffers() {
+        let mut state = State::default();
+        assert!(state.root_values.again(0x51, false, 0, &[1, 2, 3, 4]));
+        let held = state.root_values.set[0].3.as_ptr();
+        state.forget_space(false);
+        assert!(state.root_values.again(0x52, false, 0, &[5, 6]), "set again");
+        assert_eq!(state.root_values.set[0].3.as_ptr(), held, "the buffer it held");
+        // The graphics arguments were the ones undefined; the compute space
+        // keeps its own, and its entry is not touched.
+        assert!(state.root_values.again(0x62, true, 0, &[7, 8]));
+        let compute = state.root_values.set[1].3.as_ptr();
+        state.forget_space(false);
+        assert_eq!(state.root_values.set[1].3.as_ptr(), compute);
+        // A new host list forgets them whole: the slots are another list's.
+        state.forget_roots();
+        assert!(state.root_values.set.is_empty());
     }
 
     /// The draw-buffer views a list holds are compared field by field: the

@@ -84,11 +84,13 @@
   the ring's capacity.
 - Root arguments, a parameter's 32-bit constants and the draw buffers are
   cached per list (`draw::RootArgs`, `draw::RootValues`, `State::host_vertex`):
-  a call repeats only when the resolved value changes, a root-signature change
-  or a new list drops the root ones, and `draw::rectangles` marks the vertex
-  buffers unknown (it sets its own). A draw therefore emits its pipeline
-  switches, its live root arguments and one draw; what else it emits is a
-  redundancy `draw` counts (see Diagnostics).
+  a call repeats only when the resolved value changes, a new list drops them
+  all, a root signature drops the ones of its own space (graphics or compute:
+  D3D12 keeps the other's across it, so a clamp's compute signature must not
+  make the draws after it set every graphics constant again), and
+  `draw::rectangles` marks the vertex buffers unknown (it sets its own). A
+  draw therefore emits its pipeline switches, its live root arguments and one
+  draw; what else it emits is a redundancy `draw` counts (see Diagnostics).
 - The capped heap points past-the-end reads at a null slot for a reason: a
   real read past the heap end hung an NVIDIA GPU.
 - A buffer view of no elements is the console's for the rest of its buffer:
@@ -131,7 +133,9 @@
   the present shows the target the title did render into instead
   (`present::pick`), at that target's size, format and tracked state, so the
   same pass letterboxes it as a frame. Only the largest target of the frame's
-  shape (3 %) that the pass can read may stand for it, a target a shader also
+  shape (3 %) that the pass can read may stand for it, one mip and one slice
+  (the pass copies the resource whole into the swap chain's buffer, and a
+  `CopyResource` of a mip chain or an array is refused), a target a shader also
   read first, and nothing when two sizes are within 1 % of each other's area: a
   wrong image is worse than a black one. `present::note_target` is called by a
   draw where it runs (`draw::prepare_for`), by the copies and resolves, and by
