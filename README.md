@@ -253,7 +253,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_PRESENT_FALLBACK=1` | a present whose frame nothing rendered into since the last present (an upscale whose compute programs do not translate yet; a clear of it is not a frame) shows the target the title did write instead of a black window: the largest target of the frame's shape, in the same letterboxed pass, logged once. Off by default, because a substituted frame can lack the layers the title composites into the one it presents |
-| `VICTORY_FSPX=1` | read the programs inside a FidelityFX package (`ACCC`/`FSPX`, a container with no `DXIL` part). Off by default: read, the title takes its upscale chain, four of whose programs still refuse, and it stops writing the frame it presents — the world goes black behind its overlays |
+| `VICTORY_FSPX=0` | do not read the programs inside a FidelityFX package (`ACCC`/`FSPX`, a container with no `DXIL` part). On by default: the presented frame is the one that chain fills, so refusing it leaves the picture white; read, four of its programs still refuse but the frame is drawn (3.1 fps against 1.9 fps / 522 ms) |
 | `VICTORY_PIPELINE_DUMP=<path>` | write the pipeline calls the device does not implement to that file, whole; `E_NOTIMPL` is still returned |
 | `VICTORY_CALLSITE_PROBE=1` | with either unknown pipeline creation (slots `0x1c8`, `0x218`), dump the title's code at the return address and the argument's bytes either side of it, once per slot; still `E_NOTIMPL` |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
