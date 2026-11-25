@@ -93,6 +93,19 @@ pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgr
     }
 }
 
+/// `native()` with 512 bytes of LDS declared: one 512-byte unit in `COMPUTE_PGM_RSRC2`
+/// bits 15..23, the size the console programs that share LDS within one wave declare.
+fn native_lds(body: &[u32]) -> NativeProgram {
+    let mut native = native(body);
+    if let StageIo::Cs(cs) = native.io {
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: cs.rsrc2 | 1 << 15,
+            ..cs
+        });
+    }
+    native
+}
+
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
 pub(super) fn lowered(
     native: &NativeProgram,
@@ -127,6 +140,29 @@ pub(super) fn lowered(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
     })
+}
+
+/// The wave size the lowering keeps for `native`, without building a `HostShader`: `Some(64)`
+/// is the console's one wave, which a device of 32-lane waves cannot create a pipeline for;
+/// `Some(32)` is two host waves.
+fn kept_wave(native: &NativeProgram, p: &ir::Program) -> Option<u32> {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    lowered.expect("lower").wave_size
 }
 
 #[test]
@@ -453,4 +489,63 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// DS instruction words: dword 0 is the encoding (0x36), the opcode and OFFSET0/OFFSET1;
+/// dword 1 holds the address register, the data registers (bits 15..8 and 23..16) and the
+/// result register (bits 31..24).
+const DS_WRITE_B32_V1_V2: [u32; 2] = [0x36 << 26 | 0x00d << 18, 1 | 2 << 8];
+const DS_READ_B32_V4_V1: [u32; 2] = [0x36 << 26 | 0x036 << 18, 1 | 4 << 24];
+
+/// 64 threads in one console wave write one LDS dword and read it back inside one lane
+/// branch: the wave's shared scratchpad, without a barrier the console's compiler left out
+/// because the wave runs its lanes in step. The programs that stay refused share a dword
+/// this way — `GpuParticleUpdateCS_Visibility` (#369cbe906ea72764) adds to a counter of
+/// dword 0 and reads it back in the same region, `sr_tracingCS_Tiling_Generate_Opaque`
+/// (#2cc4c197ee29e291) writes a 1 to dword 0 and reads it, and the water pair
+/// (#5dc3b25986622949, #6f225b641c5b0708) min/maxes dword 0 and reads both dwords.
+///
+/// Two host waves have no ordering point inside one lane-branch region (a group barrier
+/// there would wait on lanes the branch excludes), so each half would write and read its
+/// own dword and the program would compute something else: it keeps the console's 64.
+#[test]
+fn a_dword_written_and_read_in_one_lane_branch_keeps_the_consoles_wave() {
+    let mut words = vec![
+        0x7E02_0280,     // v_mov_b32 v1, 0 (dword 0)
+        0x7E04_0281,     // v_mov_b32 v2, 1
+        0x7D88_0000,     // v_cmp_gt_u32 vcc, s0, v0 (threads below s0)
+        0xBE8C_246A,     // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 4, // s_cbranch_execz past both accesses
+    ];
+    words.extend_from_slice(&DS_WRITE_B32_V1_V2);
+    words.extend_from_slice(&DS_READ_B32_V4_V1);
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    let native = native_lds(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    assert!(names.contains(&"ds_write_b32"), "{names:?}");
+    assert!(names.contains(&"ds_read_b32"), "{names:?}");
+    assert_eq!(kept_wave(&native, &p), Some(64));
+}
+
+/// The same dword, written by every lane and read back with no lane branch around either
+/// access: the split's group barriers sit before each access, run by every thread, so both
+/// halves see the console's one wave order. Allowed — which is what the lane-branch test
+/// above is the boundary of.
+#[test]
+fn a_dword_written_and_read_by_every_lane_splits() {
+    let mut words = vec![
+        0x7E02_0280, // v_mov_b32 v1, 0 (dword 0)
+        0x7E04_0283, // v_mov_b32 v2, 3
+    ];
+    words.extend_from_slice(&DS_WRITE_B32_V1_V2);
+    words.extend_from_slice(&DS_READ_B32_V4_V1);
+    let native = native_lds(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(kept_wave(&native, &p), Some(32));
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
 }

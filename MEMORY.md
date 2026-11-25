@@ -640,6 +640,39 @@ the layer's own lever, `VICTORY_SHADING_RATE`, measured no gain at all (§5.1).
   and `title+0x24800d5` a hash map's value slot at `node+0x18`, so every byte
   the dumps read past word 0 is record or bucket memory.
 
+## 5.5 Seven compute pipelines refused for their wave size
+
+**Measured 2026-11-26** on the reference rig, from a real run's log and
+reproduced offline with `victory translate <game-folder> --pipelines` under
+`VICTORY_HOST_MAX_WAVE=32` and `VICTORY_WAVE_WHY=1`: seven compute programs
+emit `WaveSize(64)` (PSV0's wave pair 64..64, the same `!dx.waveSize`) and the
+device, whose `D3D12_FEATURE_D3D12_OPTIONS1` says 32..32, refuses each with
+`E_INVALIDARG` at pipeline creation. The refusal reads `its code requires waves
+of 64..64 lanes ... the host GPU runs waves of 32..32`; before
+`crates/victory-gpu/src/pipeline/host.rs::wave_cause` it read `cause=no cause
+known`. The DXIL is valid (`dxc.exe -dumpbin`) and the description is legal:
+the declared wave size alone is wrong for the host.
+
+All seven share their LDS within the console's one wave without a barrier — a
+dword (mostly dword 0) that every lane writes and then reads — so the console's
+order is an ordering point between a read and a write that a lane branch
+excludes, which is exactly what `crates/victory-shader/src/emit/lanes.rs::lds_meetings`
+refuses, and two 32-lane waves would compute a different number. All seven stay
+refused; none is a split the model could take exactly.
+
+- `2cc4c197ee29e291` `sr_tracingCS_Tiling_Generate_Opaque`, 8x8x1, LDS 512 B: writes a 1 to dword 0 in `b4` and reads dword 0 in `b34`, under an EXEC guard; also `v_mbcnt` and masks as data. Refused.
+- `2da4beb386509b77` `alphaResolveCS_AlphTransmissionPrefilterMip`, 256x1x1, LDS 512 B: a 16-lane `ds_swizzle` butterfly that stages through a per-lane dword (write in `b15`, another lane's slot read in `b17`), plus `v_readlane`. Refused.
+- `369cbe906ea72764` `GpuParticleUpdateCS_Visibility`, 64x1x1, LDS 512 B: shared counters at dword 0 and offsets 4..20 (`ds_add_rtn_u32`) and a `ds_read2` of them in the same region. Refused.
+- `02384a60fda6f2d0` `vfx_triangleClipCS_DefragHeap_ComputeRelocations`, 128x1x1, LDS 16,896 B: a heap scan of per-lane addresses with `s_barrier`s, plus `ds_cmpst_rtn`/`ds_add_rtn` and `v_mbcnt`/`v_readlane`. Refused.
+- `6b82bc7d22016cb5` `vfx_triangleClipCS_CollectTriangles_Meshlets`, 1024x1x1, LDS 32,768 B: a shared allocator dword (`ds_or_b32`/`ds_add_u32`) and `ds_max_i32`, `v_mbcnt`. Refused.
+- `5dc3b25986622949` `water_shadingCS_TransmissionVolumetrics_Tiled`, 8x8x1, LDS 512 B: `ds_min_u32`/`ds_max_u32` on dwords 0 and 4 and a `ds_read2` of both, every address the constant 0, plus 56 `v_readlane_b32`. Refused.
+- `6f225b641c5b0708` `water_shadingCS_TransmissionVolumetrics_Tiled_LocalLights`, 8x8x1, LDS 512 B: the same shape with 62 `v_readlane_b32`. Refused.
+
+`crates/victory-shader/src/emit/wave64_tests.rs::a_dword_written_and_read_in_one_lane_branch_keeps_the_consoles_wave`
+pins the refusal, and `..._by_every_lane_splits` pins that the same dword in
+all-lane blocks does split: the barriers the split adds are run by every
+thread, the region's edges are not.
+
 ---
 
 # 6. Dead ends — do not retry these
