@@ -175,11 +175,21 @@ fn signed(bits: u32, x: u64) -> i64 {
 ///   choice, by operand) or a NaN result;
 /// - a subnormal operand or result (a console may flush it to zero);
 /// - a result that had to round, so that the answer is the mode's;
-/// - a result that overflowed to an infinity.
+/// - a sum or difference whose double form already lost the smaller operand,
+///   which no check on the double can see;
+/// - a zero sum whose sign the mode picks.
 ///
-/// Every sum, difference and product of two singles is exact in a double
-/// (their mantissas are 24 bits), so the double here and the single it
-/// rounds to are the same number when nothing rounded.
+/// The fold therefore asks nothing about the mode where it happens: it
+/// returns a value only where nearest, up, down and toward-zero all give
+/// those bits.
+///
+/// A product of two singles is exact in a double (24 and 24 bits are 48, and
+/// 53 hold them; the product of the two exponents stays inside the double's
+/// range). A sum is not: with exponents more than 53 apart the double rounds
+/// the smaller operand away (`1e20 + 1.0` is `1e20` again), so the single
+/// compared back with it is the same number and the check passes. The
+/// error-free transform of TwoSum (Knuth) recovers what the double dropped;
+/// a nonzero error means the double is not the sum.
 fn fold_float(op: Bin, a: u32, b: u32) -> Option<u32> {
     let flush = |f: f32| f != 0.0 && f.abs() < f32::MIN_POSITIVE;
     let (x, y) = (f32::from_bits(a), f32::from_bits(b));
@@ -187,14 +197,44 @@ fn fold_float(op: Bin, a: u32, b: u32) -> Option<u32> {
         return None;
     }
     let (x, y) = (f64::from(x), f64::from(y));
-    let exact = match op {
-        Bin::Add => x + y,
-        Bin::Sub => x - y,
-        Bin::Mul => x * y,
+    let sum = match op {
+        // A difference is the sum with the second operand negated, and
+        // negating a double is exact in every mode (it flips the zero too,
+        // which is why `-0.0 - +0.0` is `-0.0` and `+0.0 - +0.0` is not).
+        Bin::Add => (x, y),
+        Bin::Sub => (x, -y),
+        Bin::Mul => {
+            let exact = x * y;
+            let single = exact as f32;
+            if f64::from(single) != exact || single.is_nan() || flush(single) {
+                return None;
+            }
+            return Some(single.to_bits());
+        }
         _ => return None,
     };
-    let single = exact as f32;
-    if f64::from(single) != exact || single.is_nan() || flush(single) {
+    let (x, y) = sum;
+    if !x.is_finite() || !y.is_finite() {
+        // An infinity and a finite number sum to the infinity; two infinities
+        // of one sign to it too. Of two signs the sum is a NaN, and which
+        // one is the hardware's.
+        let sum = x + y;
+        if sum.is_nan() {
+            return None;
+        }
+        return Some((sum as f32).to_bits());
+    }
+    let sum = x + y;
+    let t = sum - x;
+    let error = (x - (sum - t)) + (y - t);
+    let single = sum as f32;
+    if error != 0.0 || f64::from(single) != sum || single.is_nan() || flush(single) {
+        return None;
+    }
+    // A zero is `+0.0` under every mode but round-down, except where the
+    // arithmetic fixes it: two zeros of one sign sum to that zero, and a
+    // cancellation or a pair of opposite signs does not.
+    if single == 0.0 && !(x == 0.0 && y == 0.0 && x.is_sign_negative() == y.is_sign_negative()) {
         return None;
     }
     Some(single.to_bits())
@@ -704,22 +744,36 @@ impl Module {
                         };
                         Some(self.k(ty, to, k))
                     }
-                    // An integer as a float: folded where that is the whole
-                    // of the integer (nothing rounded, so no mode of any
-                    // rounding tells them apart).
+                    // An integer as a float: folded where the integer is the
+                    // whole of the result, so that no mode of any rounding
+                    // tells them apart. The rounded double of a 64-bit
+                    // integer is a value a single may hold exactly
+                    // (`u64::MAX` and `2^55 + 1` both round to a power of
+                    // two), so the test is on the integer: as many
+                    // significant bits as a single's mantissa holds. And only
+                    // a single is folded: a double, or a half, is not the
+                    // value this would write.
                     Cast::SiToFp | Cast::UiToFp => {
-                        let from = self.int_bits(self.type_of(x))?;
-                        let (_, k) = self.int_k(x)?;
-                        let n = if op == Cast::SiToFp {
-                            signed(from, k) as f64
-                        } else {
-                            k as f64
-                        };
-                        let f = n as f32;
-                        if f64::from(f) != n {
+                        if self.types[ty.0 as usize] != TypeDef::Float {
                             return None;
                         }
-                        Some(self.f32(f.to_bits()))
+                        let from = self.int_bits(self.type_of(x))?;
+                        let (_, k) = self.int_k(x)?;
+                        let (n, magnitude) = if op == Cast::SiToFp {
+                            let n = signed(from, k);
+                            (n as f64, n.unsigned_abs())
+                        } else {
+                            (k as f64, k)
+                        };
+                        let significant = if magnitude == 0 {
+                            0
+                        } else {
+                            64 - magnitude.leading_zeros() - magnitude.trailing_zeros()
+                        };
+                        if significant > 24 {
+                            return None;
+                        }
+                        Some(self.f32((n as f32).to_bits()))
                     }
                     _ => None,
                 }
@@ -1519,6 +1573,128 @@ mod tests {
             (4, "an overflowing product"),
         ] {
             assert!(m.float_k(stores[n][0]).is_none(), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// A double holds every product of two singles, but not every sum: with
+    /// the exponents more than 53 apart the smaller operand leaves the sum
+    /// entirely (`1e20 + 1.0` is `1e20` again), and the check `f64::from(
+    /// single) == exact` cannot see a loss that happened in the double.
+    #[test]
+    fn float_sums_a_double_cannot_hold_are_not_folded() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let index = m.i32(0);
+        let f = |m: &mut Module, x: f32| m.f32(x.to_bits());
+        let (big, one) = (f(&mut m, 1e20), f(&mut m, 1.0));
+        let up = m.bin(b, Bin::Add, big, one);
+        let down = m.bin(b, Bin::Add, one, big);
+        let less = m.bin(b, Bin::Sub, big, one);
+        let less_down = m.bin(b, Bin::Sub, one, big);
+        // The same exponents, and the sum is a single: folded.
+        let (two, three) = (f(&mut m, 2.0), f(&mut m, 3.0));
+        let sum = m.bin(b, Bin::Add, two, three);
+        // 2^24 + 2^24 is exact in a single; 2^24 + 1 is not.
+        let (half, tiny) = (f(&mut m, 16_777_216.0), f(&mut m, 1.0));
+        let odd = m.bin(b, Bin::Add, half, tiny);
+        for v in [up, down, less, less_down, sum, odd] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let bits = |n: usize| m.float_k(stores[n][0]);
+        assert_eq!(bits(4), Some(5.0f32.to_bits()), "2 + 3");
+        for (n, what) in [
+            (0, "1e20 + 1.0"),
+            (1, "1.0 + 1e20"),
+            (2, "1e20 - 1.0"),
+            (3, "1.0 - 1e20"),
+            (5, "2^24 + 1"),
+        ] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        m.write();
+    }
+
+    /// A sum that is zero has two possible signs: a sum of zeros of one sign
+    /// keeps it, and every other zero is `-0.0` under round-down and `+0.0`
+    /// under the other modes.
+    #[test]
+    fn float_zero_sums_fold_only_where_the_sign_is_the_arithmetic() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let index = m.i32(0);
+        let f = |m: &mut Module, x: f32| m.f32(x.to_bits());
+        let (plus, minus) = (f(&mut m, 0.0), f(&mut m, -0.0));
+        let (one, neg_one) = (f(&mut m, 1.0), f(&mut m, -1.0));
+        // `+0.0` with rounding to nearest, `-0.0` with rounding down.
+        let mixed = m.bin(b, Bin::Add, minus, plus);
+        let nothing = m.bin(b, Bin::Sub, plus, plus);
+        let cancel = m.bin(b, Bin::Add, one, neg_one);
+        // One sign only, so it is the arithmetic's and not the mode's.
+        let both = m.bin(b, Bin::Add, minus, minus);
+        let flipped = m.bin(b, Bin::Sub, minus, plus);
+        let kept = m.bin(b, Bin::Add, plus, plus);
+        for v in [mixed, nothing, cancel, both, flipped, kept] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        let bits = |n: usize| m.float_k(stores[n][0]);
+        for (n, what) in [(0, "-0.0 + +0.0"), (1, "+0.0 - +0.0"), (2, "1.0 + -1.0")] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
+        }
+        assert_eq!(bits(3), Some(0x8000_0000), "-0.0 + -0.0");
+        assert_eq!(bits(4), Some(0x8000_0000), "-0.0 - +0.0");
+        assert_eq!(bits(5), Some(0), "+0.0 + +0.0");
+        m.write();
+    }
+
+    /// An integer folded to a float is folded only where the float is the
+    /// whole of the integer, and only into a single: the rounded double of a
+    /// 64-bit integer can be a power of two that a single holds exactly
+    /// (`u64::MAX` and `2^55 + 1` both do), so the test is on the integer.
+    #[test]
+    fn integer_to_float_folds_only_whole_integers() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let (f32t, f64t) = (m.float(), m.double());
+        let index = m.i32(0);
+        let wide = m.int(64);
+        let all = m.int_const(wide, -1);
+        let unsigned = m.cast(b, Cast::UiToFp, all, f32t);
+        let above = m.k(wide, 64, (1u64 << 55) + 1);
+        let signed_up = m.cast(b, Cast::SiToFp, above, f32t);
+        let exact = m.k(wide, 64, 1u64 << 55);
+        let whole = m.cast(b, Cast::UiToFp, exact, f32t);
+        // A double is not the single the fold would write.
+        let five = m.i32(5);
+        let doubled = m.cast(b, Cast::SiToFp, five, f64t);
+        let unsigned_doubled = m.cast(b, Cast::UiToFp, five, f64t);
+        for v in [unsigned, signed_up, whole, doubled, unsigned_doubled] {
+            m.call(b, writes, vec![v, index]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD);
+        let stores = stores(&m, b);
+        assert_eq!(
+            m.float_k(stores[2][0]),
+            Some((2f32.powi(55)).to_bits()),
+            "2^55 is a single"
+        );
+        for (n, what) in [
+            (0, "u64::MAX"),
+            (1, "2^55 + 1"),
+            (3, "a signed conversion into a double"),
+            (4, "an unsigned conversion into a double"),
+        ] {
+            assert!(matches!(stores[n][0], V::Inst(_)), "{what} stays");
         }
         m.write();
     }
