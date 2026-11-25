@@ -300,7 +300,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         (None, Some(_)) => {
             return Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "a FidelityFX package of programs (VICTORY_FSPX=1 reads them)",
+                what: "a FidelityFX package of programs (VICTORY_FSPX=0 refuses them)",
             });
         }
         (None, None) => {
