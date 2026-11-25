@@ -6121,17 +6121,14 @@ impl PresentPass {
             let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
             let mut targets = [DXGI_FORMAT_UNKNOWN; 8];
             targets[0] = format;
+            let (blend, rasterizer) = present_states();
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
                 PS: code(&ps[..]),
+                BlendState: blend,
                 SampleMask: u32::MAX,
-                RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
-                    CullMode: D3D12_CULL_MODE_NONE,
-                    DepthClipEnable: true.into(),
-                    ..Default::default()
-                },
+                RasterizerState: rasterizer,
                 NumRenderTargets: 1,
                 RTVFormats: targets,
                 PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -6147,7 +6144,28 @@ impl PresentPass {
     }
 }
 
-/// What the present pass shows, and where.
+/// The states the present pass draws with: no blend, every colour channel
+/// written, no culling, depth off.
+///
+/// The write mask is the one that matters: a `Default` blend description
+/// writes nothing at all, so the pass would clear the back buffer to black and
+/// then draw its triangle into a mask that discards every channel — a black
+/// window with no error anywhere. `present_states` is tested for that.
+fn present_states() -> (D3D12_BLEND_DESC, D3D12_RASTERIZER_DESC) {
+    let mut blend = D3D12_BLEND_DESC::default();
+    for target in &mut blend.RenderTarget {
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    }
+    let raster = D3D12_RASTERIZER_DESC {
+        FillMode: D3D12_FILL_MODE_SOLID,
+        CullMode: D3D12_CULL_MODE_NONE,
+        DepthClipEnable: true.into(),
+        ..Default::default()
+    };
+    (blend, raster)
+}
+
+/// What the pass shows, and where.
 struct PresentDraw<'a> {
     /// The frame, in a state pixel shaders may read.
     frame: &'a ID3D12Resource,
@@ -6859,6 +6877,20 @@ fn move_to(
 #[cfg(test)]
 mod present_tests {
     use super::{Fit, fit};
+
+    /// The pass must write every colour channel: a `Default` blend description
+    /// writes none, which turns the window black with no error to read.
+    #[test]
+    fn the_present_pass_writes_every_colour_channel() {
+        let (blend, _) = super::present_states();
+        for (target, described) in blend.RenderTarget.iter().enumerate() {
+            assert_eq!(
+                described.RenderTargetWriteMask,
+                super::D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                "render target {target} writes no colour"
+            );
+        }
+    }
 
     /// The frame keeps its shape in the client area, scaled by the smaller of
     /// the two ratios and centred: bars at the sides, or at the top and bottom.
