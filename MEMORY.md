@@ -466,6 +466,15 @@ to check: `VICTORY_CLAMP=off` crashed the title in the loading scene after
 the arguments there are genuinely malformed and the clamp is load-bearing.
 Measured 25 Nov.
 
+The clamp's own card time, measured rather than inferred: `VICTORY_GPU_SPLIT=1`
+in `target/diag/victory.exe` (`run-20261125-204657.log`, series-x 3,840x2,160,
+3.3 fps / 306.7 ms, 173.0 ms waiting for the card) reads `where the card's time
+went: our clamp dispatches … 4835 draws 42.4 ms a frame (8.0 µs a draw)`,
+`indirect runs … 695 draws 22.1 ms`, `compute dispatches … 7 draws 21.4 ms`.
+So the clamp is 49 % of the 85.9 ms the split accounts, and the earlier A/B
+(above) was too noisy to see it. Diag only: the split forces nothing, but a
+`diag` build beside `target/diag/D3D12` is needed.
+
 Indirect windows are off by default (`VICTORY_INDIRECT_WINDOW=1` asks for one)
 because they cost the picture: with windows on the world's draws are recorded
 as one windowed run and nothing is drawn into the presented frame — black at
