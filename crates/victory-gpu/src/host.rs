@@ -342,6 +342,12 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time the texture refresh thread spent waiting for title memory to hold
+/// still, in microseconds, since the last frame-rate line. Wall-clock time of
+/// the run that the preparation split cannot show: it is spent on another
+/// thread, while the title's remapping is in flight.
+static REFRESH_STILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -6327,8 +6333,13 @@ impl Meter {
             }
         }
         {
+            let waited = [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed));
+            // Kept for the 5 s line: the wait is wall-clock time the frame
+            // spent, but it happens on the refreshing thread, so it is
+            // reported beside the breakdown rather than inside it.
+            REFRESH_STILL.fetch_add(waited[3], Ordering::Relaxed);
             let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+                waited.map(|us| us as f64 / 1000.0 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -6379,6 +6390,8 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
+            // Wall-clock time of the run that the split above cannot show.
+            let still_ms = REFRESH_STILL.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
             // Why those were dropped, split by reason: counted in every build,
             // and taken over the same window as the count above.
             #[cfg(not(feature = "diagnostics"))]
@@ -6456,7 +6469,8 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {still_ms:.1} waiting for title \
+                 memory to hold still, on the refreshing thread), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \

@@ -2035,6 +2035,10 @@ impl State {
             let reclaimed_bytes =
                 RECLAIMED_BYTES.fetch_add(reclaimed_bytes, Ordering::Relaxed) + reclaimed_bytes;
             let now = crate::host::now_ms();
+            // The first refusal starts the window: without this the first line
+            // says "in the last 188 s" and the rate it prints is a lifetime
+            // average.
+            let _ = LAST.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
             let last = LAST.load(Ordering::Relaxed);
             if now >= last + 5_000
                 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
