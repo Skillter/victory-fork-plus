@@ -13,8 +13,10 @@
 //! destination (an address, or physical pages). Files are read through second
 //! handles that leave the Windows file cache out: the package is 208 GB and
 //! the title's working set is its GPU memory living in host RAM, so passing
-//! every byte through the cache costs more than the read. A synchronous handle
-//! allows one I/O at a time, so each file carries a pool of them; and a
+//! every byte through the cache costs more than the read. A handle takes one
+//! read at a time, so each file carries a pool of them; reads are positioned
+//! through `OVERLAPPED`, so a worker never moves a file pointer another worker
+//! is reading from, and a read waits for itself and not for the handle. A
 //! compressed block's length is not a sector multiple, so a request is read as
 //! the whole sectors that hold it and copied out of them. Only a file the host
 //! would not open unbuffered goes through the title's cached handle, and the
@@ -33,12 +35,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
+use super::files::host;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
@@ -294,18 +297,29 @@ struct File {
     direct: Option<Direct>,
 }
 
+/// An unbuffered handle of a file: no file cache, and overlapped, so the
+/// offset comes from the `OVERLAPPED` of each read and a read waits for
+/// itself, never for the handle's other reads.
+struct DirectFile(std::fs::File);
+
+impl DirectFile {
+    fn handle(&self) -> *mut c_void {
+        self.0.as_raw_handle()
+    }
+}
+
 /// The handles a file's reads go through, and the workers waiting for one.
 ///
 /// They leave the file cache out: the package is 208 GB, and read through the
 /// cache every byte of it evicts the title's working set, which is its GPU
 /// memory living in host RAM. Each is positioned, so it carries no file
-/// pointer, and each is synchronous, so it carries one I/O at a time: the pool
-/// is what puts reads at the drive together (36 KiB reads on a 990 EVO Plus:
-/// one handle served 64 workers at 171 MB/s, eight at 255, and asynchronous
-/// reads on one at 365).
+/// pointer, and each serves one read at a time, so the pool is what puts
+/// reads at the drive together (36 KiB reads on a 990 EVO Plus: one handle
+/// served 64 workers at 171 MB/s, eight at 255, and asynchronous reads on one
+/// at 365).
 struct Direct {
     /// Handles no read is using. Never empty for long: a lease returns its own.
-    free: Mutex<Vec<std::fs::File>>,
+    free: Mutex<Vec<DirectFile>>,
     /// A lease returned a handle.
     returned: Condvar,
 }
@@ -315,7 +329,7 @@ struct Direct {
 const HANDLES: usize = 8;
 
 impl Direct {
-    fn new(files: Vec<std::fs::File>) -> Direct {
+    fn new(files: Vec<DirectFile>) -> Direct {
         Direct {
             free: Mutex::new(files),
             returned: Condvar::new(),
@@ -341,13 +355,13 @@ impl Direct {
 /// to the pool when dropped, whatever the read did.
 struct Lease<'a> {
     direct: &'a Direct,
-    file: Option<std::fs::File>,
+    file: Option<DirectFile>,
 }
 
 impl std::ops::Deref for Lease<'_> {
-    type Target = std::fs::File;
+    type Target = DirectFile;
 
-    fn deref(&self) -> &std::fs::File {
+    fn deref(&self) -> &DirectFile {
         // A lease always holds a handle; `Drop` takes it out.
         self.file.as_ref().expect("a lease holds a handle")
     }
@@ -384,20 +398,17 @@ fn direct_handles(path: *const u16) -> Option<Direct> {
 }
 
 /// One handle the file cache stays out of.
-fn direct_handle(path: *const u16) -> Option<std::fs::File> {
+fn direct_handle(path: *const u16) -> Option<DirectFile> {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    /// `FILE_FLAG_NO_BUFFERING`: the drive is asked directly, and the cache is
-    /// not filled. Offsets, lengths and buffer addresses must be on a sector.
-    const NO_BUFFERING: u32 = 0x2000_0000;
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        NO_BUFFERING,
+        NO_BUFFERING | OVERLAPPED,
         std::ptr::null_mut(),
     );
     if handle as isize == -1 {
@@ -405,7 +416,7 @@ fn direct_handle(path: *const u16) -> Option<std::fs::File> {
         return None;
     }
     // SAFETY: a handle we just opened and nobody else owns.
-    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+    Some(DirectFile(unsafe { std::fs::File::from_raw_handle(handle) }))
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -483,6 +494,14 @@ const STAGING: u64 = 32 << 20;
 /// The alignment an unbuffered read needs: the sector, which the console's
 /// package layout follows (a 512-byte host sector divides it).
 const SECTOR: usize = 4096;
+/// `FILE_FLAG_NO_BUFFERING`: the drive is asked directly, and the cache is not
+/// filled. Offsets, lengths and buffer addresses must be on a sector.
+const NO_BUFFERING: u32 = 0x2000_0000;
+/// `FILE_FLAG_OVERLAPPED`: a read carries its own offset and its own
+/// completion, so reads on one handle do not queue at the file object. Without
+/// it Windows serialises every read on the handle at queue depth one, whatever
+/// the pool, and `seek_read` is the only positioned read that works.
+const OVERLAPPED: u32 = 0x4000_0000;
 /// A per-worker read buffer above this size is not kept: that request gets one
 /// of its own, so one large read does not pin memory in every worker.
 const SCRATCH_KEEP: usize = 4 << 20;
@@ -1113,8 +1132,22 @@ extern "system" fn close(this: QueueRef) {
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
     let result = execute_with(request, &mut scratch);
+    keep(&mut scratch);
     SCRATCH.with_borrow_mut(|slot| *slot = scratch);
     result
+}
+
+/// Drops what a request grew past the size worth keeping before the buffers go
+/// back to the worker's slot. The copy buffer is as wide as the widest window
+/// its worker ever read, and every worker keeps its own: one large read would
+/// pin that memory in all of them for the rest of the run, which is why a
+/// buffer past `SCRATCH_KEEP` goes and the next request allocates what it
+/// needs. The read buffer needs no such rule: `read_source` reads a source
+/// larger than `SCRATCH_KEEP` into a buffer of its own.
+fn keep(scratch: &mut Scratch) {
+    if scratch.packed.capacity() > SCRATCH_KEEP {
+        scratch.packed = Vec::new();
+    }
 }
 
 fn execute_with(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
@@ -1308,10 +1341,17 @@ impl Aligned {
         if self.bytes.len() < need {
             let grow = need + need / 4;
             self.bytes = vec![0; grow];
-            self.start = self.bytes.as_ptr().align_offset(SECTOR);
+            self.start = sector_shift(self.bytes.as_ptr() as usize);
         }
         &mut self.bytes[self.start..self.start + len]
     }
+}
+
+/// How far into a buffer the first sector boundary is. Every byte address has
+/// one and the caller keeps a sector spare, so this cannot fail the way
+/// `align_offset` can (it answers `usize::MAX` when no offset would do).
+fn sector_shift(address: usize) -> usize {
+    (SECTOR - address % SECTOR) % SECTOR
 }
 
 /// Whether an address is one an unbuffered read accepts.
@@ -1443,10 +1483,14 @@ fn read_direct(
 ) -> Result<(), HRESULT> {
     let leased = {
         let lease = direct.lease();
-        sectors(&lease, offset, out, copy)
+        sectors(&lease, cached, offset, out, copy)
     };
     match leased {
         Ok(()) => Ok(()),
+        // The file ends inside the request, and the sector it ends in has
+        // already been asked of the cached handle: reading the whole request
+        // again through it would spend a cached read to learn the same thing.
+        Err(END_OF_FILE) => Err(END_OF_FILE),
         Err(hr) => {
             tracing::debug!(
                 offset,
@@ -1465,7 +1509,8 @@ fn read_direct(
 /// once, and an unbuffered read needs the buffer, the offset and the length on
 /// a sector boundary.
 fn sectors(
-    file: &std::fs::File,
+    file: &DirectFile,
+    cached: &std::fs::File,
     offset: u64,
     out: &mut [u8],
     copy: &mut Vec<u8>,
@@ -1475,13 +1520,17 @@ fn sectors(
         return Ok(());
     }
     if sector_aligned(out.as_ptr() as usize) && unbuffered_fits(offset, len) {
-        return read_span(file, offset, out);
+        let got = read_span_direct(file, cached, offset, out)?;
+        return if got == len { Ok(()) } else { Err(END_OF_FILE) };
     }
     let start = offset & !(SECTOR as u64 - 1);
     let end = (offset + len as u64).div_ceil(SECTOR as u64) * SECTOR as u64;
     let window = aligned_in(copy, (end - start) as usize);
-    read_span(file, start, window)?;
+    let got = read_span_direct(file, cached, start, window)?;
     let skip = (offset - start) as usize;
+    if skip + len > got {
+        return Err(END_OF_FILE);
+    }
     out.copy_from_slice(&window[skip..skip + len]);
     WIDENED.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -1494,10 +1543,7 @@ fn aligned_in(copy: &mut Vec<u8>, len: usize) -> &mut [u8] {
     if copy.len() < len + SECTOR {
         copy.resize(len + SECTOR, 0);
     }
-    let start = copy.as_ptr().align_offset(SECTOR);
-    // Every offset is a valid byte address, so the only failure a `Vec`
-    // can hit is a length it cannot hold, which the resize above prevents.
-    debug_assert!(start < SECTOR);
+    let start = sector_shift(copy.as_ptr() as usize);
     &mut copy[start..start + len]
 }
 
@@ -1513,6 +1559,116 @@ fn read_span(file: &std::fs::File, offset: u64, out: &mut [u8]) -> Result<(), HR
         }
     }
     Ok(())
+}
+
+/// `OVERLAPPED` (winnt.h): the offset a positioned read asks for, and where
+/// the host keeps the transfer it is running. A read on a handle opened
+/// `FILE_FLAG_OVERLAPPED` takes its offset from here, never from a file
+/// pointer, and its byte count from `GetOverlappedResult`.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut c_void,
+}
+
+impl Overlapped {
+    /// The structure one read at `offset` hands the host.
+    fn at(offset: u64) -> Overlapped {
+        Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            event: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// `ERROR_IO_PENDING`: the host has the read and will finish it.
+const IO_PENDING: i32 = 997;
+/// `ERROR_HANDLE_EOF`: the read starts at or past the end of the file.
+const HANDLE_EOF: i32 = 38;
+
+type ReadFileFn = extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut Overlapped) -> i32;
+type GetOverlappedResultFn = extern "system" fn(*mut c_void, *mut Overlapped, *mut u32, i32) -> i32;
+
+/// One read of `out` at `offset` through an unbuffered handle, waiting for it.
+/// Returns the bytes read, which is 0 at the end of the file.
+///
+/// `std::fs::File::seek_read` is not this: it hands the host an `OVERLAPPED` of
+/// its own on the stack and never waits for `ERROR_IO_PENDING`, so on an
+/// overlapped handle a read that is merely queued is reported as a failure.
+fn read_at(file: &DirectFile, offset: u64, out: &mut [u8]) -> Result<usize, HRESULT> {
+    // A request's length is a `u32` and a sector window is bounded by one; a
+    // longer buffer is read in pieces by the caller.
+    let len = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let read: ReadFileFn = host!("kernel32.dll", "ReadFile": ReadFileFn);
+    let mut over = Overlapped::at(offset);
+    // The handle is ours, `out` holds `len` bytes, and `over` outlives the
+    // read, which has completed by the time this returns.
+    let queued = read(file.handle(), out.as_mut_ptr(), len, std::ptr::null_mut(), &mut over);
+    if queued == 0 {
+        let error = std::io::Error::last_os_error();
+        // Queued, not failed: the wait below is the read.
+        if error.raw_os_error() != Some(IO_PENDING) {
+            return Err(from_win32(&error));
+        }
+    }
+    let moved: GetOverlappedResultFn = host!("kernel32.dll", "GetOverlappedResult": GetOverlappedResultFn);
+    let mut done = 0;
+    // The last argument is the wait a pending read needs.
+    let ok = moved(file.handle(), &mut over, &mut done, 1);
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(HANDLE_EOF) => Ok(0),
+            _ => Err(from_win32(&error)),
+        };
+    }
+    Ok(done as usize)
+}
+
+/// Fills `out` from `offset` through an unbuffered handle, a call at a time,
+/// returning how many bytes the file held there.
+///
+/// A read the drive will not take — the sector the file's last bytes end in,
+/// which an unbuffered read may neither start nor finish inside — is what ends
+/// a request in a file whose length is not a sector multiple. The cached handle
+/// finishes the span from where the unbuffered one stopped: it is the only one
+/// that reads that sector, and the count it leaves is what says the request is
+/// past the end of the file. `END_OF_FILE` is the caller's to report, never
+/// `ERROR_INVALID_PARAMETER` from the read that could not start there.
+fn read_span_direct(
+    file: &DirectFile,
+    cached: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        match read_at(file, offset + done as u64, &mut out[done..]) {
+            Ok(0) => return Ok(done),
+            Ok(n) => done += n,
+            Err(hr) if done > 0 => {
+                tracing::debug!(
+                    offset,
+                    done,
+                    len = out.len(),
+                    hr = format_args!("{hr:#010x}"),
+                    "dstorage: the file ends inside the read; the cached handle finishes it"
+                );
+                if read_span(cached, offset + done as u64, &mut out[done..]).is_ok() {
+                    return Ok(out.len());
+                }
+                return Ok(done);
+            }
+            Err(hr) => return Err(hr),
+        }
+    }
+    Ok(done)
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1748,6 +1904,11 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        // The host's `OVERLAPPED`: the offset a read asks for is at 0x10, and
+        // nothing of ours may sit between it and the host's own fields.
+        assert_eq!(size_of::<Overlapped>(), 0x20);
+        assert_eq!(std::mem::offset_of!(Overlapped, offset), 0x10);
+        assert_eq!(std::mem::offset_of!(Overlapped, event), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -2239,20 +2400,28 @@ mod tests {
         assert!(sector_aligned(grown.as_ptr() as usize));
     }
 
-    /// A pool of handles opened the way `direct_handles` opens them, over a
-    /// temp file: nothing here needs the title.
-    fn direct_file(bytes: &[u8]) -> (tempfile::TempDir, Direct) {
-        use std::os::windows::fs::OpenOptionsExt;
-        const NO_BUFFERING: u32 = 0x2000_0000;
+    /// A pool of handles `direct_handles` opened over a temp file, and the
+    /// cached handle a title open would also have: nothing here needs the title.
+    fn direct_file(bytes: &[u8]) -> (tempfile::TempDir, std::fs::File, Direct) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("direct.bin");
         std::fs::write(&path, bytes).unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(NO_BUFFERING)
-            .open(&path)
-            .expect("this volume takes unbuffered reads");
-        (dir, Direct::new(vec![file]))
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let direct = direct_handles(wide.as_ptr()).expect("this volume takes unbuffered reads");
+        let cached = std::fs::File::open(&path).unwrap();
+        (dir, cached, direct)
+    }
+
+    /// A buffer and the offset of a destination in it that is guaranteed not to
+    /// start on a sector, whatever the allocator handed back.
+    fn off_a_sector(len: usize) -> (Vec<u8>, usize) {
+        let bytes = vec![0xAAu8; len + SECTOR];
+        let skew = usize::from(sector_aligned(bytes.as_ptr() as usize));
+        assert!(
+            !sector_aligned(bytes.as_ptr() as usize + skew),
+            "a destination off a sector"
+        );
+        (bytes, skew)
     }
 
     #[test]
@@ -2276,19 +2445,19 @@ mod tests {
     #[test]
     fn unbuffered_reads_serve_on_sector_requests_and_widen_the_rest() {
         let contents = pattern(3 * SECTOR);
-        let (_dir, direct) = direct_file(&contents);
+        let (_dir, cached, direct) = direct_file(&contents);
         let mut scratch = Scratch::default();
 
         // A destination that is whole sectors, on an offset that is one, is
         // the buffer the read lands in.
         let out = scratch.read.prepare(contents.len());
-        sectors(&direct.lease(), 0, out, &mut scratch.packed).unwrap();
+        sectors(&direct.lease(), &cached, 0, out, &mut scratch.packed).unwrap();
         assert_eq!(out, &contents[..]);
 
         // A destination off a sector boundary goes through the copy buffer,
         // which must still hold every byte.
         let mut unaligned = vec![0u8; contents.len() + 1];
-        sectors(&direct.lease(), 0, &mut unaligned[1..], &mut scratch.packed).unwrap();
+        sectors(&direct.lease(), &cached, 0, &mut unaligned[1..], &mut scratch.packed).unwrap();
         assert_eq!(&unaligned[1..], &contents[..]);
         assert_eq!(unaligned[0], 0, "the byte before the destination is untouched");
 
@@ -2296,7 +2465,7 @@ mod tests {
         // inside one. The sectors that hold it are read and the request copied
         // out of them, which is what every compressed request needs.
         let mut block = [0u8; 1000];
-        sectors(&direct.lease(), 5000, &mut block, &mut scratch.packed).unwrap();
+        sectors(&direct.lease(), &cached, 5000, &mut block, &mut scratch.packed).unwrap();
         assert_eq!(block, contents[5000..6000]);
 
         // Past the end is the end of the file, and nothing is written: the
@@ -2304,7 +2473,7 @@ mod tests {
         let before = out[..SECTOR].to_vec();
         let tail = scratch.read.prepare(SECTOR);
         assert_eq!(
-            sectors(&direct.lease(), contents.len() as u64, tail, &mut scratch.packed),
+            sectors(&direct.lease(), &cached, contents.len() as u64, tail, &mut scratch.packed),
             Err(END_OF_FILE)
         );
         assert_eq!(tail, &before[..]);
@@ -2315,27 +2484,14 @@ mod tests {
     /// alignment and however many requests share the file.
     #[test]
     fn a_batch_of_requests_gets_every_byte_once_and_in_place() {
-        use std::os::windows::fs::OpenOptionsExt;
         use std::sync::Arc;
-        const NO_BUFFERING: u32 = 0x2000_0000;
         // Bytes are their own address, so a read that lands elsewhere cannot
         // pass, and the file is whole sectors plus a tail a window must not
         // read past.
         let len = 1 << 20;
         let contents: Vec<u8> = (0..len).map(|i| (i as u8) ^ (i >> 7) as u8).collect();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("batch.bin");
-        std::fs::write(&path, &contents).unwrap();
-        let files: Vec<std::fs::File> = (0..HANDLES)
-            .map(|_| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(NO_BUFFERING)
-                    .open(&path)
-                    .expect("this volume takes unbuffered reads")
-            })
-            .collect();
-        let direct = Arc::new(Direct::new(files));
+        let (_dir, cached, direct) = direct_file(&contents);
+        let direct = Arc::new(direct);
 
         // Requests of every shape: whole sectors, a block that ends anywhere,
         // a destination off a sector, and a request that starts inside one.
@@ -2354,6 +2510,7 @@ mod tests {
         let mut workers = Vec::new();
         for (t, _) in (0..8).enumerate() {
             let direct = Arc::clone(&direct);
+            let cached = cached.try_clone().unwrap();
             let expected = contents.clone();
             workers.push(std::thread::spawn(move || {
                 let mut copy = Vec::new();
@@ -2363,7 +2520,7 @@ mod tests {
                     let at = (i * SECTOR * 7 + offset) % room;
                     let mut buffer = vec![0xAAu8; ask + skew + 1];
                     let out = &mut buffer[skew..skew + ask];
-                    sectors(&direct.lease(), at as u64, out, &mut copy).unwrap();
+                    sectors(&direct.lease(), &cached, at as u64, out, &mut copy).unwrap();
                     assert_eq!(
                         out,
                         &expected[at..at + ask],
@@ -2420,5 +2577,128 @@ mod tests {
         assert!(line.contains("3 through the file cache"), "{line}");
         assert!(line.contains("97 through a sector window"), "{line}");
         assert!(line.contains("2 requests were queued"), "{line}");
+    }
+
+    #[test]
+    fn an_unbuffered_handle_leaves_the_cache_and_takes_overlapped_reads() {
+        // Both flags decide the read path: without `NO_BUFFERING` the 208 GB
+        // package fills the cache and evicts the title's working set, and
+        // without `OVERLAPPED` each read on a handle waits for the one before
+        // it, so the pool is queue depth `HANDLES` and not one per worker.
+        let flags = NO_BUFFERING | OVERLAPPED;
+        assert_eq!(NO_BUFFERING & OVERLAPPED, 0, "two different flags");
+        assert_eq!(flags & NO_BUFFERING, NO_BUFFERING);
+        assert_eq!(flags & OVERLAPPED, OVERLAPPED);
+    }
+
+    #[test]
+    fn an_unbuffered_read_takes_its_offset_and_waits_for_itself() {
+        // The handle is opened for overlapped I/O, so the offset is the
+        // `OVERLAPPED`'s and the wait is the read's own: this serves a read
+        // that `seek_read` would report as pending (a failure) on it.
+        let contents = pattern(3 * SECTOR);
+        let (_dir, _cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+        let out = scratch.read.prepare(SECTOR);
+        assert_eq!(read_at(&direct.lease(), 2 * SECTOR as u64, out), Ok(SECTOR));
+        assert_eq!(out, &contents[2 * SECTOR..]);
+        // At the end of the file the read moves nothing and says so.
+        let end = scratch.read.prepare(SECTOR);
+        assert_eq!(read_at(&direct.lease(), contents.len() as u64, end), Ok(0));
+    }
+
+    /// An unbuffered read wants the buffer itself on a sector boundary, and a
+    /// title destination need not be on one: the read goes through a buffer
+    /// that is, and every byte asked for still arrives.
+    #[test]
+    fn a_destination_off_a_sector_is_served_through_an_aligned_buffer() {
+        let contents = pattern(8 * SECTOR);
+        let (_dir, cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+        let (mut bytes, skew) = off_a_sector(2 * SECTOR);
+        let destination = &mut bytes[skew..skew + 2 * SECTOR];
+        sectors(&direct.lease(), &cached, (2 * SECTOR) as u64, destination, &mut scratch.packed)
+            .unwrap();
+        assert_eq!(destination, &contents[2 * SECTOR..4 * SECTOR]);
+        assert!(
+            bytes[..skew].iter().all(|&b| b == 0xAA)
+                && bytes[skew + 2 * SECTOR..].iter().all(|&b| b == 0xAA),
+            "a read wrote outside its destination"
+        );
+    }
+
+    /// The same through the title's own queue: a destination off a sector is a
+    /// request that succeeds, not `ERROR_INVALID_PARAMETER` (0x80070057).
+    #[test]
+    fn a_request_into_a_destination_off_a_sector_serves() {
+        let contents = pattern(4 * SECTOR);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let (mut buffer, skew) = off_a_sector(2 * SECTOR);
+        let destination = buffer.as_mut_ptr().cast::<u8>().wrapping_add(skew);
+        let r = request(0, destination.cast(), 2 * SECTOR, file, SECTOR as u64, 2 * SECTOR);
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(&buffer[skew..skew + 2 * SECTOR], &contents[SECTOR..3 * SECTOR]);
+        void(queue, 0x40);
+    }
+
+    /// A file's length need not be a sector multiple. A request that starts on
+    /// a sector and runs past the end reads the sectors the file has, and then
+    /// asks for a length the drive will not take: the tail comes through the
+    /// cached handle and the request is owed `END_OF_FILE`, never the sector
+    /// error a read that could not start inside the last sector would give.
+    #[test]
+    fn a_sector_request_across_the_end_of_a_part_sector_file_is_the_end_of_the_file() {
+        let contents = pattern(3 * SECTOR + 100);
+        let (_dir, cached, direct) = direct_file(&contents);
+        let mut scratch = Scratch::default();
+
+        let out = scratch.read.prepare(4 * SECTOR);
+        assert_eq!(
+            sectors(&direct.lease(), &cached, 0, out, &mut scratch.packed),
+            Err(END_OF_FILE)
+        );
+        assert_eq!(&out[..contents.len()], &contents[..], "every byte the file holds arrived");
+
+        // A request whose last byte is the file's last byte is inside the file,
+        // so it serves: the sector it ends in came through the cached handle.
+        let mut tail = [0u8; 100];
+        sectors(&direct.lease(), &cached, (3 * SECTOR) as u64, &mut tail, &mut scratch.packed)
+            .unwrap();
+        assert_eq!(tail, contents[3 * SECTOR..]);
+    }
+
+    /// The same through the title's queue, which is where the wrong error
+    /// (0x80070057) was the title's to see.
+    #[test]
+    fn a_request_across_the_end_of_a_part_sector_file_reports_the_end() {
+        let contents = pattern(3 * SECTOR + 100);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; 4 * SECTOR];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), out.len(), file, 0, 4 * SECTOR));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+        void(queue, 0x40);
+    }
+
+    /// A copy buffer is as wide as the widest window its worker ever read, and
+    /// every worker keeps its own: past `SCRATCH_KEEP` it goes instead of being
+    /// pinned in all of them for the rest of the run.
+    #[test]
+    fn a_copy_buffer_past_the_kept_size_is_not_kept() {
+        let mut scratch = Scratch { packed: vec![0u8; 1000], ..Scratch::default() };
+        keep(&mut scratch);
+        assert_eq!(scratch.packed.capacity(), 1000, "a small copy buffer stays");
+        scratch.read.prepare(SCRATCH_KEEP);
+        let read = scratch.read.bytes.len();
+        scratch.packed = vec![0u8; 2 * SCRATCH_KEEP];
+        keep(&mut scratch);
+        assert_eq!(scratch.packed.capacity(), 0, "a copy buffer past the kept size goes");
+        assert_eq!(scratch.read.bytes.len(), read, "the read buffer keeps its size");
     }
 }

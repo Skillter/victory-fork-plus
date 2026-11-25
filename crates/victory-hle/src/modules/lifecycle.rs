@@ -335,8 +335,11 @@ fn summary(how: &str) {
 ///
 /// Everything the block reads is a static of `victory_core` (the meter and the
 /// `logging` warning watches), so it is written even though the GPU layer may
-/// already have let go of its arenas - no directory is walked and no device
-/// object is asked for anything.
+/// already have let go of its arenas. The `STOP cache` sizes come from the
+/// writer `victory run` installed at start-up
+/// ([`victory_core::report::set_footer_hook`]), so this path and the one that
+/// returns from `run` render the same block; no device object is asked for
+/// anything.
 fn last_records(how: &str) -> bool {
     let duration = started().map_or(Duration::ZERO, |start| start.elapsed());
     let Some(block) = victory_gpu::report::stop_block(how, duration) else {

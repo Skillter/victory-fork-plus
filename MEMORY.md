@@ -231,6 +231,20 @@ default, `run-20261125-135405.log`) restores the path the title took before:
 `the window a present closes ... written=true` and 13.8 fps / 72.4 ms on the
 loading screen.
 
+*(re-measured, `victory translate` with `VICTORY_FSPX=1`, 25 Nov)* three of the
+package's refusals were instructions with no arm at all, and they are gone:
+`v_dot4c_i32_i8`/`v_dot4_i32_i8` (1 → 0), `a packed 16-bit operation` (1 → 0,
+`v_pk_fmac_f16`) and `a special operand (vccz, execz, scc, lds_direct)` (2 → 0).
+Compute programs emitted 2728 → **2731** of 2762; vertex/pixel 14211/14259 and
+mesh 8762/8765 unchanged, so nothing that translated before stopped. What is
+left of the package is the lane model: `a lane mask read as data` 17 ×,
+`a lane mask holding lanes elsewhere read as data` 9 → 10 (one program now
+reaches that refusal instead of stopping at a special operand), `a 16-bit image
+atomic` 1, `resources: a descriptor neither loaded nor built` 1. The lane-mask
+pair is the EXEC_LO idiom (`s_mov_b32 s16, exec_lo` … `s_andn2_b32 exec_lo, s16,
+exec_lo`): `structure::key` needs both dwords of a wave64 mask, so the saved
+copy is never a mask and the SOP op consuming it reads data.
+
 *(re-measured, `run-20261125-092842.log`)* series-s now reaches the world with
 **no failed texture create and no device removal**: `R9G9B9E5` (console format
 67) has neither `RENDER_TARGET` nor `TYPED_UNORDERED_ACCESS_VIEW` support on
@@ -389,10 +403,10 @@ preparing, 96 → 168 ms, 205 ms a frame (`run-20261125-101119.log`); measured
 25 Nov.
 
 The argument clamp is not a lever either: with the indirect window off
-(`VICTORY_INDIRECT_WINDOW=0`, `indirect.rs::record_clamp_as` once a record) the
-world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the GPU and 1.04 clamps a
-draw; with the window on, 4,423 draws at 217.6 ms and 0.52 clamps a draw
-(`run-20261125-123322.log` against `-114852.log`) — doubling the clamps did not
+(`indirect.rs::record_clamp_as` once a record; the default since the window
+cost the picture) the world ran 4,459 draws at 172.1 ms/frame, 73.3 ms on the
+GPU and 1.04 clamps a draw; with the window on, 4,423 draws at 217.6 ms and
+0.52 clamps a draw (`run-20261125-123322.log` against `-114852.log`) — doubling the clamps did not
 slow the frame, and the 45 ms between the two runs (21 % of the frame, world
 state and machine load included) is larger than anything the clamp
 contributes. A clamp emits 5–6 barrier records (`argument clamp: N clamped and
@@ -402,6 +416,13 @@ to check: `VICTORY_CLAMP=off` crashed the title in the loading scene after
 2 min 36 s with `0xC0000005` and no frame line (`run-20261125-115523.log`), so
 the arguments there are genuinely malformed and the clamp is load-bearing.
 Measured 25 Nov.
+
+Indirect windows are off by default (`VICTORY_INDIRECT_WINDOW=1` asks for one)
+because they cost the picture: with windows on the world's draws are recorded
+as one windowed run and nothing is drawn into the presented frame — black at
+4.8 fps (`run-20261125-140122.log`); with them off the same build shows the
+scene at 4.0 fps (`run-20261125-141510.log`). Until the window path draws what
+it records, it stays opt-in.
 
 ## 5.2 Missing content — clothes and materials
 

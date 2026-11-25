@@ -23,6 +23,14 @@ Largest crate. Change it with the pipeline order in mind (`emit::translate`):
   through as `Err(<mnemonic>)`.
 - Add a case to `emit::valu_tests` (synthetic shader, validated with
   `dxil.dll`, run on GPU and WARP) or the relevant `*_tests` module.
+- A packed operation encoded as VOP2 (`v_pk_fmac_f16`, opcode table `VOP2`)
+  has no half selectors: each half reads its own half (`packed_src`). Only a
+  VOP3P encoding carries `opsel`/`opsel_hi`.
+- GFX10's DOT instructions treat a byte of `0x80` as absent, so that pair's
+  product is zero rather than `-128 * x` (`emit::lower::dot_byte`).
+- Where the accumulator lives follows the encoding, not the mnemonic:
+  `v_dot4c_i32_i8` (VOP2) adds to its destination, `v_dot4_i32_i8` (VOP3P)
+  adds its third source.
 - Keep `what` strings stable and specific; logs and tests match on them.
 
 ## Wave size
@@ -69,6 +77,12 @@ all agree on; anything else stays unfolded.
 ## Traps
 
 - `emit::lower::take_needs` is thread-local state carried between programs.
+- `resource::Tracer::patched` models only a four-dword buffer `V#`, gated on
+  `Role::Resource`; a patched image `T#` (eight dwords) or sampler `S#` is
+  refused as "a descriptor changed after loading", never read as a buffer.
+- `fspx::Reflect` reads VGPR, LDS and thread-id bounds from the code because
+  the package's `COMPUTE_PGM_RSRC2` layout is not established: a dynamic `DS`
+  address adds `LDS_DYNAMIC_MARGIN` on top of the immediate offsets.
 - `HostShader` is the output boundary; `victory-gpu`'s shader cache encodes
   its fields. Coordinate any layout change.
 - `emit::host` compiles only with the `host` feature and creates real D3D12

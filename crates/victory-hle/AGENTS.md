@@ -34,13 +34,18 @@
   widened and sent to the host's `W` twin; do not rewrite twice.
 - Any CPU write into title memory calls `victory_gpu::kernel_will_write` first
   (`ReadFile`, `fread` and DirectStorage destinations already do).
-- DirectStorage reads the package through eight `FILE_FLAG_NO_BUFFERING`
-  handles per file (`modules::dstorage::direct_handles`): 208 GB through the
-  file cache evicts the title's working set (its GPU memory in host RAM), and
-  one synchronous handle allows one I/O at a time. A request off a sector is
-  read as the sectors that hold it and copied out (`sectors`). Only a file the
-  host will not open unbuffered falls back to the title's cached handle, and
-  the five-second line counts it.
+- DirectStorage reads the package through eight unbuffered handles per file
+  (`modules::dstorage::direct_handles`), each opened `FILE_FLAG_NO_BUFFERING`
+  and `FILE_FLAG_OVERLAPPED`: 208 GB through the file cache evicts the title's
+  working set (its GPU memory in host RAM), and a handle without
+  `FILE_FLAG_OVERLAPPED` serialises every read at the file object. A read is
+  `ReadFile` and `GetOverlappedResult` on its own `OVERLAPPED`
+  (`dstorage::read_at`), never `seek_read`, which cannot wait for a pending
+  one. A request off a sector is read as the sectors that hold it and copied
+  out (`sectors`); a read the drive refuses in the file's partial last sector
+  is finished through the cached handle, so the title sees `END_OF_FILE`. Only
+  a file the host will not open unbuffered falls back to the title's cached
+  handle, and the five-second line counts it.
 - Saves are versioned directories committed by one `rename`, with `sync_all`
   per file. Keep that shape; it is what makes a kill at any step safe.
 

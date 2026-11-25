@@ -231,41 +231,56 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-/// Writes the `STOP` block on every way out of [`run`] that returns.
+/// Writes the `STOP` block on every way out of [`run`], and installs the
+/// renderer the paths that end the process from inside the HLE use.
 ///
-/// The paths that end the process from inside the HLE — `lifecycle::end`, the
-/// suspend deadline, a title that calls `ExitProcess` — never return here:
-/// they write the same block from
-/// `crates/victory-hle/src/modules/lifecycle.rs` (`last_records`), through the
-/// same renderer, and the process writes it once (the one that ends the run).
+/// `lifecycle::end` (a closed window, the suspend deadline) terminates the
+/// process rather than returning, so this frame is gone by then; it writes the
+/// block from `crates/victory-hle/src/modules/lifecycle.rs` (`last_records`).
+/// That path knows no directories, so the cache sizes are installed here, at
+/// start-up, through [`victory_core::report::set_footer_hook`]: both paths
+/// render through [`victory_core::report::stop_block`], which writes the block
+/// once per process whichever of them is first.
 ///
-/// The counters are [`victory_core::report::RunFooter::from_counters`], which
-/// is what that path has too; this one adds the cache left on disk, because a
-/// returning path still knows where its directories are. The frame figures are
-/// the two metrics the presentation path records: `frames_n`, counted once per
-/// presented frame by `victory_gpu::queue::present`, and `frame_ms`, observed
-/// once per frame. A run that never drew has neither and prints no fps.
+/// The frame figures are the two metrics the presentation path records:
+/// `frames_n`, counted once per presented frame by `victory_gpu::queue::present`,
+/// and `frame_ms`, observed once per frame. A run that never drew has neither
+/// and prints no fps.
 struct Footer {
     started: std::time::Instant,
     reason: String,
-    cache_dir: std::path::PathBuf,
-    data_dir: std::path::PathBuf,
-    title_id: u32,
 }
+
+/// The title the footer names. A static because the hook that renders it may
+/// run on the thread `lifecycle::end` spawned, after this frame is gone.
+static TITLE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Footer {
     fn new(started: std::time::Instant, cfg: &victory_core::Config) -> Self {
+        let (cache_dir, data_dir) = (cfg.cache_dir.clone(), cfg.data_dir.clone());
+        victory_core::report::set_footer_hook(Box::new(move |reason, duration| {
+            let mut footer = victory_core::report::RunFooter::from_counters(reason, duration);
+            let title = format!("{:08X}", TITLE_ID.load(std::sync::atomic::Ordering::Relaxed));
+            // A directory that is not there yet is 0 bytes, not an error: the
+            // footer is written on every path, including the ones that failed
+            // before they could make one.
+            footer.cache = vec![
+                ("shaders".to_owned(), dir_size(&cache_dir.join("shaders"))),
+                ("pipelines".to_owned(), dir_size(&cache_dir.join("pipelines"))),
+                ("images".to_owned(), dir_size(&cache_dir.join("images"))),
+                ("storage".to_owned(), dir_size(&data_dir.join(&title).join("storage"))),
+                ("temp".to_owned(), dir_size(&data_dir.join(&title).join("temp"))),
+            ];
+            footer.render()
+        }));
         Self {
             started,
             reason: "the run stopped before the title ended".to_owned(),
-            cache_dir: cfg.cache_dir.clone(),
-            data_dir: cfg.data_dir.clone(),
-            title_id: 0,
         }
     }
 
     fn title(&mut self, id: u32) {
-        self.title_id = id;
+        TITLE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn stopped(&mut self, reason: &str) {
@@ -275,20 +290,11 @@ impl Footer {
 
 impl Drop for Footer {
     fn drop(&mut self) {
-        let mut footer =
-            victory_core::report::RunFooter::from_counters(&self.reason, self.started.elapsed());
-        let title = format!("{:08X}", self.title_id);
-        // A directory that is not there yet is 0 bytes, not an error: the
-        // footer is written on every path, including the ones that failed
-        // before they could make one.
-        footer.cache = vec![
-            ("shaders".to_owned(), dir_size(&self.cache_dir.join("shaders"))),
-            ("pipelines".to_owned(), dir_size(&self.cache_dir.join("pipelines"))),
-            ("images".to_owned(), dir_size(&self.cache_dir.join("images"))),
-            ("storage".to_owned(), dir_size(&self.data_dir.join(&title).join("storage"))),
-            ("temp".to_owned(), dir_size(&self.data_dir.join(&title).join("temp"))),
-        ];
-        victory_core::logging::emit("INFO", &footer.render());
+        // The same call `lifecycle::end` makes, through the same guard: a run
+        // that returned and a run that was terminated cannot both write it.
+        if let Some(block) = victory_core::report::stop_block(&self.reason, self.started.elapsed()) {
+            victory_core::logging::emit("INFO", &block);
+        }
     }
 }
 
