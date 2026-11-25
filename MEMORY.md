@@ -218,6 +218,24 @@ Ceiling on the older build: 3–4 fps with every stable trick. The fork's own
 authors report 420–450 ms → 240–350 ms with relay on a 4070, and the 04:23 run
 reached 4.5 fps, so the limit is the port, not a bug.
 
+A buffer view of no elements (`NumElements == 0`) reads *and writes* the rest of
+its buffer (`crates/victory-gpu/src/descriptor/host.rs::buffer_copy`). What that
+declaration costs, measured 25 Nov: the world's heap is 182,452,224 B and the
+view in the log sits 10,880,256 B in, so 171,571,968 B — 2,618 pieces — are
+declared as the shaders' to write. That copy is in the card's memory
+(`host copies in the card's memory: 1 copies 174 MB`), where a declaration costs
+one span in the plan and no host snapshot: the card already hashes 10,217 pieces
+(669 MB) a frame inside a 2.1–3.5 ms card phase, and the rest about doubles it
+(`run-20261125-043856.log`). What is fetched and merged back is only the pieces
+that differ — 115–332 a frame that run, 7.5–21.8 MB, none of them the rest's.
+With the card's copies off (`VICTORY_CARD_BUFFERS=0`) the same declaration is
+host work: 10.3 ms of snapshot plus 9.7 ms of compare a submission, measured
+here at 14–15 GB/s (145,752,064 B memcpy 10.3 ms, u64 piece compare 9.7 ms),
+~80 ms a frame at 4 submissions.
+No run of this session reached the world to compare both: three runs of 3.5–10
+minutes stayed at the main menu (30 fps, 3 draws a frame, no
+`pack\core_restofworld` opened) and one was killed by a segfault.
+
 ## 5.2 Missing content — clothes and materials
 
 Most of what is dropped each frame is not a shader problem. In the 02:56 run

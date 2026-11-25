@@ -1972,10 +1972,19 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         // A view of no elements reads the rest of its buffer (`elements_left`):
         // the copy is refreshed and what shaders write goes back for all of it,
         // as for a view of some.
-        // shortcut: the whole rest of the buffer is declared, the title's ring
-        // offsets moving through it every frame; the copy-back keeps its bytes
-        // once per submission, and its parts not held yet (a 174 MB heap the
-        // world declares dozens of times a frame already).
+        // shortcut: the whole rest of the buffer is declared as shaders' to
+        // write, and the title's ring offsets move through it every frame, so
+        // the compare runs over the declared bytes again each submission. What
+        // that costs, measured (MEMORY.md §5.1): the world's 174 MB heap copy
+        // is in the card's memory, where the declaration is one span of 2,618
+        // pieces per submission and no snapshot at all — the card hashes
+        // 10,217 pieces (669 MB) a frame there already inside a 2.1-3.5 ms
+        // phase, and the rest about doubles it. What is fetched and merged back
+        // is only the pieces that differ (115-332 a frame, 7.5-21.8 MB, none of
+        // them the rest's). With the card's copies off
+        // (`VICTORY_CARD_BUFFERS=0`) the same declaration is 171,571,968 bytes
+        // snapshotted and compared on this CPU: 10.3 + 9.7 ms a submission at
+        // 14-15 GB/s, ~80 ms a frame.
         let (base, width) = extent?;
         if address < base || address - base >= width.max(1) {
             return None;
