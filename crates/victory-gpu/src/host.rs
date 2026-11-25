@@ -996,6 +996,27 @@ fn create() -> windows::core::Result<Host> {
                 &mut device,
             )?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = named_adapter() {
+            // `VICTORY_ADAPTER`: the card that was named, with the same
+            // fallback of feature level.
+            let adapter: &IDXGIAdapter = &adapter.cast()?;
+            if let Err(e) = create_device(
+                factory.as_ref(),
+                Some(adapter),
+                D3D_FEATURE_LEVEL_12_2,
+                &mut device,
+            ) {
+                tracing::warn!(
+                    error = %e,
+                    "feature level 12_2 unavailable; falling back to 12_0"
+                );
+                create_device(
+                    factory.as_ref(),
+                    Some(adapter),
+                    D3D_FEATURE_LEVEL_12_0,
+                    &mut device,
+                )?;
+            }
         } else {
             // Feature level 12_2 is where shader model 6.6 and descriptor-heap
             // direct indexing live, which the title's pipelines and root
@@ -1130,6 +1151,58 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             shading,
         })
+    }
+}
+
+/// Whether `name` (an adapter's) is the one `wanted` (`VICTORY_ADAPTER`)
+/// asks for: a part of it, in any case. An empty `wanted` asks for none.
+fn adapter_matches(name: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim().to_lowercase();
+    !wanted.is_empty() && name.to_lowercase().contains(&wanted)
+}
+
+/// `VICTORY_ADAPTER=<part of the adapter's name>` picks the host GPU on a
+/// machine with several (e.g. the one that does not drive the main display,
+/// so a GPU hang resets a different card). Every hardware adapter is logged
+/// so the choice is visible; no match leaves the default adapter, and a
+/// software adapter is never picked.
+fn named_adapter() -> Option<IDXGIAdapter1> {
+    let wanted = std::env::var("VICTORY_ADAPTER").ok()?;
+    if wanted.trim().is_empty() {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut found = None;
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            index += 1;
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let matches = adapter_matches(&name, &wanted);
+            tracing::info!(
+                adapter = %name,
+                vram_mb = desc.DedicatedVideoMemory / (1 << 20),
+                chosen = matches && found.is_none(),
+                "host adapter"
+            );
+            if matches && found.is_none() {
+                found = Some(adapter);
+            }
+        }
+        if found.is_none() {
+            tracing::warn!(wanted = %wanted.trim(), "VICTORY_ADAPTER matched no adapter; using the default");
+        }
+        found
     }
 }
 
@@ -1348,6 +1421,19 @@ mod tests {
     }
 
     use super::*;
+
+    /// `VICTORY_ADAPTER` names a part of a card's name, in any case, and an
+    /// empty or blank switch names none.
+    #[test]
+    fn the_named_adapter_is_matched_by_a_part_of_its_name() {
+        let card = "NVIDIA GeForce RTX 4070";
+        assert!(adapter_matches(card, "4070"));
+        assert!(adapter_matches(card, "rtx 4070"));
+        assert!(adapter_matches(card, "  GeForce  "));
+        assert!(!adapter_matches(card, "7900"));
+        assert!(!adapter_matches(card, ""));
+        assert!(!adapter_matches(card, "   "), "a blank switch picks nothing");
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -7808,8 +7894,20 @@ impl HostList {
         let list = self.deferred();
         let steps: &[Step] = &list.copies;
         let mut at = 0;
+        // Texture refreshes wait here to be done together
+        // (`crate::texture::refresh_all`): before the next step that is not
+        // one of them, a host-side note or a buffer refresh (those neither
+        // write title memory nor read a staging buffer), and when the
+        // list's steps are through.
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         while at < steps.len() {
             let step = &steps[at];
+            if !textures.is_empty()
+                && !matches!(step, Step::Texture(_) | Step::Host(_) | Step::Refresh(..))
+            {
+                crate::texture::refresh_all(&textures);
+                textures.clear();
+            }
             let started = std::time::Instant::now();
             // The steps this one runs, and the microseconds of them a flush
             // took (it is refresh work, counted apart as well).
@@ -7933,7 +8031,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if crate::texture::batched() {
+                            textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     at += 1;
                     continue;
@@ -7948,6 +8050,7 @@ impl HostList {
             PREPARING[0].fetch_add(own, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        crate::texture::refresh_all(&textures);
     }
 }
 
@@ -9107,6 +9210,14 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                );
+            }
+            let [batches, together] =
+                [0, 1].map(|i| crate::texture::BATCHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if batches > 0.0 {
+                tracing::info!(
+                    "textures read in place together per frame: {batches:.1} batches of {:.1} textures, on the threads kept                      for the snapshots (VICTORY_TEXTURE_BATCH=0: one by one)",
+                    together / batches
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);

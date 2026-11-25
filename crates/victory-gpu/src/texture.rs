@@ -64,8 +64,39 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// A refresh that only asked ([`refresh_all`]) found the texture is to be
+    /// read in place: what it had learnt of unseen writes, for the read that
+    /// follows with title memory held still.
+    waiting: Option<bool>,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame a guarded texture found changed without a write seen is
+    /// hashed at every check until, 0 while it is not
+    /// ([`Staging::unseen_write`]).
+    unguarded: u64,
+}
+
+/// Frames a texture found changed without a write seen is hashed at every
+/// check for, and for how many when that happens again inside the window (a
+/// movie's picture changes at every frame, a texture streamed in once).
+const UNGUARDED_FRAMES: u64 = 16;
+const UNGUARDED_MOVIE: u64 = 120;
+
+/// Whether a guarded texture is read at this check: always when the guards
+/// saw a write (`unwritten` false), at its hash turn (`turn`), when it is a
+/// linear picture of one level (`film`: what the processor draws, the planes
+/// of a movie, through views of its own), or while [`unseen_write`] asks for
+/// it (`frame` before `unguarded`). Without the last two, a texture written
+/// where the guards cannot see it was read once in eight frames.
+fn reads_now(unwritten: bool, turn: bool, film: bool, frame: u64, unguarded: u64) -> bool {
+    !unwritten || turn || film || frame < unguarded
+}
+
+/// The frame a texture found changed without a write seen is hashed at every
+/// check until: [`UNGUARDED_FRAMES`] on, or [`UNGUARDED_MOVIE`] when it
+/// changed again inside the window.
+fn unguarded_until(frame: u64, unguarded: u64) -> u64 {
+    frame + if frame < unguarded { UNGUARDED_MOVIE } else { UNGUARDED_FRAMES }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -333,6 +364,81 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let out = f();
     REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     out
+}
+
+/// Whether the texture refreshes of a list are done together at its
+/// submission (`VICTORY_TEXTURE_BATCH=0`: one by one, as before).
+pub(crate) fn batched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// Since the frame line last asked: batches that read in place, and the
+/// textures they read.
+pub(crate) static BATCHES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Reads `waiting` with `read` on the threads kept for the snapshots
+/// (`crate::shadow::wide_run`), returning the bytes read.
+fn read_together<T: Send + Sync + 'static>(
+    waiting: Vec<Arc<T>>,
+    read: impl Fn(&T) -> usize + Send + Sync + 'static,
+) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let read = Arc::new(read);
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = waiting
+        .into_iter()
+        .map(|item| {
+            let total = total.clone();
+            let read = read.clone();
+            Box::new(move || {
+                total.fetch_add(read(&item), Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    total.load(Relaxed)
+}
+
+/// Brings `stagings` up to date ([`Staging::refresh`] for each), reading
+/// those that are read in place together: title memory is held still once
+/// for all of them, and they are hashed and detiled on several threads.
+///
+/// One by one, each waited by itself for the runtime to finish a remapping,
+/// and in the opening cutscene the runtime remaps for most of every frame:
+/// 95% of the 400-1,800 ms a frame the texture step took was that wait (run
+/// `pool_try3`: 770.8 of 802.4 ms, 1,057.7 of 1,079.9). The read itself ran
+/// on the submitting thread alone.
+pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if stagings.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut read = 0;
+    // What the write watch and the guards settle needs nothing held.
+    let mut waiting: Vec<Arc<Staging>> = Vec::new();
+    for staging in stagings {
+        let whole = std::time::Instant::now();
+        match staging.refresh_timed(true) {
+            usize::MAX => waiting.push(staging.clone()),
+            n => read += n,
+        }
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, Relaxed);
+    }
+    if !waiting.is_empty() {
+        let held = std::time::Instant::now();
+        let _mapped = waited(2, crate::watch::title_memory_reading);
+        // The wait is every texture's, where it was each one's.
+        REFRESH_WAITS[3].fetch_add(held.elapsed().as_micros() as u64, Relaxed);
+        BATCHES[0].fetch_add(1, Relaxed);
+        BATCHES[1].fetch_add(waiting.len() as u64, Relaxed);
+        read += read_together(waiting, |staging: &Staging| staging.read_held());
+    }
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
 }
 
 thread_local! {
@@ -732,12 +838,14 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(false);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    /// With `ask`, a texture that is to be read in place is not read:
+    /// [`usize::MAX`] comes back and [`read_held`](Self::read_held) reads it.
+    fn refresh_timed(&self, ask: bool) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -767,17 +875,42 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        //
+        // What the guard cannot see is a movie's pictures: written through
+        // another view at every frame, they were read once in eight frames
+        // on the hash's turn alone. The intro movies keep three pictures of
+        // three planes (3840x2160 and two of 1920x1080, 36 MB in all) and
+        // show them in turn, so what was shown jumped between pictures read
+        // at different moments. Two things answer that: a linear picture of
+        // one level is read at every check (what the processor draws, the
+        // planes of a movie, through views of its own), and a texture whose
+        // hash finds a change the guards did not report is read at every
+        // check for a while ([`unseen_write`]).
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Whether the guards reported no write since the last check.
+        let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let frame = crate::frame::current();
+            let turn = frame
+                .wrapping_add((start >> 16) as u64)
+                .is_multiple_of(HASH_EVERY);
+            // Linear pictures of one level are what the processor draws (the
+            // planes of a movie), through a view of its own.
+            let desc = &self.layout.desc;
+            let film = desc.swizzle == victory_formats::texture::Swizzle::LINEAR && desc.mips == 1;
+            if !reads_now(unwritten, turn, film, frame, last.unguarded) {
                 return 0;
             }
+            unseen = unwritten;
+        }
+        if ask {
+            last.waiting = Some(unseen);
+            return usize::MAX;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -796,6 +929,67 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        self.read_now(last, size, unseen)
+    }
+
+    /// The read a refresh that only asked ([`refresh_timed`] with `ask`) left
+    /// for later; the caller holds title memory still. Returns the bytes
+    /// read.
+    fn read_held(&self) -> usize {
+        let whole = std::time::Instant::now();
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(unseen) = last.waiting.take() else {
+            return 0;
+        };
+        let read = self.read_now(&mut last, self.layout.size as usize, unseen);
+        REFRESH_WAITS[3].fetch_add(
+            whole.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        read
+    }
+
+    /// The texture's memory changed and the guard says nothing wrote it: it
+    /// is hashed at every check for the next frames, the longer the more
+    /// often this happens (a texture streamed in once is soon guarded
+    /// again, a movie's is not).
+    fn unseen_write(&self, last: &mut Last) {
+        let frame = crate::frame::current();
+        last.unguarded = unguarded_until(frame, last.unguarded);
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                // SAFETY: plain data filled in by the query.
+                let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                    unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                unsafe {
+                    windows_sys::Win32::System::Memory::VirtualQuery(
+                        self.memory.cast(),
+                        &mut info,
+                        size_of_val(&info),
+                    )
+                };
+                tracing::info!(
+                    frame,
+                    memory = ?self.memory,
+                    size = self.layout.size,
+                    protection = format_args!("{:#x}", info.Protect),
+                    kind = format_args!("{:#x}", info.Type),
+                    run = info.RegionSize,
+                    desc = ?self.layout.desc,
+                    "a guarded texture changed and no write to it was seen"
+                );
+            }
+        }
+    }
+
+    /// The read of the texture's memory in place and what follows from it:
+    /// the hash, and the detile when it differs from the last. `unseen` says
+    /// the guards reported no write (`[`reads_now`]`). The caller holds
+    /// title memory still (`crate::watch::title_memory_reading`).
+    fn read_now(&self, last: &mut Last, size: usize, unseen: bool) -> usize {
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -839,6 +1033,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                if unseen && last.hash.is_some() {
+                    self.unseen_write(last);
+                }
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -854,6 +1051,9 @@ impl Staging {
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
+        }
+        if unseen && last.hash.is_some() {
+            self.unseen_write(last);
         }
         last.hash = Some(hash);
         self.detile(tiled);
@@ -1685,6 +1885,57 @@ mod run_table_cost {
 }
 
 #[cfg(test)]
+mod unseen_tests {
+    use super::{UNGUARDED_FRAMES, UNGUARDED_MOVIE, reads_now, unguarded_until};
+
+    /// Checks in a row on a texture whose guards see nothing, of which every
+    /// eighth is its hash turn; `film` alone, or an unseen write at every
+    /// check. Returns how many times it was read.
+    fn reads(turn_of: u64, film: bool, unguarded: u64) -> u32 {
+        let mut until = unguarded;
+        let mut reads = 0;
+        for frame in 0..80u64 {
+            let turn = frame.is_multiple_of(turn_of);
+            if !reads_now(true, turn, film, frame, until) {
+                continue;
+            }
+            reads += 1;
+            if unguarded != 0 {
+                until = unguarded_until(frame, until);
+            }
+        }
+        reads
+    }
+
+    /// A linear picture of one level — the planes of a movie, drawn by the
+    /// processor through views of its own — is read at every check although
+    /// no write to the texture was seen and the turn is not its.
+    #[test]
+    fn a_film_is_read_at_every_check() {
+        assert!(!reads_now(true, false, false, 0, 0), "its turn only");
+        assert!(reads_now(true, false, true, 0, 0), "a film");
+        assert!(reads_now(true, true, false, 0, 0), "its turn");
+        assert!(reads_now(false, false, false, 0, 0), "the guards saw a write");
+        assert_eq!(reads(8, false, 0), 10, "its turn, ten times in 80 checks");
+        assert_eq!(reads(8, true, 0), 80);
+    }
+
+    /// A texture found changed without a write seen is read for sixteen
+    /// frames; found again inside that window, for a hundred and twenty (a
+    /// movie changes at every frame, a texture streamed in once does not).
+    #[test]
+    fn an_unseen_write_holds_the_texture_read_for_a_while() {
+        assert_eq!(unguarded_until(100, 0), 100 + UNGUARDED_FRAMES);
+        assert_eq!(unguarded_until(100, 116), 100 + UNGUARDED_MOVIE, "inside the window");
+        assert_eq!(unguarded_until(116, 116), 116 + UNGUARDED_FRAMES, "the window is over");
+        let until = unguarded_until(100, 0);
+        assert!(reads_now(true, false, false, 115, until), "still asked for");
+        assert!(!reads_now(true, false, false, until, 0), "back at its turn");
+        assert_eq!(reads(8, false, 100), 80, "an unseen write at every check");
+    }
+}
+
+#[cfg(test)]
 mod run_table_tests {
     use super::{MAX_RUNS, SHORT_RUN, drop_touching, note_run};
     use std::collections::BTreeMap;
@@ -1783,5 +2034,46 @@ mod subresource_len_tests {
         assert_eq!(subresource_len(0, ROW_PITCH, 4, 1, 2048), 1024);
         // Absurd totals never overflow into a huge length.
         assert_eq!(subresource_len(0, usize::MAX, u32::MAX, u32::MAX, u64::MAX), usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::read_together;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// Every texture of a batch is read once, the bytes are summed, and the
+    /// list is shared: the reads go to the threads kept for the snapshots,
+    /// not all to the submitting thread (which is what one refresh at a time
+    /// did, each taking title memory still on its own).
+    #[test]
+    fn a_batch_is_read_once_each_and_on_several_threads() {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let items: Vec<Arc<(AtomicUsize, usize)>> =
+            (1..=256).map(|n| Arc::new((AtomicUsize::new(0), n))).collect();
+        let seen: Arc<std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>> =
+            Arc::default();
+        let inside = seen.clone();
+        let total = read_together(items.clone(), move |item: &(AtomicUsize, usize)| {
+            item.0.fetch_add(1, Relaxed);
+            inside.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(std::thread::current().id());
+            item.1
+        });
+        assert_eq!(total, (1..=256).sum::<usize>(), "the bytes of every texture");
+        assert!(
+            items.iter().all(|item| item.0.load(Relaxed) == 1),
+            "each texture read once"
+        );
+        let lanes = seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if threads < 2 {
+            println!("skipped: one thread on this machine");
+        } else {
+            assert!(lanes > 1, "read on {lanes} thread(s) of {threads}");
+        }
+        // Nothing to read is no work.
+        assert_eq!(read_together(Vec::<Arc<(AtomicUsize, usize)>>::new(), |_| 1), 0);
     }
 }
