@@ -33,8 +33,15 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// The dynamic slots (view heaps only): the bump cursor and the runs
     /// given back ([`Ring`]). Taken a whole list at a time ([`DynamicList`]):
-    /// the drawing thread never locks this per table.
-    ring: Mutex<Ring>,
+    /// the drawing thread never locks this per table. Shared with
+    /// [`RINGS`], so that a list gives a run back to this ring and not to one
+    /// made where this heap stood.
+    ring: std::sync::Arc<Mutex<Ring>>,
+    /// This heap's identity (`ident`), which the runs a list holds of it name
+    /// ([`Region::heap`]): a counter, so that a heap released and another
+    /// made at its address is another heap, and a stale run is drained onto
+    /// its own or onto nothing.
+    ident: usize,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -692,7 +699,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            ring: Mutex::new(Ring::new(extra)),
+            ring: std::sync::Arc::new(Mutex::new(Ring::new(extra))),
+            ident: next_ident(),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -711,6 +719,10 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // Its runs are given back by its identity while it is alive
+        // ([`release_dynamic`]); after it is dropped the reference no longer
+        // upgrades and a stale run is forgotten.
+        register(h.ident, h.count, &h.ring);
         Some(h)
     }
 
@@ -898,8 +910,62 @@ impl Ring {
     }
 }
 
+/// Identities handed to host heaps ([`HostHeap::ident`]): a counter, never an
+/// address, so that a heap the title released and another it made at the same
+/// address are two heaps and a run of one is never drained onto the other.
+static IDENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn next_ident() -> usize {
+    IDENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The rings of the host heaps alive, by identity: the title slots each heap's
+/// ring starts after, and a reference that does not upgrade once the heap is
+/// gone. A list gives its runs back by the identity it took them under
+/// ([`DynamicList::drain`]), so the slots of a run never land in a heap the
+/// run was not taken from; a heap released meanwhile takes nothing.
+/// (The runs used to name the heap's address, and nothing was given back at
+/// all: the run's address was not the title heap's, which is what the release
+/// path looked up.)
+static RINGS: Mutex<Vec<(usize, u32, std::sync::Weak<Mutex<Ring>>)>> = Mutex::new(Vec::new());
+
+/// Registers `ring` as the ring of host heap `ident`, which starts at `count`
+/// title slots ([`HostHeap::new`]).
+fn register(ident: usize, count: u32, ring: &std::sync::Arc<Mutex<Ring>>) {
+    let mut live = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    live.retain(|(_, _, ring)| ring.strong_count() > 0);
+    live.push((ident, count, std::sync::Arc::downgrade(ring)));
+}
+
+/// The ring of host heap `ident`, if it is still alive, and the title slots it
+/// starts after.
+fn registered(ident: usize) -> Option<(u32, std::sync::Arc<Mutex<Ring>>)> {
+    let live = RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, count, ref ring) = live.iter().find(|&&(id, _, _)| id == ident)?;
+    Some((count, ring.upgrade()?))
+}
+
+/// `n` slots of `ring` from host index `first` (a [`DynamicList::drain`]
+/// named) are free again, `count` the title slots the ring starts after.
+fn give_back(ring: &Mutex<Ring>, count: u32, first: u32, n: u32) {
+    let Some(at) = first.checked_sub(count) else {
+        return;
+    };
+    ring.lock().unwrap_or_else(|e| e.into_inner()).give_back(at, n);
+}
+
+/// Gives back `n` dynamic slots of the host heap whose identity is `ident`,
+/// from host index `first` (a [`DynamicList::drain`] named), free for another
+/// list's run ([`crate::descriptor::release_dynamic`]). A heap that is gone
+/// takes nothing: the run it was given is forgotten with it.
+pub(crate) fn release_dynamic(ident: usize, first: u32, n: u32) {
+    if let Some((count, ring)) = registered(ident) {
+        give_back(&ring, count, first, n);
+    }
+}
+
 /// A run of dynamic slots one list holds: `first` to `end` of the host heap
-/// whose address is `heap` (by host heap, so that a heap released and another
+/// whose identity is `heap` (by host heap, so that a heap released and another
 /// made at its address is another heap), with `next` the slot its next table
 /// starts at.
 struct Region {
@@ -934,7 +1000,7 @@ impl DynamicList {
     /// `n` consecutive dynamic slots of `heap`: the first's host index, taken
     /// until [`DynamicList::drain`].
     fn alloc(&mut self, heap: &HostHeap, n: u32) -> Option<u32> {
-        let id = heap.id();
+        let id = heap.ident();
         if let Some(first) = self.step(id, n) {
             return Some(first);
         }
@@ -976,9 +1042,10 @@ impl DynamicList {
         }
     }
 
-    /// Gives every run back, as (host heap, first slot, slots). The caller
-    /// releases them ([`crate::descriptor::release_dynamic`]): the heap may
-    /// be gone by then.
+    /// Gives every run back, as (host heap identity, first slot, slots). The
+    /// caller releases them ([`crate::descriptor::release_dynamic`]): the
+    /// heap may be gone by then, and a heap made at its address since is
+    /// another identity, so nothing lands in it.
     pub(crate) fn drain(&mut self) -> Vec<(usize, u32, u32)> {
         self.regions
             .drain(..)
@@ -996,9 +1063,11 @@ impl DynamicList {
 const GROWTH: u32 = 4096;
 
 impl HostHeap {
-    /// This heap as a list names it (see [`Region::heap`]).
-    fn id(&self) -> usize {
-        std::ptr::from_ref(self) as usize
+    /// This heap as a list's run names it (see [`Region::heap`]): its
+    /// identity, not its address, so that a stale run of a heap the title
+    /// released is never drained onto a heap made at the same address.
+    fn ident(&self) -> usize {
+        self.ident
     }
 
     /// `len` slots of the ring as (host index, length), to be given back with
@@ -1362,18 +1431,6 @@ impl HostHeap {
                 .insert(index);
         }
         stale
-    }
-
-    /// Gives back `n` dynamic slots from `first` (a host index a
-    /// [`drain`](DynamicList::drain) named), free for another list's run.
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
-        self.ring
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .give_back(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3028,6 +3085,52 @@ mod tests {
         // Spent: the list asks the ring for another run.
         assert_eq!(list.step(7, 1), None);
         assert_eq!(list.step(8, 1), None);
+    }
+
+    /// A heap made where a released one stood is another heap: identities
+    /// come from a counter, so a run a list took under one is never stepped
+    /// through by the other, and the drain names the identity it took the
+    /// run under, not an address.
+    #[test]
+    fn a_heap_made_where_another_stood_gets_another_identity() {
+        let first = next_ident();
+        let second = next_ident();
+        assert!(second > first, "identities are handed out in order");
+        let mut list = DynamicList {
+            regions: vec![Region { heap: first, first: 100, next: 100, end: 200 }],
+        };
+        // The run is the first heap's: the second's tables never come out of
+        // it, though a heap made at the same address would have before.
+        assert_eq!(list.step(second, 1), None);
+        assert_eq!(list.step(first, 1), Some(100));
+        assert_eq!(list.drain(), [(first, 100, 100)]);
+    }
+
+    /// A run is given back to the ring of its own heap only: another heap's
+    /// identity is not answered, and a heap released meanwhile takes nothing
+    /// (its ring is gone, so the run is forgotten rather than landing in a
+    /// heap made at the same address).
+    #[test]
+    fn a_run_is_given_back_to_its_own_heap_only() {
+        let first = next_ident();
+        let ring = std::sync::Arc::new(Mutex::new(Ring::new(64)));
+        register(first, 1_000, &ring);
+        let free = || ring.lock().unwrap().free;
+        assert_eq!(ring.lock().unwrap().take(8), Some((0, 8)));
+        // Host index 1000 is the ring's first dynamic slot.
+        release_dynamic(first, 1_000, 8);
+        assert_eq!(free(), 64, "the run came back");
+        // Another heap's identity, naming slots inside this ring: nothing.
+        let second = next_ident();
+        assert_eq!(ring.lock().unwrap().take(4), Some((8, 4)));
+        release_dynamic(second, 1_008, 4);
+        assert_eq!(free(), 60, "another heap's run landed in this ring");
+        // The heap gone: the run is forgotten (and no address is read as a
+        // heap, as the release path used to).
+        release_dynamic(first, 1_008, 4);
+        assert_eq!(free(), 64);
+        drop(ring);
+        release_dynamic(first, 1_000, 8);
     }
 
     /// Runs never overlap, whatever the order tables are asked for and given

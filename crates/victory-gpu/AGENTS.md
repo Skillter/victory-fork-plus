@@ -34,7 +34,10 @@
 - Per-draw tables come from the dynamic ring in `descriptor::host`; a request
   that cannot fit must be refused, never served from unbuilt slots.
 - A command list bumps through a run it holds (`DynamicList`), given back whole
-  at submission; the ring is never walked per table.
+  at submission; the ring is never walked per table. A run names its heap by
+  identity, a counter (`HostHeap::ident`) resolved in `descriptor::host::RINGS`,
+  never the heap's address: a heap released and another made where it stood are
+  two heaps, and a run goes back to the ring it came from or to none.
 - Root arguments are cached per list (`draw::RootArgs`) and re-issued only when
   the resolved value changes; a root-signature change or a new list drops them.
 - The capped heap points past-the-end reads at a null slot for a reason: a
@@ -70,9 +73,13 @@
 ## Textures
 
 - `resource::room` refuses only when the card is at its ceiling; a refusal is
-  now answered by reclaiming a copy that one idle slot alone holds, and a slot
-  seen twice in 64 frames is protected from the sweep. Never raise the ceiling
-  to make a refusal go away; reclaim or admit instead.
+  answered by reclaiming a copy that one idle slot alone holds. A slot seen
+  twice in 64 frames is protected from the sweep, and protection lapses after
+  600 frames without a sample of it (`resource::protected_at`): a set that
+  could only grow filled the budget and left `room` refusing for the rest of
+  the run. The admission line counts copies the sweep manages, never one the
+  host wrote (a render target keeps itself). Never raise the ceiling to make a
+  refusal go away; reclaim or admit instead.
 - Staging copies are capped in system RAM (`VICTORY_STAGING_MB`), coldest and
   not-held first: re-admitting from staging is one DMA, decoding the title's
   format is far more expensive.
