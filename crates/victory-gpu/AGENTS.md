@@ -66,6 +66,12 @@
 - The swap chain is sized from the window's client rectangle, never the frame,
   and the frame is drawn into it by the present pass with a viewport that keeps
   its shape (letterbox): a Win32 flip chain's `DXGI_SCALING_STRETCH` cannot.
+- The pipelines folder keeps the live library and one older generation.
+  `library::prune` drops a `.tmp` that no save finished and any generation
+  unread for 30 days, and never the file this run opened or mapped.
+- `pipeline census` prints at the save a run ends with (every save in a
+  diagnostics build); `bytes_per_pipeline_made` is the library's growth over
+  the pipelines this run made, never the whole library over this run's count.
 
 ## Textures
 
