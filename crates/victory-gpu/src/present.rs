@@ -278,6 +278,19 @@ pub(crate) fn pick(
     if shaped.is_empty() {
         return Err(Why::Nothing);
     }
+    // A frame is never larger than the one it is shown in: the title draws it
+    // at its render size and upscales, or draws it at the presented size. A
+    // larger target of the same shape is a shadow map or a UI layer, and
+    // showing it shows the wrong picture.
+    let presented = u64::from(size.0) * u64::from(size.1);
+    let fits: Vec<usize> = shaped
+        .iter()
+        .copied()
+        .filter(|&i| {
+            u64::from(since.targets[i].width) * u64::from(since.targets[i].height) <= presented
+        })
+        .collect();
+    let shaped = if fits.is_empty() { shaped } else { fits };
     // A target a shader read is the frame's own source; failing that, the
     // largest of the frame's shape.
     let read: Vec<usize> = shaped
@@ -453,6 +466,26 @@ mod tests {
             target(0x30, 640, 360, false),
         ];
         assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(1));
+    }
+
+    /// A target larger than the frame is never the frame: the world is drawn
+    /// at 1280x720 and upscaled, so a written 3840x2160 target of the same
+    /// shape is a layer over it, not the picture.
+    #[test]
+    fn a_target_larger_than_the_frame_is_not_the_frame() {
+        let targets = vec![
+            target(0x10, 1280, 720, false),
+            target(0x20, 3840, 2160, false),
+        ];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
+    }
+
+    /// When every written target is larger than the frame, the largest is
+    /// still shown rather than nothing.
+    #[test]
+    fn a_larger_target_is_shown_when_it_is_all_there_is() {
+        let targets = vec![target(0x20, 3840, 2160, false)];
+        assert_eq!(pick((1920, 1080), &since(false, targets), |_| true), Ok(0));
     }
 
     /// Another shape is another picture: a shadow atlas or a 4:3 probe of the
