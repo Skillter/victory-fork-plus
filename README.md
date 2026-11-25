@@ -56,14 +56,18 @@ Speed and memory:
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
+- Placed textures are staged in bounded bursts (192 MB and 250 ms of staging per window by default, three times those while a backlog of a thousand waits: `VICTORY_TEXTURE_STAGE_MB`, `VICTORY_TEXTURE_STAGE_MS`, `VICTORY_TEXTURE_CATCHUP=0`); the host copies of filled textures are let go after 2-10 s idle, sooner when the card has less free memory (was a fixed 5 s); a texture uploaded whole is looked at again at 4, 12, 40, 120 and 400 frames and re-uploaded if the title filled its memory later (`VICTORY_HEAP_RECHECK=0`); a texture view past the memory of the host view heap reads a null slot instead of faulting.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...),
+and some translate a shader another way (`VICTORY_FIRSTLANE_OWN=1` takes a
+half-wave's own first lane where the translator would otherwise refuse the
+shader; own shader cache entries). Each is described in a comment where it is
+read.
 
 ### Known problems
 
