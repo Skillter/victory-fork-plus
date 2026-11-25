@@ -84,6 +84,20 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// Waits that ended, and the microseconds they slept, since the last call
+/// to [`pacing`] (all threads together). A menu that runs at half its rate
+/// waits two ticks a frame; this is where that shows.
+static PACING: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The frame waits since the last call: how many, and the microseconds they
+/// slept between them.
+pub(crate) fn pacing() -> (u64, u64) {
+    (
+        PACING[0].swap(0, Ordering::Relaxed),
+        PACING[1].swap(0, Ordering::Relaxed),
+    )
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -150,6 +164,8 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    PACING[0].fetch_add(1, Ordering::Relaxed);
+    PACING[1].fetch_add(wait.min(limit).as_micros() as u64, Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

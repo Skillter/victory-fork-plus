@@ -6810,6 +6810,16 @@ impl Meter {
             // lost its table in a release run (run 2026-11-25 04:38 lost
             // 4,359 a frame behind a single line).
             crate::descriptor::host::dynamic_line(frames);
+            // How the frame clock paced this window: a menu that runs at half
+            // its rate sits through two ticks a frame, and this names it.
+            let (waits, slept) = crate::frame::pacing();
+            if waits > 0 {
+                tracing::info!(
+                    "frame waits: {:.1} a frame sleeping {:.2} ms each (all threads)",
+                    waits as f64 / frames,
+                    slept as f64 / 1e3 / waits as f64
+                );
+            }
             // The reasons, in the builds that do not print the frame listing:
             // the same drops, split by why each was not run. Diagnostics
             // builds split them by the detail worth formatting there (shader
