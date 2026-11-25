@@ -87,6 +87,15 @@
 - `pipeline census` prints at the save a run ends with (every save in a
   diagnostics build); `bytes_per_pipeline_made` is the library's growth over
   the pipelines this run made, never the whole library over this run's count.
+- The host parses the whole library at every start, and its pages are the
+  file's: a cold 753 MB library cost 9.4 s of page faults (80 MB/s) against
+  49 ms of parse with the bytes resident (`VICTORY_LIBRARY_BENCH`). So
+  `library` reads the mapping ahead in one pass before the parse
+  (`VICTORY_LIBRARY_PREFETCH`) and keeps the phases apart in the
+  `pipeline library load` line: check those three figures before changing how
+  the library is opened. The only lever on what a start must read is a
+  smaller file, and `VICTORY_LIBRARY_MB` (`library::room`) is where a run
+  stops adding to it.
 
 ## Textures
 
