@@ -1070,6 +1070,60 @@ mod tests {
         })
         .unwrap()
     }
+    /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
+    /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
+    /// written with (the compare's, EXEC's on entry). Now the store refuses;
+    /// without the write it translates.
+    #[test]
+    fn a_mask_whose_high_dword_is_rewritten_is_refused() {
+        // v_cmp_eq_u32 vcc, 0, v0; v_mov_b32 v2, 11; v_cndmask_b32 v1, 0, v2, vcc
+        let select = [0x7D84_0080, 0x7E04_028B, 0x0202_0480];
+        // The same with v_add_co_ci_u32 v1, vcc, 0, v2, vcc.
+        let carry = [0x7D84_0080, 0x7E04_028B, 0x5002_0480];
+        // v_mov_b32 v1, 7
+        let mov = [0x7E02_0287];
+        for body in [&select[..], &carry, &mov] {
+            stores_v1(body).unwrap();
+        }
+        // s_mov_b32 vcc_hi, 0 after the compare.
+        let select_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x0202_0480];
+        let carry_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x5002_0480];
+        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7, then the same after
+        // s_mov_b64 s[2:3], exec.
+        let exec_hi = [0xBEFF_0380, 0x7E02_0287];
+        let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
+        for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
+            assert!(stores_v1(body).is_err(), "{body:x?}");
+        }
+    }
+
+    /// `ds_bpermute_b32` stores nothing: each lane reads the lane its address
+    /// names. It stopped as "LDS the program does not allocate" (sticky lips)
+    /// or "an LDS operation" (the checkerboard shadow masks).
+    #[test]
+    fn a_backward_permute_reads_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// `v_cvt_f32_f64`: a console double in a register pair, rounded to a
+    /// float. Three compute shaders stopped at the opcode by name, all of
+    /// them feeding the result to `v_rcp_f32`.
+    #[test]
+    fn a_double_register_pair_rounds_to_a_float() {
+        // v_cvt_f32_f64 v2, v0: v0:v1 is the thread id, read as a double.
+        stores_v1(&[0x7E04_1F00]).unwrap();
+    }
+
+    /// `v_permlanex16_b32`: each lane reads the lane 16 away within its
+    /// 32-lane block, at the offset its half's selector names. One compute
+    /// shader's 64-lane max/min reduction stopped at the opcode by name.
+    #[test]
+    fn a_permutation_across_the_16_lane_halves_reads_the_other_half() {
+        // v_permlanex16_b32 v1, v0, 0, 0
+        stores_v1(&[0xD778_0001, 0x0201_0100]).unwrap();
+    }
+
     /// Whether the program declares the function `name` (a `dx.op` name).
     fn declares(l: &crate::emit::lower::Lowered, name: &str) -> bool {
         l.declared.iter().any(|n| n == name)
