@@ -10,7 +10,7 @@ use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{HostShader, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -466,6 +466,301 @@ fn log_graphics_refusal(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, shaders: &[Ar
     );
 }
 
+/// The `PSV0` stage of a compute shader. The container numbers programs as
+/// `victory_shader` does: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+const PSV_COMPUTE: u8 = 5;
+/// As [`PSV_COMPUTE`], for the mesh shader of a mesh pipeline.
+const PSV_MESH: u8 = 13;
+
+/// What a stage's `PSV0` part declares: the stage it was built for, its
+/// thread group, and the resources it names as (kind, space, register) in
+/// the numbering `PSV0` itself uses — 1 sampler, 2 CBV, 4 raw SRV, 7 raw
+/// UAV.
+struct Psv0 {
+    stage: u8,
+    threads: [u32; 3],
+    bindings: Vec<(u32, u32, u32)>,
+}
+
+/// A little-endian word of `data`, when it holds one.
+fn word(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..at + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")))
+}
+
+/// Reads `PSV0`: a size for its runtime info, that info, then the bindings
+/// as a count, a record stride and one record each. Every read is checked
+/// and the error says which field of the part is inconsistent, so a refused
+/// pipeline is never left with a field nobody looked at.
+fn psv0(data: &[u8]) -> Result<Psv0, String> {
+    let info = word(data, 0).ok_or("its PSV0 holds no runtime info size")? as usize;
+    if !(48..=1024).contains(&info) {
+        return Err(format!("its PSV0 declares {info} bytes of runtime info"));
+    }
+    // Runtime info version 2: the stage at 24, the thread group at 36.
+    let stage = *data
+        .get(4 + 24)
+        .ok_or("its PSV0 runtime info is truncated")?;
+    let mut threads = [0u32; 3];
+    for (k, at) in [36, 40, 44].into_iter().enumerate() {
+        threads[k] = word(data, 4 + at).ok_or("its PSV0 runtime info is truncated")?;
+    }
+    let mut bindings = Vec::new();
+    let at = 4 + info;
+    if let Some(count) = word(data, at) {
+        let count = count as usize;
+        if count > 64 {
+            return Err(format!(
+                "its PSV0 declares {count} bindings, more than the 64 a root signature can name"
+            ));
+        }
+        if count > 0 {
+            let stride = word(data, at + 4).ok_or("its PSV0 bindings have no stride")? as usize;
+            if !(12..=256).contains(&stride) {
+                return Err(format!("its PSV0 declares a binding stride of {stride} bytes"));
+            }
+            for i in 0..count {
+                let at = at + 8 + i * stride;
+                match (word(data, at), word(data, at + 4), word(data, at + 8)) {
+                    (Some(kind), Some(space), Some(register)) => {
+                        bindings.push((kind, space, register));
+                    }
+                    _ => return Err("its PSV0 binding records are truncated".to_owned()),
+                }
+            }
+        }
+    }
+    Ok(Psv0 {
+        stage,
+        threads,
+        bindings,
+    })
+}
+
+/// A `PSV0` binding kind's name.
+fn binding_kind(kind: u32) -> String {
+    match kind {
+        1 => "sampler".to_owned(),
+        2 => "cbv".to_owned(),
+        4 => "srv".to_owned(),
+        7 => "uav".to_owned(),
+        n => format!("kind {n}"),
+    }
+}
+
+/// A root parameter as the log prints it, and the bindings it holds in the
+/// numbering [`Psv0`] uses (a constants parameter is the user data cbuffer at
+/// `b<register>` in its space).
+fn param_facts(p: &D3D12_ROOT_PARAMETER1) -> (String, Vec<(u32, u32, u32)>) {
+    if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS {
+        // SAFETY: every parameter we build sets the member its
+        // `ParameterType` names, and this arm reads that member only.
+        let c = unsafe { p.Anonymous.Constants };
+        return (
+            format!(
+                "constants {}:{} {}dw",
+                c.RegisterSpace, c.ShaderRegister, c.Num32BitValues
+            ),
+            vec![(2, c.RegisterSpace, c.ShaderRegister)],
+        );
+    }
+    let kind = if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV {
+        2
+    } else if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV {
+        4
+    } else if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV {
+        7
+    } else if p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE {
+        return (format!("parameter of type {}", p.ParameterType.0), Vec::new());
+    } else {
+        0
+    };
+    if kind != 0 {
+        // SAFETY: as above; a leaf parameter holds a descriptor.
+        let d = unsafe { p.Anonymous.Descriptor };
+        return (
+            format!("{} {}:{}", binding_kind(kind), d.RegisterSpace, d.ShaderRegister),
+            vec![(kind, d.RegisterSpace, d.ShaderRegister)],
+        );
+    }
+    // SAFETY: as above; a table parameter holds a range list.
+    let t = unsafe { p.Anonymous.DescriptorTable };
+    let n = t.NumDescriptorRanges as usize;
+    if n == 0 || t.pDescriptorRanges.is_null() {
+        return (format!("table of {n} ranges"), Vec::new());
+    }
+    // SAFETY: the description names `n` ranges and the caller keeps them
+    // alive while the root signature is made, which is what this reports on.
+    let ranges = unsafe { std::slice::from_raw_parts(t.pDescriptorRanges, n) };
+    let held: Vec<(u32, u32, u32)> = ranges
+        .iter()
+        .map(|r| {
+            let kind = if r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV {
+                2
+            } else if r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV {
+                7
+            } else if r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER {
+                1
+            } else {
+                4
+            };
+            (kind, r.RegisterSpace, r.BaseShaderRegister)
+        })
+        .collect();
+    let names: Vec<String> = held
+        .iter()
+        .map(|&(kind, space, register)| format!("{} {space}:{register} (table)", binding_kind(kind)))
+        .collect();
+    (names.join(","), held)
+}
+
+/// A stage's container as a refusal prints it, what of the bytes is provably
+/// invalid, and the resources `PSV0` names.
+struct StageFacts {
+    /// `container=... dxil=... psv0=... sfi0=...`
+    text: String,
+    /// What is provably invalid about the bytes; empty when nothing is.
+    causes: Vec<String>,
+    /// The resources `PSV0` names, when its binding records could be read.
+    bindings: Option<Vec<(u32, u32, u32)>>,
+}
+
+/// Reads a stage's DXIL container: the part table, the `DXIL` part's own two
+/// lengths and bitcode magic, `SFI0`'s feature bits and `PSV0`'s stage,
+/// thread group and bindings. `stage` and `threads` say what the pipeline
+/// needs of `PSV0` (compute and mesh declare a thread group; the graphics
+/// stages do not).
+fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
+    let mut facts = StageFacts {
+        text: String::new(),
+        causes: Vec::new(),
+        bindings: None,
+    };
+    let container = match victory_shader::Container::parse(code) {
+        Ok(c) => c,
+        Err(e) => {
+            facts.text = "container=none".to_owned();
+            facts.causes.push(format!("its container is not readable: {e}"));
+            return facts;
+        }
+    };
+    let parts: Vec<String> = container
+        .parts
+        .iter()
+        .map(|p| format!("{}:{}", p.fourcc, p.data.len()))
+        .collect();
+    facts.text = format!(
+        "container=v{}.{} of {} bytes parts=[{}]",
+        container.version.0,
+        container.version.1,
+        code.len(),
+        parts.join(",")
+    );
+    match container.part(victory_shader::FourCC::DXIL) {
+        None => facts
+            .causes
+            .push("its container has no DXIL part".to_owned()),
+        Some(part) => {
+            let dxil = part.data;
+            if dxil.len() < 24 {
+                facts.causes.push(format!(
+                    "its DXIL part is {} bytes, shorter than its 24-byte header",
+                    dxil.len()
+                ));
+            } else if &dxil[8..12] != b"DXIL" {
+                facts.causes
+                    .push("its DXIL part has no DXIL code at its offset 8".to_owned());
+            } else {
+                // The part's own size is in dwords, at 4, and the length of
+                // the bitcode that follows the 24-byte header is at 20: both
+                // must agree with the part the container hands over.
+                let size = word(dxil, 4).unwrap_or(0) as usize * 4;
+                let bitcode = word(dxil, 20).unwrap_or(0) as usize;
+                facts
+                    .text
+                    .push_str(&format!(" dxil={bitcode} of {} bytes", dxil.len()));
+                if size > dxil.len() {
+                    facts.causes.push(format!(
+                        "its DXIL part declares {size} bytes and the container gives it {}",
+                        dxil.len()
+                    ));
+                } else if 24 + bitcode > dxil.len() {
+                    facts.causes.push(format!(
+                        "its DXIL part declares {bitcode} bytes of bitcode and holds {}",
+                        dxil.len() - 24
+                    ));
+                } else if !dxil[24..].starts_with(&[0x42, 0x43, 0xc0, 0xde]) {
+                    facts
+                        .causes
+                        .push("its bitcode does not start with the LLVM bitcode magic".to_owned());
+                }
+            }
+        }
+    }
+    if let Some(part) = container.part(victory_shader::FourCC::SFI0) {
+        let features = word(part.data, 0).unwrap_or(0) as u64
+            | (word(part.data, 4).unwrap_or(0) as u64) << 32;
+        facts.text.push_str(&format!(" sfi0={features:#x}"));
+    }
+    match container.part(victory_shader::FourCC::PSV0) {
+        None => facts
+            .causes
+            .push("its container has no PSV0 part".to_owned()),
+        Some(part) => match psv0(part.data) {
+            Err(e) => facts.causes.push(e),
+            Ok(psv) => {
+                let names: Vec<String> = psv
+                    .bindings
+                    .iter()
+                    .map(|&(kind, space, register)| {
+                        format!("{} {space}:{register}", binding_kind(kind))
+                    })
+                    .collect();
+                facts.text.push_str(&format!(
+                    " psv0=stage={} threads={}x{}x{} bindings=[{}]",
+                    psv.stage, psv.threads[0], psv.threads[1], psv.threads[2], names.join(",")
+                ));
+                if psv.stage != stage {
+                    facts.causes.push(format!(
+                        "its PSV0 declares stage {} where the pipeline is stage {stage}",
+                        psv.stage
+                    ));
+                }
+                if threads && psv.threads.contains(&0) {
+                    facts.causes.push(format!(
+                        "its PSV0 declares a thread group of {}x{}x{}",
+                        psv.threads[0], psv.threads[1], psv.threads[2]
+                    ));
+                }
+                facts.bindings = Some(psv.bindings);
+            }
+        },
+    }
+    facts
+}
+
+/// What closes a refusal no CPU-side re-check can name: the code itself is
+/// the only input left, and the driver owns its reading. It also says that
+/// nothing is retried, which is the decision this path makes where the
+/// graphics path turns a missing DSV off: every field here is one the
+/// console's own state forces, and every parameter is made from a binding
+/// the same translation declared, so there is nothing to drop or to add.
+const CLOSES: &str = "nothing in the description or in the bytes of its shaders is invalid, so the \
+     driver's compile of the code is what is left, and only a diagnostics build's debug layer, \
+     VICTORY_D3D12_DRED, or VICTORY_SHADER_SAVE=<dir> with dxc.exe -dumpbin on the saved .dxil \
+     names it; nothing is retried, since every field is one the console's own state forces and \
+     every parameter is made from a binding this code declares";
+
+/// The causes as one line of log text: what is provably invalid, or `no cause
+/// known` and what closes it.
+fn cause_text(causes: &[String]) -> String {
+    if causes.is_empty() {
+        format!("no cause known ({CLOSES})")
+    } else {
+        causes.join("; ")
+    }
+}
+
 /// As [`log_graphics_refusal`], for a mesh pipeline: the same fields, from
 /// the stream's state.
 fn log_mesh_refusal(
@@ -476,6 +771,17 @@ fn log_mesh_refusal(
     shaders: &[Arc<Shader>],
 ) {
     let used = g.targets.NumRenderTargets.min(8) as usize;
+    let facts = stage_facts(&code_bytes(&ms), PSV_MESH, true);
+    let mut causes = invalid_combinations(
+        ("mesh", stage_len(&ms)),
+        true,
+        g.depth_format,
+        depth,
+        g.sample_mask,
+        g.samples,
+        &g.targets,
+    );
+    causes.extend(facts.causes);
     tracing::warn!(
         ?shaders,
         ms = ?stage_len(&ms),
@@ -494,38 +800,124 @@ fn log_mesh_refusal(
         blend = blend_writes(&g.blend, g.targets.NumRenderTargets),
         node_mask = 0,
         flags = 0,
-        suspected = ?invalid_combinations(
-            ("mesh", stage_len(&ms)),
-            true,
-            g.depth_format,
-            depth,
-            g.sample_mask,
-            g.samples,
-            &g.targets,
-        ),
+        container = %facts.text,
+        cause = %cause_text(&causes),
         "host mesh pipeline refused: the fields D3D12 validates"
     );
 }
 
-/// As [`log_graphics_refusal`], for a compute description: a shader, a root
-/// signature, a node mask and flags are all D3D12 validates there.
-fn log_compute_refusal(desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC, shaders: &[Arc<Shader>]) {
-    let mut suspected = Vec::new();
-    if desc.pRootSignature.is_none() {
-        suspected.push("no root signature".to_owned());
+/// The line a compute refusal logs: every field of the description, the code
+/// and the root signature it was given, what that code's container holds, and
+/// the causes the re-check can name — `no cause known` and what closes it
+/// when none of those is provably invalid.
+///
+/// The list this used to print (`suspected`) named two things a compute
+/// description cannot be wrong about here: [`HostPipeline::new`] makes the
+/// signature itself and returns before this when that fails, and the code is
+/// the translation of a shader that translated. So it was empty for every
+/// real refusal, while every field D3D12 can reject of a compute pipeline
+/// lives in the bytes of the shader and not in the description's four fields.
+fn compute_refusal(
+    desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    root: Option<&[u8]>,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: usize,
+    shader: Option<&HostShader>,
+) -> String {
+    let code = code_bytes(&desc.CS);
+    let facts = stage_facts(&code, PSV_COMPUTE, true);
+    let mut causes = Vec::new();
+    let (root_bytes, root_hash) = match root {
+        Some(bytes) if !bytes.is_empty() => (
+            bytes.len().to_string(),
+            blake3::hash(bytes).to_hex()[..8].to_owned(),
+        ),
+        _ => {
+            causes.push("no root signature".to_owned());
+            (0.to_string(), "none".to_owned())
+        }
+    };
+    if desc.CS.pShaderBytecode.is_null() || desc.CS.BytecodeLength == 0 {
+        causes.push("no compute shader".to_owned());
     }
-    if stage_len(&desc.CS).is_none() {
-        suspected.push("no compute shader".to_owned());
+    causes.extend(facts.causes);
+    let mut names = Vec::with_capacity(params.len());
+    let mut held: Vec<(u32, u32, u32)> = Vec::new();
+    for p in params {
+        let (name, bindings) = param_facts(p);
+        names.push(name);
+        held.extend(bindings);
     }
-    tracing::warn!(
-        ?shaders,
-        cs = ?stage_len(&desc.CS),
-        root_signature = desc.pRootSignature.is_some(),
-        node_mask = desc.NodeMask,
-        flags = desc.Flags.0,
-        suspected = ?suspected,
-        "host compute pipeline refused: the fields D3D12 validates"
+    if let Some(bindings) = &facts.bindings {
+        for &(kind, space, register) in bindings {
+            // A static sampler is the shader's own declaration, not one of
+            // the draw's root arguments.
+            if kind == 1 || held.contains(&(kind, space, register)) {
+                continue;
+            }
+            causes.push(format!(
+                "its PSV0 declares {} space {space} register {register} and no root parameter names it",
+                binding_kind(kind)
+            ));
+        }
+    }
+    // Parameters the shader never reads are legal, and are what a fallback
+    // would drop; there is nothing to drop here, since every parameter is
+    // made from a binding the same translation declared.
+    let unused = match &facts.bindings {
+        Some(bindings) => held.iter().filter(|b| !bindings.contains(b)).count(),
+        None => 0,
+    };
+    let mut line = format!(
+        "cs={} root_bytes={root_bytes} root_hash={root_hash} root_flags={:#x} params={} samplers={} \
+         node_mask={} flags={} cached_pso={} {}",
+        code.len(),
+        root_flags(true).0,
+        params.len(),
+        samplers,
+        desc.NodeMask,
+        desc.Flags.0,
+        u8::from(!desc.CachedPSO.pCachedBlob.is_null()),
+        facts.text,
     );
+    if let Some(s) = shader {
+        let slots = |slots: &[u8]| {
+            slots
+                .iter()
+                .map(|&r| u32::from(r).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        // Root views are declared in space 1 (`ROOT_CBV_SPACE`), user data
+        // at `b0` in space 0.
+        line.push_str(&format!(
+            " declared=user_data={}dw cbvs=[{}] srvs=[{}] uavs=[{}] samplers={}",
+            s.user_data_dwords(),
+            slots(&s.root_cbvs),
+            slots(&s.root_srvs),
+            slots(&s.root_uavs),
+            s.static_samplers.len(),
+        ));
+    }
+    line.push_str(&format!(" signature=[{}]", names.join(",")));
+    if unused > 0 {
+        line.push_str(&format!(" parameters_the_code_does_not_name={unused}"));
+    }
+    line.push_str(&format!(" cause={}", cause_text(&causes)));
+    line
+}
+
+/// As [`log_graphics_refusal`], for a compute description.
+fn log_compute_refusal(
+    desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    root: Option<&[u8]>,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: usize,
+    shader: Option<&HostShader>,
+    shaders: &[Arc<Shader>],
+) {
+    let report = compute_refusal(desc, root, params, samplers, shader);
+    tracing::warn!(?shaders, "host compute pipeline refused: {report}");
 }
 
 impl HostPipeline {
@@ -781,7 +1173,14 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                    log_compute_refusal(&desc, shaders);
+                    log_compute_refusal(
+                        &desc,
+                        Some(&root_blob),
+                        &params,
+                        samplers.len(),
+                        bound.first().and_then(|s| s.shader.translated()).map(|t| &t.host),
+                        shaders,
+                    );
                     host.log_messages();
                     // Nothing here is ours to change: the shader, the root
                     // signature and the flags are what the title asked for,
@@ -1361,6 +1760,20 @@ pub(crate) fn root_signature_counts() -> (u64, u64) {
 static ROOT_HITS: AtomicU64 = AtomicU64::new(0);
 static ROOT_CREATED: AtomicU64 = AtomicU64::new(0);
 
+/// The flags every signature this module makes carries: the input layout only
+/// where a stage draws, and both heaps directly indexed, which is how the
+/// translated code reaches a descriptor it was given the address of.
+fn root_flags(compute: bool) -> D3D12_ROOT_SIGNATURE_FLAGS {
+    let input = if compute {
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    };
+    input
+        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED
+}
+
 /// The root signature the parameters and samplers describe, and its
 /// serialised bytes. A signature whose bytes this run already has is handed
 /// out again rather than created anew.
@@ -1370,11 +1783,6 @@ fn root_signature(
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Arc<Vec<u8>>)> {
-    let input = if compute {
-        D3D12_ROOT_SIGNATURE_FLAG_NONE
-    } else {
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-    };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1383,9 +1791,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: root_flags(compute),
             },
         },
     };
@@ -1576,6 +1982,243 @@ mod tests {
                 "no vertex shader",
                 "a sample mask of zero"
             ]
+        );
+    }
+
+    /// The `PSV0` the emitter writes: 48 bytes of runtime info (the stage at
+    /// 24, the thread group at 36), then the bindings as a count, a stride
+    /// and one record each.
+    fn psv0_bytes(stage: u8, threads: [u32; 3], bindings: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut info = [0u8; 48];
+        info[24] = stage;
+        for (k, n) in threads.into_iter().enumerate() {
+            info[36 + 4 * k..40 + 4 * k].copy_from_slice(&n.to_le_bytes());
+        }
+        let mut out = 48u32.to_le_bytes().to_vec();
+        out.extend(info);
+        out.extend((bindings.len() as u32).to_le_bytes());
+        if !bindings.is_empty() {
+            out.extend(24u32.to_le_bytes());
+            for &(kind, space, register) in bindings {
+                for n in [kind, space, register, register, 11, 0] {
+                    out.extend(n.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// A `DXBC` container of these parts, as `victory_shader::emit` builds
+    /// one: a header, the part table, then each part's header and data.
+    fn container_bytes(parts: Vec<(&[u8; 4], Vec<u8>)>) -> Vec<u8> {
+        let table = 0x20 + 4 * parts.len();
+        let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend(b"DXBC");
+        out.extend([0u8; 16]);
+        out.extend(1u16.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend((total as u32).to_le_bytes());
+        out.extend((parts.len() as u32).to_le_bytes());
+        let mut offset = table;
+        for (_, d) in &parts {
+            out.extend((offset as u32).to_le_bytes());
+            offset += 8 + d.len();
+        }
+        for (fourcc, d) in &parts {
+            out.extend(*fourcc);
+            out.extend((d.len() as u32).to_le_bytes());
+            out.extend(d);
+        }
+        out
+    }
+
+    /// A `DXIL` part: the 24-byte header the emitter writes (a dword size,
+    /// the four-character code, then the bitcode's offset and length), then
+    /// bitcode that only has to start with the magic.
+    fn dxil_part(bitcode: &[u8]) -> Vec<u8> {
+        let mut out = ((5u32 << 16) | 0x66).to_le_bytes().to_vec();
+        out.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
+        out.extend(b"DXIL");
+        out.extend(0x106u32.to_le_bytes());
+        out.extend(16u32.to_le_bytes());
+        out.extend((bitcode.len() as u32).to_le_bytes());
+        out.extend(bitcode);
+        out
+    }
+
+    /// LLVM bitcode: the magic, then nothing the re-check reads.
+    const BITCODE: [u8; 8] = [0x42, 0x43, 0xc0, 0xde, 0, 0, 0, 0];
+
+    fn constants_param(space: u32, register: u32, dwords: u32) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: register,
+                    RegisterSpace: space,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }
+    }
+
+    fn uav_param(space: u32, register: u32) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: register,
+                    RegisterSpace: space,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }
+    }
+
+    /// A translated compute shader reading these user-data dwords and root
+    /// UAVs.
+    fn compute_shader(user_data: u32, uavs: &[u8]) -> HostShader {
+        HostShader {
+            stage: victory_shader::HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: (0..user_data)
+                .map(|index| victory_shader::emit::UserData {
+                    index,
+                    slot: 0,
+                    root: victory_shader::RootType::Constants,
+                    dword: 0,
+                })
+                .collect(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: uavs.to_vec(),
+            root_indexed_views: Vec::new(),
+        }
+    }
+
+    /// A compute refusal names the fields it read and the values of the bytes
+    /// it was given, and says `no cause known` when none of them is invalid —
+    /// it used to print an empty list that named nothing.
+    #[test]
+    fn a_compute_refusal_names_its_fields_or_says_no_cause_is_known() {
+        let psv = psv0_bytes(5, [8, 8, 1], &[(2, 0, 0), (7, 1, 7)]);
+        let container = container_bytes(vec![
+            (b"SFI0", vec![0u8; 8]),
+            (b"PSV0", psv),
+            (b"DXIL", dxil_part(&BITCODE)),
+        ]);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&container),
+            ..Default::default()
+        };
+        // The signature of a shader that reads u7 and 16 dwords of user data.
+        let params = [constants_param(0, 0, 16), uav_param(1, 7)];
+        let shader = compute_shader(16, &[7]);
+        let root: &[u8] = &[0xc0, 0x0f];
+        let line = compute_refusal(&desc, Some(root), &params, 0, Some(&shader));
+        assert!(line.contains("cause=no cause known ("), "{line}");
+        assert!(line.contains(&format!("cs={}", container.len())), "{line}");
+        assert!(
+            line.contains(&format!(
+                "root_bytes=2 root_hash={}",
+                &blake3::hash(root).to_hex()[..8]
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("params=2 samplers=0 node_mask=0 flags=0 cached_pso=0"),
+            "{line}"
+        );
+        assert!(line.contains("root_flags=0xc00"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "container=v1.0 of {} bytes parts=[SFI0:8,PSV0:",
+                container.len()
+            )),
+            "{line}"
+        );
+        assert!(line.contains("psv0=stage=5 threads=8x8x1"), "{line}");
+        assert!(line.contains("bindings=[cbv 0:0,uav 1:7]"), "{line}");
+        assert!(
+            line.contains("declared=user_data=16dw cbvs=[] srvs=[] uavs=[7]"),
+            "{line}"
+        );
+        assert!(
+            line.contains("signature=[constants 0:0 16dw,uav 1:7]"),
+            "{line}"
+        );
+        assert!(!line.contains("suspected="), "{line}");
+    }
+
+    /// A resource the code declares that no root parameter names is a
+    /// description D3D12 rejects, and the refusal names it by kind, space and
+    /// register instead of leaving the list empty.
+    #[test]
+    fn a_compute_refusal_names_a_resource_no_root_parameter_names() {
+        let psv = psv0_bytes(5, [8, 8, 1], &[(2, 0, 0), (7, 1, 7)]);
+        let container = container_bytes(vec![(b"PSV0", psv), (b"DXIL", dxil_part(&BITCODE))]);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&container),
+            ..Default::default()
+        };
+        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[constants_param(0, 0, 16)], 0, None);
+        assert!(
+            line.contains("its PSV0 declares uav space 1 register 7 and no root parameter names it"),
+            "{line}"
+        );
+        assert!(!line.contains("no cause known"), "{line}");
+    }
+
+    /// A zero thread group, a `PSV0` built for another stage, a missing part
+    /// and a `DXIL` part whose header disagrees with the container are each
+    /// named, and a description with no signature says so first.
+    #[test]
+    fn a_compute_refusal_names_a_zero_thread_group_a_wrong_stage_and_a_truncated_part() {
+        let psv = psv0_bytes(1, [0, 0, 0], &[]);
+        let container = container_bytes(vec![(b"PSV0", psv)]);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&container),
+            ..Default::default()
+        };
+        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[constants_param(0, 0, 4)], 0, None);
+        assert!(
+            line.contains("its PSV0 declares stage 1 where the pipeline is stage 5"),
+            "{line}"
+        );
+        assert!(
+            line.contains("its PSV0 declares a thread group of 0x0x0"),
+            "{line}"
+        );
+        assert!(line.contains("its container has no DXIL part"), "{line}");
+        let mut dxil = dxil_part(&BITCODE);
+        dxil[20..24].copy_from_slice(&100u32.to_le_bytes());
+        let psv = psv0_bytes(5, [1, 1, 1], &[]);
+        let container = container_bytes(vec![(b"PSV0", psv), (b"DXIL", dxil)]);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&container),
+            ..Default::default()
+        };
+        let line = compute_refusal(&desc, None, &[], 0, None);
+        assert!(
+            line.contains(
+                "cause=no root signature; its DXIL part declares 100 bytes of bitcode and holds 8"
+            ),
+            "{line}"
+        );
+        // A container that is not one at all is named as well.
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: code(&[0u8; 64]),
+            ..Default::default()
+        };
+        let line = compute_refusal(&desc, Some(&[0; 4][..]), &[], 0, None);
+        assert!(
+            line.contains("its container is not readable: not a DXBC container"),
+            "{line}"
         );
     }
 

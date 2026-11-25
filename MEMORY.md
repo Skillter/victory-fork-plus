@@ -215,8 +215,12 @@ data` (pixel), 2× `a lane mask exchanged where not every lane runs` (compute),
 1× `a descriptor's address or format read as data` (compute).
 
 Separately, the host refuses 7 compute pipelines and 1 mesh pipeline with
-`0x80070057`; `pipeline/host.rs` prints `suspected=[]` for them, so the
-parameter is not known yet.
+`0x80070057`. `pipeline::host::compute_refusal` now logs the description's
+fields, the serialised root signature, the container's parts, its `DXIL`
+part's lengths and `PSV0`'s stage, thread group and bindings, then
+`cause=<what is provably invalid>` or `cause=no cause known (<what closes
+it>)`; in the 02:56 run that line did not exist, `suspected=[]` named
+nothing, and no cause is known yet.
 
 In the log a refusal appears as `shader does not translate; its pipelines'
 draws are dropped ... stage=... error=converter shader.dxil v1: GFX10 code at
