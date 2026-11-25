@@ -491,17 +491,20 @@ frame 1,024 — 16 groups a dispatch.
 `VICTORY_GPU_SPLIT=1` measures it (diagnostics builds; `crate::gpusplit`): one
 `EndQuery(TIMESTAMP)` in front of every run of commands sharing a kind and a
 host pipeline — graphics draws, mesh dispatches, indirect runs, compute
-dispatches, our clamp dispatches — the stamps read back after each submission's
-fence (`gpusplit::harvest`) and printed beside `commands per draw` every 5 s as
+dispatches, our clamp dispatches — the stamps read back when the list that
+recorded them has run (`gpusplit::harvest`: after a submission's own wait, or
+at its landing with `VICTORY_LATE_WAIT`/the relay, which the switch leaves as
+they are) and printed beside `commands per draw` every 5 s as
 `where the card's time went: mesh dispatches [mesh <hash> pixel <hash>] 900
 draws 120.0 ms a frame (133.3 µs a draw)`, heaviest first, twelve groups. A
 segment runs from a group's first command to the next group's first, so the
 state between two groups is charged to the earlier one (`shortcut:` in that
 module); our own compare and hash passes are lists nothing waits for, so they
 stay outside it and are read from `host`'s "our passes over copies in the card's
-memory". `host::late_stage` stands still while the switch is on, as it does for
-`VICTORY_GPU_TIMING`, so 87 µs a draw is not compared with a run that has it
-off: compare two runs that both have it on.
+memory". The switch does not stand `late_stage` still (`RUN gpusplit on=true
+late_stage=3` says which stage the numbers were taken under; forcing it to 0
+once whitened the intro's frames), so 87 µs a draw is still not compared with a
+run that has it off: that run pays one query a group less.
 
 ## 5.2 Missing content — clothes and materials
 

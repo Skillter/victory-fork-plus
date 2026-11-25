@@ -18,8 +18,28 @@
 //! barriers) are charged to the group before them. Recording one query a
 //! group costs the card one `EndQuery` a group: a group of one draw pays
 //! about a microsecond for being measured, which is why the µs/draw figures
-//! of two runs with the switch on compare, and why they are not mixed with
-//! a run with it off.
+//! of two runs with the switch on compare, and a run with it off differs by
+//! that query and by nothing else.
+//!
+//! What is timed is the lists' own commands, so the switch says nothing
+//! about how those lists are submitted and changes nothing about it: with
+//! `VICTORY_LATE_WAIT` or the relay (the default) a submission is sent to
+//! the card without a wait for it, and its segments are read when it lands
+//! (`harvest`, at the read-backs of the lists it ran). Two things follow,
+//! and both are what the numbers are read for:
+//!
+//! - A segment's time is the card's clock between two of the list's own
+//!   commands, so it is the same time whether the list was waited for or
+//!   sent ahead. What the card runs between two lists of one submission is
+//!   charged to no group: the compare of copies in its card's memory (a
+//!   list of ours behind the submission's last), the uploads on the copy
+//!   queue, the present's copy. That work is not a draw's, and this line
+//!   prices draws; its counts are in `host`'s lines.
+//! - Nothing of ours is put behind the queries to read them: no fence, no
+//!   wait, no settle the title did not have. A group's cost that cannot be
+//!   attributed this way is not estimated: a list that runs past its query
+//!   cap counts the draws it lost (`unattributed`) rather than spreading
+//!   them over the groups it did time.
 //!
 //! Our own passes over the copies in the card's memory (the compare, the
 //! hash) and the copies themselves are lists of ours that nothing waits
@@ -86,12 +106,29 @@ impl Group {
 }
 
 /// Whether the card is timed per group (`VICTORY_GPU_SPLIT`, diagnostics
-/// builds). Off unless asked for: it adds a query a group and a fence
-/// (`host::late` stands still while it is on, so every submission is waited
-/// for before its timestamps are read).
+/// builds). Off unless asked for: it adds a query a group and no wait — the
+/// title's submission order, the late wait, the relay and the fences stay
+/// as they are without it (`host::late_stage` does not consult it; its
+/// segments are read when the list that recorded them has run, in
+/// [`harvest`]).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_GPU_SPLIT").is_ok_and(|v| v == "1"))
+}
+
+/// One line at the start of a run with the switch on, beside the `RUN env`
+/// lines: what the 5 s line measures, and the submission stage it was
+/// measured under (`RUN gpusplit on=true late_stage=3`). A stage above 0 is
+/// the title's own path — the instrument adds queries to it, it does not
+/// choose it.
+pub(crate) fn announce() {
+    if !on() {
+        return;
+    }
+    victory_core::logging::emit(
+        "INFO",
+        &format!("RUN gpusplit on=true late_stage={}", crate::host::late_stage()),
+    );
 }
 
 /// What a list has timed since the last submission: the query heap and its
@@ -279,8 +316,10 @@ pub(crate) fn close(list: &HostList) {
     }
 }
 
-/// The list's submission has finished: its segments' times go to their
-/// groups. `frequency` is the queue's ([`ID3D12CommandQueue::GetTimestampFrequency`]).
+/// The list's submission has finished — after its own wait, or at its
+/// landing when it was sent ahead ([`crate::host`]'s `harvest_split`): its
+/// segments' times go to their groups. `frequency` is the queue's
+/// ([`ID3D12CommandQueue::GetTimestampFrequency`]).
 pub(crate) fn harvest(list: &HostList, frequency: u64) {
     if !on() {
         return;

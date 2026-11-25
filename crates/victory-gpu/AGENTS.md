@@ -227,8 +227,10 @@
   front of every run of commands sharing a kind and a host pipeline and prints
   `where the card's time went: <group> [<shaders>] N draws X ms a frame (Y µs a
   draw)` every 5 s, heaviest group first. A segment runs to the next group's
-  first command, our own fire-and-forget passes are outside it, and it forces
-  `late_stage` to 0 like the timing switch: compare runs that both have it on.
+  first command, and our own fire-and-forget passes are outside it. It adds
+  queries and nothing else: `late_stage` is not consulted for it, a
+  submission sent ahead is timed at its landing, and the run line says so
+  (`RUN gpusplit on=true late_stage=3`).
 - `draw` counts what a draw emits on the host list and what those caches
   spare, per 5 s in every build (`draw::commands_line`), including the
   barriers and state an indirect clamp emits; `draw::windowed_line` splits
