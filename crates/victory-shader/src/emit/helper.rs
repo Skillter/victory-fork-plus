@@ -17,6 +17,17 @@
 use super::Lower;
 use super::super::bitcode::{Attr, V};
 
+/// Whether a read of another lane of this lane's quad must reach helper
+/// lanes: in a pixel shader, always. At a triangle's edge a quad's other
+/// pixels are helpers (a discarded pixel is one too), and only quad reads
+/// see them: the console computed a derivative by hand as a swizzle or a quad
+/// DPP of the value, so a wave read gave the whole value there, the texture
+/// read that used it took its smallest level, and the triangles' edges showed
+/// as lines across car paint, glass and skin.
+pub(super) fn quad_reads_helpers(l: &Lower, quad: bool) -> bool {
+    quad && l.s.pixel
+}
+
 /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a
 /// helper lane takes its own value instead.
 ///

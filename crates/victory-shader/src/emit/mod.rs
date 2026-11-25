@@ -1099,6 +1099,28 @@ mod tests {
         );
     }
 
+    /// A quad read of another lane must reach helper lanes in a pixel
+    /// shader: a pixel of a quad no primitive covers is in EXEC on the
+    /// console, so the console's `ds_swizzle_b32` quad form read its value.
+    /// A wave read gives 0 from a helper lane on the host, so a derivative
+    /// taken by hand at a triangle's edge was the whole value there, the
+    /// texture read that used it took its smallest level, and the edges
+    /// showed as lines. A compute program keeps its wave read.
+    #[test]
+    fn a_pixel_quad_read_reaches_helper_lanes() {
+        // v_mov_b32 v0, 1; ds_swizzle_b32 v1, v0 offset:0x8000
+        let read = [0x7E00_0281u32, 0xD8D4_8000, 0x0100_0000];
+        let mut words = read.to_vec();
+        // exp mrt0, v1, v1, v1, v1 done vm; s_endpgm
+        words.extend_from_slice(&[0xF800_180F, 0x0101_0101, 0xBF81_0000]);
+        let ps = ps_lower(&words, 2);
+        assert!(declares(&ps, "dx.op.quadReadLaneAt.i32"));
+        assert!(!declares(&ps, "dx.op.waveReadLaneAt.i32"));
+        let cs = cs_lower(&read);
+        assert!(declares(&cs, "dx.op.waveReadLaneAt.i32"));
+        assert!(!declares(&cs, "dx.op.quadReadLaneAt.i32"));
+    }
+
     /// A 16-bit interpolation pair: `v_interp_p2_f16` writes one half of its
     /// destination and keeps the other, so both halves evaluate and the
     /// export sees the pair's dword. Eight pixel shaders stopped at "the

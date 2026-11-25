@@ -4088,7 +4088,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || helper::quad_reads_helpers(self, quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6513,7 +6513,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || helper::quad_reads_helpers(self, quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
