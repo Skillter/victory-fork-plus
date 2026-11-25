@@ -739,6 +739,27 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// A fresh descriptor table the ring cannot hold: the slot's draws are
+/// dropped, and every draw that asks for that table asks again.
+///
+/// The line names the table and its slot count, and
+/// [`victory_core::logging::warn_once`] says which occurrence it is: a scene
+/// that keeps overflowing the ring reads as thousands of dropped draws with
+/// their running total, not as one that a `Once` reported and then denied.
+pub(crate) fn refused_table_span(slot: u8, n: u32) -> bool {
+    victory_core::logging::warn_once("draw.table_span", || {
+        format!("fresh descriptor table exceeds the available span; table={slot} slots={n}")
+    })
+}
+
+/// A draw whose root UAV the title never bound: dropped, and drawn again by
+/// the same title every frame.
+pub(crate) fn refused_uav_unbound() -> bool {
+    victory_core::logging::warn_once("draw.uav_unbound", || {
+        "a root UAV with nothing to bind: the draw is dropped".to_owned()
+    })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1518,7 +1539,7 @@ impl State {
         };
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
-                once!("a root UAV with nothing to bind: the draw is dropped");
+                refused_uav_unbound();
                 return false;
             };
             ready(a, &s);
@@ -2660,7 +2681,7 @@ impl State {
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
-                once!(slot, n, "fresh descriptor table exceeds the available span");
+                refused_table_span(slot, n);
                 continue;
             }
             // The records at the table, mixed. The key is the table and its
@@ -3453,6 +3474,36 @@ mod tests {
     /// one of their own, so whatever the other tests do to
     /// `crate::shadow`'s counter cannot move it.
     const REV: u64 = 1;
+
+    /// A refusal a draw meets on every frame is counted, and its line names
+    /// which occurrence it is: the first, the tenth, the hundredth, and the
+    /// running total (`victory_core::logging::warn_once`). A `Once` said it
+    /// once and the log then read as if the refusal had stopped - reverting
+    /// either site leaves its key out of the totals this reads.
+    #[test]
+    fn a_draw_refusal_says_which_occurrence_it_is() {
+        assert!(refused_table_span(3, 4), "the first occurrence is logged");
+        for nth in 2..10 {
+            assert!(
+                !refused_table_span(3, 4),
+                "occurrence {nth} is counted, not logged"
+            );
+        }
+        assert!(
+            refused_table_span(3, 4),
+            "the tenth occurrence is logged again"
+        );
+        assert!(refused_uav_unbound(), "the first UAV refusal is logged");
+        let totals = victory_core::logging::warn_once_totals();
+        let count = |key: &str| {
+            totals
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, count)| *count)
+        };
+        assert_eq!(count("draw.table_span"), Some(10), "{totals:?}");
+        assert_eq!(count("draw.uav_unbound"), Some(1), "{totals:?}");
+    }
 
     /// A copy answer is used only while the registry of copies still says
     /// the same thing (`crate::shadow::revision`): title memory remapped

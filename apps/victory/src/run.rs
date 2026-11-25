@@ -234,16 +234,17 @@ fn dir_size(path: &Path) -> u64 {
 /// Writes the `STOP` block on every way out of [`run`] that returns.
 ///
 /// The paths that end the process from inside the HLE — `lifecycle::end`, the
-/// suspend deadline, a title that calls `ExitProcess` — never return here.
-/// Their last line is the `run summary:` of
-/// `crates/victory-hle/src/modules/lifecycle.rs`, which this block complements
-/// and does not repeat: that line names the reason and the duration, this one
-/// adds the meter totals, the cache left on disk and the warning counts the
-/// escalation kept out of the log.
+/// suspend deadline, a title that calls `ExitProcess` — never return here:
+/// they write the same block from
+/// `crates/victory-hle/src/modules/lifecycle.rs` (`last_records`), through the
+/// same renderer, and the process writes it once (the one that ends the run).
 ///
-/// The frame figures come from the two metrics the presentation path records:
-/// `frames_n`, counted once per presented frame, and `frame_ms`, observed once
-/// per frame. A run that never drew has neither and prints no fps.
+/// The counters are [`victory_core::report::RunFooter::from_counters`], which
+/// is what that path has too; this one adds the cache left on disk, because a
+/// returning path still knows where its directories are. The frame figures are
+/// the two metrics the presentation path records: `frames_n`, counted once per
+/// presented frame by `victory_gpu::queue::present`, and `frame_ms`, observed
+/// once per frame. A run that never drew has neither and prints no fps.
 struct Footer {
     started: std::time::Instant,
     reason: String,
@@ -274,36 +275,19 @@ impl Footer {
 
 impl Drop for Footer {
     fn drop(&mut self) {
-        let totals = victory_core::meter::meter().totals();
-        let metric = |name: &str| {
-            totals
-                .metrics
-                .iter()
-                .find(|metric| metric.name == name)
-                .copied()
-        };
-        let frames = metric("frames_n").map_or(0, |metric| metric.count);
-        let worst = metric("frame_ms").map(|metric| metric.max);
+        let mut footer =
+            victory_core::report::RunFooter::from_counters(&self.reason, self.started.elapsed());
         let title = format!("{:08X}", self.title_id);
         // A directory that is not there yet is 0 bytes, not an error: the
         // footer is written on every path, including the ones that failed
         // before they could make one.
-        let cache = vec![
+        footer.cache = vec![
             ("shaders".to_owned(), dir_size(&self.cache_dir.join("shaders"))),
             ("pipelines".to_owned(), dir_size(&self.cache_dir.join("pipelines"))),
             ("images".to_owned(), dir_size(&self.cache_dir.join("images"))),
             ("storage".to_owned(), dir_size(&self.data_dir.join(&title).join("storage"))),
             ("temp".to_owned(), dir_size(&self.data_dir.join(&title).join("temp"))),
         ];
-        let footer = victory_core::report::RunFooter {
-            reason: self.reason.clone(),
-            duration: self.started.elapsed(),
-            frames,
-            worst_frame_ms: worst,
-            meter: totals,
-            cache,
-            warns: victory_core::logging::warn_once_totals(),
-        };
         victory_core::logging::emit("INFO", &footer.render());
     }
 }

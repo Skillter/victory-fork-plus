@@ -12,6 +12,7 @@
 //! even when the terminal wrapped it and `grep '^STOP '` is the whole footer.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::meter::Snapshot;
@@ -169,6 +170,52 @@ impl RunFooter {
         }
         out
     }
+}
+
+impl RunFooter {
+    /// The footer of a run that ends where only this crate's statics are left:
+    /// the meter ([`crate::meter::METER`]) and the [`crate::logging`] watches.
+    ///
+    /// No directory is walked, so nothing is answered by a layer that may
+    /// already have let go of its arenas. A path that leaves the process
+    /// without returning through the binary's own shutdown - a title that
+    /// exits, the suspend routines, the deadline that stops waiting for them -
+    /// still reaches both, because they are statics of this crate rather than
+    /// state of the run.
+    pub fn from_counters(reason: &str, duration: Duration) -> Self {
+        let meter = crate::meter::meter().totals();
+        let metric = |name: &str| meter.metrics.iter().find(|m| m.name == name);
+        RunFooter {
+            reason: reason.to_owned(),
+            duration,
+            frames: metric("frames_n").map_or(0, |m| m.count),
+            worst_frame_ms: metric("frame_ms").map(|m| m.max).filter(|ms| *ms > 0),
+            meter,
+            cache: Vec::new(),
+            warns: crate::logging::warn_once_totals(),
+        }
+    }
+}
+
+/// Whether this process has already written its [`STOP`] block.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// The [`STOP`] block of a run that ends by leaving the process, and `None`
+/// once one has been written.
+///
+/// Several paths reach the end of a run - the title asking to exit, the
+/// suspend routines returning, the deadline that stops waiting for them - and
+/// the process is terminated rather than returned from, so no caller can be
+/// asked which came first. The first caller renders the block
+/// ([`RunFooter::from_counters`]); every caller after it is told there is
+/// nothing left to say, so a log holds one `STOP` block and it names the path
+/// that ended the run.
+pub fn stop_block(reason: &str, duration: Duration) -> Option<String> {
+    let wrote = STOPPED.swap(true, Ordering::SeqCst);
+    if wrote {
+        return None;
+    }
+    Some(RunFooter::from_counters(reason, duration).render())
 }
 
 /// One line of free text inside `key=value`: quoted, with the characters that
@@ -345,6 +392,35 @@ mod tests {
         assert!(text.ends_with('\n'), "the block ends the line it writes");
         // Nothing else may prefix a line: a second marker would break both.
         assert!(lines.iter().all(|line| line.starts_with("RUN ") || line.starts_with("STOP ")));
+    }
+
+    /// The end of a run is written once, however many paths reach it: the
+    /// suspend routines and the deadline that stops waiting for them both call
+    /// it, and the second must not write a second block over the first.
+    #[test]
+    fn the_end_of_a_run_is_written_once() {
+        let first = stop_block("title suspended", Duration::from_secs(3))
+            .expect("the first path writes the block");
+        assert!(first.lines().all(|line| line.starts_with("STOP ")), "{first}");
+        assert!(first.contains("\"title suspended\""), "{first}");
+        assert!(
+            stop_block("title did not finish suspending in time", Duration::ZERO).is_none(),
+            "the second path is told the run already has its footer"
+        );
+    }
+
+    /// The counters a path that leaves the process still has: the meter and
+    /// the warning watches, never a directory.
+    #[test]
+    fn a_footer_from_counters_states_the_frames_it_was_given() {
+        crate::meter::meter().count("frames_n", 7);
+        let text = RunFooter::from_counters("title exited with 0", Duration::from_secs(2)).render();
+        assert!(
+            text.contains("duration_s=2 frames=7 fps_mean=3.5"),
+            "{text}"
+        );
+        assert!(text.lines().all(|line| line.starts_with("STOP ")), "{text}");
+        assert!(!text.contains("STOP cache "), "a directory is not walked: {text}");
     }
 
     #[test]

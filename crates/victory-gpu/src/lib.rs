@@ -58,6 +58,16 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+/// The records of a run, for the parts of the layer that end it.
+///
+/// `victory-hle`'s `lifecycle::end` leaves the process itself (the title asked,
+/// or its suspend routines returned), so the `STOP` block cannot be written by
+/// the binary's own shutdown; and that crate does not depend on `victory-core`.
+/// The block is still built and rendered in `victory_core::report`, by
+/// [`victory_core::report::RunFooter`], so there is one set of lines and one
+/// place that formats them.
+pub use victory_core::{logging, report};
+
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
