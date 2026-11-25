@@ -485,6 +485,41 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
+/// The process's own disk traffic in bytes since it started: read, written.
+///
+/// The pagefile's traffic is the system's, not ours, so it is not here: a run
+/// whose disk is busy while these figures are small is one the system is
+/// paging, not one we are writing.
+fn process_io() -> (u64, u64) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, IO_COUNTERS,
+    };
+    // SAFETY: plain data the call fills in.
+    let mut c: IO_COUNTERS = unsafe { std::mem::zeroed() };
+    // SAFETY: our own process and a structure the call fills in.
+    unsafe { GetProcessIoCounters(GetCurrentProcess(), &mut c) };
+    (c.ReadTransferCount, c.WriteTransferCount)
+}
+
+/// The process's disk traffic per second since the last call, in MB/s: read,
+/// written. The first call has no window behind it and reports nothing.
+fn io_rate() -> Option<(f64, f64)> {
+    static LAST: std::sync::Mutex<Option<(u64, u64, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let (read, wrote) = process_io();
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_read, was_wrote, was_at) = last.replace((read, wrote, now))?;
+    let secs = now.duration_since(was_at).as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    Some((
+        read.saturating_sub(was_read) as f64 / secs / 1e6,
+        wrote.saturating_sub(was_wrote) as f64 / secs / 1e6,
+    ))
+}
+
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
 fn system_memory() -> (u64, u64) {
@@ -796,8 +831,14 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    if let Some((read, wrote)) = io_rate() {
+        tracing::info!(
+            "this process on the disk: {read:.1} MB/s read, {wrote:.1} MB/s written (its own \
+             traffic only; pages the system moved to the pagefile are not ours)"
+        );
+    }
     tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
+        "memory, placed textures: {} of them were asked for again with other filler words in their description (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
     // What the line above leaves open: what is alive of the buffers "made

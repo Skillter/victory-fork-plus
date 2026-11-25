@@ -78,9 +78,9 @@ pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
-/// while the library lives, and the bytes the last save wrote (a buffer of
-/// that size is made, filled and written every time pipelines were added,
-/// at most every `SAVE_EVERY`, a minute).
+/// while the library lives, and the bytes the file holds on the disk (as the
+/// last save wrote them, or as this run loaded them): what a save would
+/// rewrite, and the base the growth gate in `save` measures against.
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
@@ -582,6 +582,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             Ok(library) => {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
+                // What a save would rewrite is what is already on the disk: the
+                // growth gate in `save` compares against this, so a warm run
+                // that adds a handful of pipelines does not rewrite the whole
+                // file to gain a few hundred kilobytes.
+                SAVED.store(bytes as u64, Ordering::Relaxed);
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
@@ -811,7 +816,8 @@ pub(crate) fn pipeline(
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save, they grew the library by [`SAVE_GROWTH`], and `SAVE_EVERY` has
+/// passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     // A save rewrites the whole library, whichever pipeline was added: the
@@ -820,6 +826,12 @@ pub(crate) fn save(now: bool) {
     // minute does the same work three times less often, and a crash still
     // costs at most the pipelines of the last minute.
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+    // What growth is worth rewriting the whole library for: a save writes every
+    // byte of it (718 MB measured), and a warm run adds a few hundred kilobytes
+    // in all, so saving on `SAVE_EVERY` alone wrote the 718 MB two or three times
+    // a run for nothing. Growth waits for the load that adds thousands of
+    // pipelines, and the shutdown save is forced and takes the rest.
+    const SAVE_GROWTH: usize = 64 << 20;
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -843,6 +855,15 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
+        if !now && added != 0 {
+            // SAFETY: a plain query.
+            let size = unsafe { library.library.GetSerializedSize() };
+            if size.saturating_sub(SAVED.load(Ordering::Relaxed) as usize) < SAVE_GROWTH {
+                // Too little new to be worth the whole file: `added` stays, so
+                // the next look in a minute or the shutdown save carries these.
+                return;
+            }
+        }
         let changed = USED_CHANGED.swap(false, Ordering::Relaxed);
         if !changed && added == 0 {
             None
