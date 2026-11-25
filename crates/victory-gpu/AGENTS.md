@@ -53,8 +53,23 @@
   a cosmetic slot-order difference is neither a new library entry nor a new
   driver compile. Each stage still reaches its own root views, through
   indices `canonical_params` returns.
-- Translated shaders are cached by the executable's BLAKE3 plus translation
-  switches. Old entries die with the build hash; do not hand-version them.
+- Translated shaders are cached by the translator's fingerprint (`build.rs`
+  hashes `victory-shader`'s source, the cache encoding, `Cargo.lock` and the
+  toolchain) plus the switches that change output, so a rebuild keeps them;
+  `VICTORY_SHADER_CACHE_KEY` starts cold when one looks stale.
+- The swap chain is sized from the window's client rectangle, never the frame,
+  and the frame is drawn into it by the present pass with a viewport that keeps
+  its shape (letterbox): a Win32 flip chain's `DXGI_SCALING_STRETCH` cannot.
+
+## Textures
+
+- `resource::room` refuses only when the card is at its ceiling; a refusal is
+  now answered by reclaiming a copy that one idle slot alone holds, and a slot
+  seen twice in 64 frames is protected from the sweep. Never raise the ceiling
+  to make a refusal go away; reclaim or admit instead.
+- Staging copies are capped in system RAM (`VICTORY_STAGING_MB`), coldest and
+  not-held first: re-admitting from staging is one DMA, decoding the title's
+  format is far more expensive.
 
 ## Diagnostics
 
