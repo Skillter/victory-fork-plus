@@ -2409,6 +2409,16 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Host lists in the flights in the air ([`late`]): the runs of dynamic
+/// descriptor slots a refusal cannot get are held by them until they have
+/// run (`descriptor::host` names the count when it refuses a table).
+pub(crate) fn lists_in_air() -> usize {
+    if !late() {
+        return 0;
+    }
+    line().lists
+}
+
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
 const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
@@ -2419,6 +2429,10 @@ const WHY_RUN: usize = 7;
 const WHY_MOST: usize = 8;
 const WHY_WRITES: usize = 9;
 const WHY_FENCE: usize = 10;
+/// A descriptor table the ring had no room for
+/// (`descriptor::host::take_slots`): the flight in the air holds the slots,
+/// and it is worth a wait for the card.
+pub(crate) const WHY_DYNAMIC: usize = 18;
 
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
@@ -2426,11 +2440,11 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
-static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static LATE_WAITED: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
@@ -2906,7 +2920,8 @@ fn late_line(frames: f64) {
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
          a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
-         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
+         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}, \
+         a descriptor table with no room {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
         s[1],
@@ -2925,6 +2940,7 @@ fn late_line(frames: f64) {
         s[WHY_MOST],
         s[WHY_WRITES],
         s[WHY_FENCE],
+        s[WHY_DYNAMIC],
         s[13],
         s[14],
     );
@@ -2933,7 +2949,8 @@ fn late_line(frames: f64) {
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
-             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}",
+             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}, \
+             a descriptor table with no room {:.1}",
             w[WHY_SYNC],
             w[WHY_CARD_DONE],
             w[WHY_VALUE],
@@ -2943,6 +2960,7 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+            w[WHY_DYNAMIC],
         );
     }
     if relay() {
@@ -4233,7 +4251,7 @@ impl Host {
                 }
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                LATE_WAITED[why.min(WHY_DYNAMIC)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
@@ -6723,6 +6741,10 @@ impl Meter {
                     "buffer views left null as the host would refuse them, by reason: {reasons}"
                 );
             }
+            // The dynamic descriptor ring: the one number that said a draw
+            // lost its table in a release run (run 2026-11-25 04:38 lost
+            // 4,359 a frame behind a single line).
+            crate::descriptor::host::dynamic_line(frames);
             // The reasons, in the builds that do not print the frame listing:
             // the same drops, split by why each was not run. Diagnostics
             // builds split them by the detail worth formatting there (shader

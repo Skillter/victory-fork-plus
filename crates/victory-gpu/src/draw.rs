@@ -1295,7 +1295,9 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 self.scratch_made = made;
-                once!("a draw whose descriptor table found no free slots is dropped");
+                // A table that found no slot: counted, and named with the
+                // ring's room by `descriptor::host`, at most once a second.
+                crate::descriptor::host::note_dropped_draw();
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -1542,6 +1544,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
+                    crate::descriptor::host::note_dropped_draw();
                     return false;
                 };
                 if let Some((a, s)) = &shadow {
@@ -1612,6 +1615,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic_in(&mut self.ring, 1) else {
+                    crate::descriptor::host::note_dropped_draw();
                     return false;
                 };
                 self.root_srv_slots

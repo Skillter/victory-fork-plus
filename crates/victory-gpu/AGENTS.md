@@ -36,7 +36,12 @@
 
 - Host heaps mirror the title's slots and are re-made when a slot is written.
 - Per-draw tables come from the dynamic ring in `descriptor::host`; a request
-  that cannot fit must be refused, never served from unbuilt slots.
+  that cannot fit asks the flights in the air to land once
+  (`descriptor::host::make_room`, at most one ask per 250 ms) and is refused
+  only if the second try fails, never served from unbuilt slots. Every refusal
+  is counted and its line names the free slots and the lists in the air; the
+  ring's room is printed every 5 s in every build
+  (`descriptor::host::dynamic_line`), not only in a diagnostics one.
 - A command list bumps through a run it holds (`DynamicList`), given back whole
   at submission; the ring is never walked per table. A run names its heap by
   identity, a counter (`HostHeap::ident`) resolved in `descriptor::host::RINGS`,
