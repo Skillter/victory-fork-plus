@@ -1934,6 +1934,18 @@ mod tests {
                 _ => panic!("a global or function as a value"),
             }
         };
+        // The value an instruction of an integer type reads: exactly the
+        // width of its own type, whatever a model left above it. Every
+        // arm that has an operand of the wrong width would otherwise
+        // answer differently from the constant the pass folds in its
+        // place.
+        let narrow = |vals: &[Option<u64>], v: V| -> u64 {
+            let x = eval(vals, v);
+            match m.int_bits(m.type_of(v)) {
+                Some(bits) => x & mask(bits),
+                None => x,
+            }
+        };
         let (mut b, mut from) = (0usize, usize::MAX);
         for _ in 0..4000 {
             let blk = &m.blocks[b];
@@ -1961,7 +1973,7 @@ mod tests {
                 let float = |x: u64| f32::from_bits(x as u32);
                 let r = match &inst.op {
                     Op::Bin(op, x, y) => {
-                        let (x, y) = (eval(&vals, *x), eval(&vals, *y));
+                        let (x, y) = (narrow(&vals, *x), narrow(&vals, *y));
                         match bits {
                             Some(bits) => {
                                 let r = match op {
@@ -1974,7 +1986,17 @@ mod tests {
                                     Bin::Shl => x << y,
                                     Bin::LShr => x >> y,
                                     Bin::AShr => (signed(bits, x) >> y) as u64,
-                                    _ => panic!("no divisions here"),
+                                    // The optimiser folds neither a division
+                                    // by zero nor a signed one that
+                                    // overflows, so those instructions stay
+                                    // in both modules; any fixed answer
+                                    // here compares equal.
+                                    Bin::UDiv => x.checked_div(y).unwrap_or(0),
+                                    Bin::URem => x.checked_rem(y).unwrap_or(0),
+                                    Bin::SDiv => {
+                                        signed(bits, x).checked_div(signed(bits, y)).unwrap_or(0)
+                                            as u64
+                                    }
                                 };
                                 r & mask(bits)
                             }
@@ -1991,7 +2013,7 @@ mod tests {
                     }
                     Op::Cmp(p, x, y) => {
                         let wide = m.int_bits(m.type_of(*x));
-                        let (x, y) = (eval(&vals, *x), eval(&vals, *y));
+                        let (x, y) = (narrow(&vals, *x), narrow(&vals, *y));
                         let holds = match wide {
                             Some(bits) => {
                                 let (sx, sy) = (signed(bits, x), signed(bits, y));
@@ -2036,6 +2058,31 @@ mod tests {
                             (Cast::ZExt, _, _) => x,
                             (Cast::SExt, Some(f), Some(t)) => signed(f, x) as u64 & mask(t),
                             (Cast::Trunc, _, Some(t)) => x & mask(t),
+                            // The optimiser folds a float rounded to an
+                            // integer only inside the target's range, so
+                            // what it does outside is never compared.
+                            (Cast::FpToSi, _, Some(t)) => {
+                                let f = f32::from_bits(x as u32).trunc();
+                                if (-2147483648.0..2147483648.0).contains(&f) {
+                                    (f as i64) as u64 & mask(t)
+                                } else {
+                                    0
+                                }
+                            }
+                            (Cast::FpToUi, _, Some(t)) => {
+                                let f = f32::from_bits(x as u32).trunc();
+                                if (0.0..4294967296.0).contains(&f) {
+                                    (f as u64) & mask(t)
+                                } else {
+                                    0
+                                }
+                            }
+                            (Cast::SiToFp, Some(f), _) => {
+                                u64::from((signed(f, x) as f32).to_bits())
+                            }
+                            (Cast::UiToFp, Some(f), _) => {
+                                u64::from(((x & mask(f)) as f32).to_bits())
+                            }
                             _ => panic!("a cast the generator does not make"),
                         }
                     }
@@ -2126,6 +2173,12 @@ mod tests {
 
         fn cond(&mut self) -> V {
             let c = self.cur;
+            // Now and then a condition that is already a constant, so the
+            // branch it guards goes one way and the side not taken is dead.
+            if self.next(8) == 0 {
+                let t = self.next(2) == 0;
+                return self.k.m.bool(t);
+            }
             let made = match self.next(6) {
                 0 if !self.conds.is_empty() => {
                     let n = self.next(self.conds.len() as u64) as usize;
@@ -2161,7 +2214,7 @@ mod tests {
             let d = self.next(self.regs.len() as u64) as usize;
             let i32t = self.k.m.int(32);
             let f32t = self.k.m.float();
-            let r = match self.next(14) {
+            let r = match self.next(16) {
                 0..=3 => {
                     let op = [Bin::Add, Bin::Sub, Bin::Mul, Bin::And, Bin::Or, Bin::Xor]
                         [self.next(6) as usize];
@@ -2227,10 +2280,30 @@ mod tests {
                     let g = self.cond();
                     self.k.m.cast(self.cur, Cast::ZExt, g, i32t)
                 }
+                13 => {
+                    // Division and remainder, by a register: zero and the
+                    // overflowing quotient are the cases the optimiser
+                    // refuses to fold and the interpreter's fixed answers.
+                    let op = [Bin::UDiv, Bin::SDiv, Bin::URem][self.next(3) as usize];
+                    let (x, y) = (self.value(), self.value());
+                    self.k.m.bin(c, op, x, y)
+                }
+                14 => {
+                    // Round a float toward zero, then back: the conversion
+                    // folds only where both directions are exact.
+                    let g = self.value();
+                    let f = self.k.m.cast(c, Cast::Bitcast, g, f32t);
+                    let i = self.k.m.cast(c, Cast::FpToSi, f, i32t);
+                    let g = self.k.m.cast(c, Cast::SiToFp, i, f32t);
+                    self.k.m.cast(c, Cast::Bitcast, g, i32t)
+                }
                 _ => {
-                    let x = self.value();
-                    let f = self.k.m.cast(c, Cast::Bitcast, x, f32t);
-                    self.k.m.cast(c, Cast::Bitcast, f, i32t)
+                    // The unsigned pair.
+                    let g = self.value();
+                    let f = self.k.m.cast(c, Cast::Bitcast, g, f32t);
+                    let i = self.k.m.cast(c, Cast::FpToUi, f, i32t);
+                    let g = self.k.m.cast(c, Cast::UiToFp, i, f32t);
+                    self.k.m.cast(c, Cast::Bitcast, g, i32t)
                 }
             };
             self.regs[d] = r;
@@ -2421,5 +2494,170 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    /// One instruction built from constants, stored, so that a run of the
+    /// module reports what it computed.
+    fn fold_case(op: u8, bits: u32, x: u64, y: u64) -> Module {
+        let mut k = kit();
+        let b = k.b;
+        let t = k.m.int(bits);
+        let zero = k.m.int_const(t, 0);
+        let f = k.m.float();
+        let v = match op {
+            0 => {
+                let a = k.m.f32(x as u32);
+                k.m.cast(b, Cast::FpToSi, a, t)
+            }
+            1 => {
+                let a = k.m.f32(x as u32);
+                k.m.cast(b, Cast::FpToUi, a, t)
+            }
+            2 => {
+                let a = k.m.int_const(t, x as i64);
+                k.m.cast(b, Cast::SiToFp, a, f)
+            }
+            3 => {
+                let a = k.m.int_const(t, x as i64);
+                k.m.cast(b, Cast::UiToFp, a, f)
+            }
+            4 | 5 => {
+                let a = k.m.int_const(t, x as i64);
+                let wide = k.m.int(64);
+                if op == 4 {
+                    k.m.cast(b, Cast::ZExt, a, wide)
+                } else {
+                    k.m.cast(b, Cast::SExt, a, wide)
+                }
+            }
+            6 => {
+                let a = k.m.int_const(t, x as i64);
+                let half = k.m.int(bits / 2);
+                k.m.cast(b, Cast::Trunc, a, half)
+            }
+            o => {
+                let (a, z) = (k.m.int_const(t, x as i64), k.m.int_const(t, y as i64));
+                let bin = [Bin::UDiv, Bin::SDiv, Bin::URem, Bin::Mul, Bin::Add][o as usize - 7];
+                k.m.bin(b, bin, a, z)
+            }
+        };
+        k.m.call(b, k.writes, vec![zero, v]);
+        k.m.terminate(b, Term::Ret);
+        k.m
+    }
+
+    /// Every constant fold says what the instruction it replaces says: the
+    /// same program, folded and not, stores the same values.
+    #[test]
+    fn a_fold_from_constants_says_what_the_instruction_says() {
+        let floats = [
+            0u32, 0x8000_0000, 0x3F80_0000, 0xBF80_0000, 0x3F00_0000, 0xBF00_0000,
+            0x4F00_0000, 0xCF00_0000, 0x4F80_0000, 0x4EFF_FFFF, 0x4B80_0001,
+            0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0x0000_0001, 0x8000_0001,
+            0x5F00_0000, 0xDF00_0000, 0x7F7F_FFFF, 0x3FC0_0000, 0x4020_0000,
+            0x4F7F_FFFF, 0x3F80_0001, 0x3400_0000,
+        ];
+        let ints = [
+            0u64, 1, 2, 3, 7, 0xFF, 0x7F, 0x80, 0xFFFF, 0x8000, 0x7FFF,
+            0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0x0100_0001,
+            0xFFFF_FF7F, 0x8000_0001,
+        ];
+        let inputs = [1u32, 2, 3, 4, 5, 6, 7];
+        let (mut cases, mut folded) = (0, 0);
+        // A conversion needs a width to come from or go to; a division or a
+        // sum, only its own.
+        let all = 0..9u8;
+        for &bits in &[8u32, 16, 32] {
+            let m = (1u64 << bits) - 1;
+            for op in all.clone() {
+                let (xs, ys): (&[u64], &[u64]) = match op {
+                    0 | 1 => (&floats.iter().map(|&f| u64::from(f)).collect::<Vec<_>>(), &[0]),
+                    4..=6 => (&ints, &ints),
+                    _ => (&ints, &[0]),
+                };
+                for &x in xs {
+                    for &y in ys {
+                        let (x, y) = (x & if op < 2 { u64::MAX } else { m }, y & m);
+                        let plain = fold_case(op, bits, x, y);
+                        let want = run(&plain, &inputs);
+                        let mut pass = fold_case(op, bits, x, y);
+                        pass.optimise(FOLD);
+                        if pass.blocks[0].body.len() < 2 {
+                            folded += 1;
+                        }
+                        assert_eq!(
+                            run(&pass, &inputs),
+                            want,
+                            "op {op} i{bits} {x:#x} {y:#x}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("{cases} cases, {folded} folded");
+        // The folds are the point: most of these do fold.
+        assert!(folded > 1000, "{folded} of {cases} folded");
+    }
+
+    /// The join reported as folding wrongly: a register that is only ever
+    /// itself round a loop, one the loop computes from it, and a second
+    /// join whose back edge reads that computed value.
+    fn self_join_loop() -> (Module, usize) {
+        let Kit {
+            mut m,
+            b,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (head, exit) = (m.new_block(), m.new_block());
+        let (five, nine, zero, one, four) = (m.i32(5), m.i32(9), m.i32(0), m.i32(1), m.i32(4));
+        m.terminate(b, Term::Br(head));
+        let self_join = m.phi(head, i32t);
+        let counter = m.phi(head, i32t);
+        let reads_it = m.phi(head, i32t);
+        let or = m.bin(head, Bin::Or, self_join, self_join);
+        let next = m.bin(head, Bin::Add, counter, one);
+        let more = m.cmp(head, pred::IULT, next, four);
+        m.terminate(head, Term::CondBr(more, head, exit));
+        m.set_phi(self_join, vec![(five, b), (self_join, head)]);
+        m.set_phi(counter, vec![(zero, b), (next, head)]);
+        m.set_phi(reads_it, vec![(nine, b), (or, head)]);
+        m.call(exit, writes, vec![zero, reads_it]);
+        m.call(exit, writes, vec![one, self_join]);
+        m.terminate(exit, Term::Ret);
+        let V::Inst(reads_it) = reads_it else {
+            panic!("a join")
+        };
+        (m, reads_it as usize)
+    }
+
+    /// The pass replaces the back edge's value with the one the register
+    /// came in with, which is computed before the loop every time round,
+    /// and the two programs store the same values.
+    #[test]
+    fn a_join_folded_to_a_value_from_before_the_loop_stores_the_same() {
+        let (mut plain, reads_it) = self_join_loop();
+        let mut folded = self_join_loop().0;
+        folded.optimise(FOLD);
+        let inputs = [1u32, 2, 3];
+        assert_eq!(
+            run(&folded, &inputs),
+            run(&plain, &inputs),
+            "the folded program stores what the plain one does"
+        );
+        // The shape the report named: the self-join is gone, and the back
+        // edge of the join that read what the loop computed now reads the
+        // value defined before the loop.
+        let five = plain.i32(5);
+        assert_eq!(folded.blocks[1].phis.len(), 2, "the self-join is gone");
+        let Op::Phi(incoming) = &folded.insts[reads_it].op else {
+            panic!("a join")
+        };
+        assert!(
+            incoming.iter().any(|&(v, from)| from == 1 && v == five),
+            "{incoming:?}"
+        );
     }
 }
