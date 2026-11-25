@@ -569,6 +569,36 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// The console has no removed device: when the host's goes, the error alone
+/// says only "suspended". Say the reason `GetDeviceRemovedReason` gives
+/// (a TDR, an invalid call, ...) once, at the first call that reports the
+/// device gone, in one line with the debug layer's first error if one is
+/// kept.
+pub(crate) fn note_removal(error: &windows::core::Error) {
+    const REMOVED: i32 = 0x887A_0005u32 as i32;
+    const RESET: i32 = 0x887A_0006u32 as i32;
+    const HUNG: i32 = 0x887A_0007u32 as i32;
+    const INVALID_CALL: i32 = 0x887A_0001u32 as i32;
+    let code = error.code().0;
+    if ![REMOVED, RESET, HUNG, INVALID_CALL].contains(&code) {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(host) = host() else {
+        return;
+    };
+    // SAFETY: a plain query.
+    let reason = match unsafe { host.device.GetDeviceRemovedReason() } {
+        Ok(()) => "none: the device is not removed".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    let layer = host.log_messages();
+    tracing::error!(reason = %reason, first = %error, layer = ?layer, "the host device was removed");
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -7283,6 +7313,7 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                note_removal(&e);
                 None
             }
         }
@@ -8709,6 +8740,7 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                note_removal(&e);
                 None
             }
         }

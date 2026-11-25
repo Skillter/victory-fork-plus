@@ -244,20 +244,27 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// R9G9B9E5_SHAREDEXP (67) is a render target and unordered access target on
+/// the console (the title's exposure chain) and on no PC: `CheckFeatureSupport`
+/// reports neither RENDER_TARGET nor TYPED_UNORDERED_ACCESS_VIEW for it, and
+/// `CreateCommittedResource` refuses either flag (0x80070057) while a render
+/// target *view* of that format is one the device removes itself for. Half
+/// float stands in, which holds every value the shared exponent does and
+/// more.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 11)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -511,6 +518,7 @@ fn twin_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+        crate::host::note_removal(&e);
     }
     let Some(texture) = texture else {
         TWINS[1].fetch_add(1, Relaxed);
@@ -574,6 +582,7 @@ fn twin_texture(
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+            crate::host::note_removal(&e);
         }
         texture.map(|texture| {
             crate::host::name(&texture, || {
@@ -1279,6 +1288,22 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    if !same {
+        // Two textures over one address that do not match: the console reads
+        // the one through the other, and the host does not.
+        static SAID: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let at = r.data() as u64;
+        if !said.contains(&at) {
+            said.push(at);
+            tracing::info!(
+                address = format_args!("{at:#x}"),
+                ours = ?r.desc,
+                other = ?o.desc,
+                "two textures hold one address and are not the same shape"
+            );
+        }
+    }
     same.then_some(other)
 }
 
@@ -2099,6 +2124,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether the host takes a clear value for a texture with these flags:
+/// `CreateCommittedResource` answers `E_INVALIDARG` for a clear value on a
+/// texture that is neither a render target nor a depth target (only those
+/// two flags have an optimised clear). The console ignores the pointer, so
+/// the title passes one for every texture it fills: the description says
+/// `flags: 0` and the create was refused whole.
+fn takes_clear_value(flags: u32) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    flags & (TARGET | DEPTH) != 0
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2147,7 +2184,7 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && takes_clear_value(d.flags)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2178,6 +2215,7 @@ fn host_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        crate::host::note_removal(&e);
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
@@ -2194,6 +2232,52 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+/// Diagnostics: what lives in `this`'s memory besides it. `alias_of` looks
+/// only at an equal address and the same shape, so a texture the title
+/// presents and a texture it renders to that differ in height (1080 over
+/// 1088, scanout padding) or in format are two textures here and the same
+/// memory there.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn overlaps(this: This) -> String {
+    let Some((start, d)) = texture_memory(this) else {
+        return String::from("not a texture");
+    };
+    let at = start as u64;
+    let end = at.saturating_add(footprint(&d).map_or(0, |f| f.size).max(1));
+    let written = TARGETS_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&at);
+    let mut said = vec![format!(
+        "itself {at:#x} {}x{} f{} mips {} layers {} flags {:#x} {}",
+        d.width,
+        d.height,
+        d.format,
+        d.mip_levels,
+        d.depth_or_array_size,
+        d.flags,
+        if written { "host rendered" } else { "from its memory" }
+    )];
+    for other in textures().iter().copied() {
+        let other = other as This;
+        if other == this {
+            continue;
+        }
+        let Some((p, o)) = texture_memory(other) else {
+            continue;
+        };
+        let os = p as u64;
+        let oend = os.saturating_add(footprint(&o).map_or(0, |f| f.size).max(1));
+        if os < end && at < oend {
+            said.push(format!(
+                "{os:#x} {}x{} f{} mips {} layers {} flags {:#x}",
+                o.width, o.height, o.format, o.mip_levels, o.depth_or_array_size, o.flags
+            ));
+        }
+    }
+    said.join("; ")
 }
 
 /// A buffer's host memory and size; `None` for textures.
@@ -2856,6 +2940,21 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn a_clear_value_goes_only_to_a_target() {
+        // CreateCommittedResource refuses a clear value on a texture that is
+        // neither a render target nor a depth target: the title passes one
+        // for every texture it fills, and those creates came back
+        // E_INVALIDARG (the console ignores the pointer).
+        assert!(!takes_clear_value(0));
+        assert!(!takes_clear_value(4)); // unordered access only
+        assert!(!takes_clear_value(8 | 4)); // no shader access
+        assert!(takes_clear_value(1)); // render target
+        assert!(takes_clear_value(2)); // depth
+        assert!(takes_clear_value(1 | 4));
+        assert!(takes_clear_value(2 | 8));
     }
 
     #[test]
