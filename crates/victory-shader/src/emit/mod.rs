@@ -272,10 +272,19 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    // A console program is in the `DXIL` part; a package of them, with no
+    // `DXIL` part beside it, is in the `ACCC` one.
+    let native = match (c.part(FourCC::DXIL), c.part(FourCC::ACCC)) {
+        (Some(dxil), _) => crate::native_programs(dxil.data)?,
+        (None, Some(accc)) => crate::fspx::programs(accc.data, &c)?,
+        (None, None) => {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container with neither a DXIL nor an ACCC part",
+            });
+        }
+    };
+    let native = native
         .into_iter()
         .find(|p| {
             matches!(

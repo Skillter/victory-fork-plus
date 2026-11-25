@@ -234,9 +234,16 @@ window is **black**: the title draws only into 1280x720 targets (0 of 12,071
 operations at frame 3318 name a 1920-wide resource) and never writes the
 1920x1080 f28 texture it presents. Series-x draws 2560x1440 and then four
 draws into 3840x2160, so its upscale is graphics; series-s's is FidelityFX
-compute (29 `FFX FSR4` lines, series-s only) and 20 of its 26 compute shaders
-do not translate (`converter shader.dxil v1: malformed shader: no DXIL part`),
-so the upscale never runs and the presented texture stays as created.
+compute (29 `FFX FSR4` lines, series-s only). Those 29 shaders have no `DXIL`
+part at all: their program is an `FSPX` package of GFX10 code in an `ACCC`
+part (`fspx.rs::programs`), and all 29 now reach the emitter, where
+they stop on seven named gaps (census 2026-11-25, `victory translate
+--validate` over the installed package: of their 29 programs 17 stop on `a
+lane mask read as data` and 6 on `... holding lanes elsewhere read as data`,
+2 on a special operand, and one each on `v_dot4c_i32_i8`, a packed 16-bit
+operation, a 16-bit image atomic and a descriptor neither loaded nor built;
+2728 of 2762 compute programs still emit and validate), so the upscale never
+runs and the presented texture stays as created.
 
 Split on the reference rig at 4K (473 ms/frame, 2.1 fps, older build):
 

@@ -656,10 +656,20 @@ fn stage_facts(code: &[u8], stage: u8, threads: bool) -> StageFacts {
         code.len(),
         parts.join(",")
     );
-    match container.part(victory_shader::FourCC::DXIL) {
+    match container
+        .part(victory_shader::FourCC::DXIL)
+        .or_else(|| container.part(victory_shader::FourCC::ACCC))
+    {
         None => facts
             .causes
             .push("its container has no DXIL part".to_owned()),
+        Some(part) if part.fourcc == victory_shader::FourCC::ACCC => {
+            if !victory_shader::fspx::is_package(part.data) {
+                facts
+                    .causes
+                    .push("its ACCC part is not an FSPX package".to_owned());
+            }
+        }
         Some(part) => {
             let dxil = part.data;
             if dxil.len() < 24 {
