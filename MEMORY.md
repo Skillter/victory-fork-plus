@@ -137,6 +137,7 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 | `VICTORY_D3D12_WARP=1` | software adapter; wild accesses become AVs, no driver reset | diagnostics builds only; slow |
 | `VICTORY_GPU_TIMING=1` | per-list timing on the card | forces `late_stage()` to 0 |
 | `VICTORY_LOG_FILE=<path>` | log goes to that file as well as stderr | `0` turns the file off; see below |
+| `VICTORY_SHADER_CACHE_KEY=<text>` | starts the shader cache cold | a cache keyed by the translator survives rebuilds; set this only when a translation looks stale |
 
 Log destination. `VICTORY_LOG_FILE=<path>` writes the log to that file in
 addition to stderr. `VICTORY_LOG_FILE=0` (or `off`) disables the file copy, so

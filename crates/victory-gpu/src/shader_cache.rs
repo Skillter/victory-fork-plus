@@ -6,9 +6,9 @@
 //! leaves it alone keeps the cache. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
-//! Opening the cache first prunes it (a month idle, then a 2 GiB cap): the
-//! key carries this build's hash, so every rebuild orphans a generation and
-//! nothing else ever removed one.
+//! Opening the cache first prunes it (a month idle, then a 2 GiB cap).
+//! `VICTORY_SHADER_CACHE_KEY=<text>` joins the key, so a developer who
+//! suspects a stale translation can start cold without touching the disk.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -60,11 +60,11 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe: std::io::Result<Vec<u8>> = Ok([
+        let mut bytes = [
             env!("VICTORY_TRANSLATOR_HASH").as_bytes(),
             &[u8::from(cfg!(feature = "diagnostics")), u8::from(cfg!(debug_assertions))],
         ]
-        .concat());
+        .concat();
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -72,42 +72,51 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(victory_shader::emit::group_sync());
+        // So are the switches that pick the form of a wave64 program:
+        // without them here a run with `VICTORY_WAVE_WIDE=0` was
+        // served the translations an earlier run of the same
+        // executable had cached with the switch unset.
+        for name in [
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_F16_NEAREST",
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(value.as_encoded_bytes());
             }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
+            bytes.push(0);
         }
+        // And which clean-up passes ran over the translated code.
+        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        rekey(
+            *blake3::hash(&bytes).as_bytes(),
+            std::env::var_os("VICTORY_SHADER_CACHE_KEY").as_deref(),
+        )
     })
+}
+
+/// `VICTORY_SHADER_CACHE_KEY=<text>` rejoins the key with that text, so a
+/// developer who suspects a translation outlived its translator can start
+/// from a cold cache. Unset or empty leaves the key as the fingerprint made
+/// it, and the entries written under another value stay on disk for the run
+/// that drops the variable again.
+fn rekey(key: [u8; 32], spec: Option<&std::ffi::OsStr>) -> [u8; 32] {
+    match spec {
+        Some(spec) if !spec.is_empty() => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&key);
+            hasher.update(&[0]);
+            hasher.update(spec.as_encoded_bytes());
+            *hasher.finalize().as_bytes()
+        }
+        _ => key,
+    }
 }
 
 /// The translation of a console shader container, from the cache when
@@ -349,6 +358,19 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_key_switch_rekeys_and_only_then() {
+        use std::ffi::OsStr;
+        let key = [7u8; 32];
+        assert_eq!(rekey(key, None), key);
+        assert_eq!(rekey(key, Some(OsStr::new(""))), key);
+        assert_ne!(rekey(key, Some(OsStr::new("cold"))), key);
+        assert_ne!(
+            rekey(key, Some(OsStr::new("cold"))),
+            rekey(key, Some(OsStr::new("colder")))
+        );
+    }
 
     fn shader() -> HostShader {
         HostShader {
