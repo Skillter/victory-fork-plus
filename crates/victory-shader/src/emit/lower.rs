@@ -28,6 +28,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// The helper lanes of a pixel shader's quad, a child module for the same
+/// reason.
+#[path = "helper.rs"]
+pub(super) mod helper;
+
 pub(super) type Why = &'static str;
 
 /// A mesh program's primitive word: three 10-bit vertex indices at bits 0,
@@ -90,6 +95,9 @@ pub(crate) struct Lowered {
     /// emitted, when the request was followed.
     #[cfg(test)]
     pub counts_emit: Option<(usize, usize)>,
+    /// The program's functions: the `dx.op` names it declares.
+    #[cfg(test)]
+    pub declared: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1756,6 +1764,8 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         #[cfg(test)]
         let heap_address_indexed = self.heap_address_indexed();
+        #[cfg(test)]
+        let declared = self.s.m.declared_names();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -1772,6 +1782,8 @@ impl<'a> Lower<'a> {
             cull_guards: self.cull_guards,
             #[cfg(test)]
             counts_emit: self.counts_emit,
+            #[cfg(test)]
+            declared,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -7443,6 +7455,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = helper::reads_own(self, a, r);
                 int(self, r)
             }
             _ => {

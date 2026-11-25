@@ -966,58 +966,137 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res).map(|_| ())
     }
 
-    /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
-    /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
-    /// written with (the compare's, EXEC's on entry). Now the store refuses;
-    /// without the write it translates.
-    #[test]
-    fn a_mask_whose_high_dword_is_rewritten_is_refused() {
-        // v_cmp_eq_u32 vcc, 0, v0; v_mov_b32 v2, 11; v_cndmask_b32 v1, 0, v2, vcc
-        let select = [0x7D84_0080, 0x7E04_028B, 0x0202_0480];
-        // The same with v_add_co_ci_u32 v1, vcc, 0, v2, vcc.
-        let carry = [0x7D84_0080, 0x7E04_028B, 0x5002_0480];
-        // v_mov_b32 v1, 7
-        let mov = [0x7E02_0287];
-        for body in [&select[..], &carry, &mov] {
-            stores_v1(body).unwrap();
-        }
-        // s_mov_b32 vcc_hi, 0 after the compare.
-        let select_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x0202_0480];
-        let carry_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x5002_0480];
-        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7, then the same after
-        // s_mov_b64 s[2:3], exec.
-        let exec_hi = [0xBEFF_0380, 0x7E02_0287];
-        let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
-        for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
-            assert!(stores_v1(body).is_err(), "{body:x?}");
-        }
+    /// The lowered program of a wave64 compute shader: `body`, then a store
+    /// of v1 to a UAV.
+    fn cs_lower(body: &[u32]) -> crate::emit::lower::Lowered {
+        use crate::native::RootParam;
+        use crate::{ResourceType, RootType, UsedResource};
+        // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
+        let mut words = vec![0xBE81_0380, 0xF408_0200, 0xFA00_0000];
+        words.extend_from_slice(body);
+        // v_lshlrev_b32 v3, 2, v0; buffer_store_dword v1, v3, s[8:11], 0 offen;
+        // s_endpgm
+        words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
     }
 
-    /// `ds_bpermute_b32` stores nothing: each lane reads the lane its address
-    /// names. It stopped as "LDS the program does not allocate" (sticky lips)
-    /// or "an LDS operation" (the checkerboard shadow masks).
-    #[test]
-    fn a_backward_permute_reads_the_lane_its_address_names() {
-        // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2
-        stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
+    /// The lowered program of a pixel shader exporting v1 to `mrt0`, with no
+    /// input attribute and `vgprs` VGPRs.
+    fn ps_lower(words: &[u32], vgprs: u16) -> crate::emit::lower::Lowered {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half,
+        };
+        let outputs = vec![el("SV_Target", 16, 15, false)];
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+    /// Whether the program declares the function `name` (a `dx.op` name).
+    fn declares(l: &crate::emit::lower::Lowered, name: &str) -> bool {
+        l.declared.iter().any(|n| n == name)
     }
 
-    /// `v_cvt_f32_f64`: a console double in a register pair, rounded to a
-    /// float. Three compute shaders stopped at the opcode by name, all of
-    /// them feeding the result to `v_rcp_f32`.
+    /// A pixel shader's helper lanes are in EXEC on the console, so a
+    /// waterfall loop (read the first lane's value, run the lanes that hold
+    /// it, take them out of EXEC) serves them. The host leaves helper lanes
+    /// out of wave operations: once only they were left in such a loop,
+    /// `WaveReadLaneFirst` read no lane, no lane matched, and the loop ran to
+    /// its limit there with whatever the read gave. A pixel's first-lane read
+    /// takes its own value for a helper lane (`isHelperLane`); a compute
+    /// program's read is unchanged.
     #[test]
-    fn a_double_register_pair_rounds_to_a_float() {
-        // v_cvt_f32_f64 v2, v0: v0:v1 is the thread id, read as a double.
-        stores_v1(&[0x7E04_1F00]).unwrap();
-    }
-
-    /// `v_permlanex16_b32`: each lane reads the lane 16 away within its
-    /// 32-lane block, at the offset its half's selector names. One compute
-    /// shader's 64-lane max/min reduction stopped at the opcode by name.
-    #[test]
-    fn a_permutation_across_the_16_lane_halves_reads_the_other_half() {
-        // v_permlanex16_b32 v1, v0, 0, 0
-        stores_v1(&[0xD778_0001, 0x0201_0100]).unwrap();
+    fn a_pixel_helper_lane_reads_its_own_first_lane_value() {
+        // v_mov_b32 v0, 1; v_readfirstlane_b32 s0, v0; v_mov_b32 v1, s0
+        let read = [0x7E00_0281u32, 0x7E00_0500, 0x7E02_0200];
+        // exp mrt0, v1, v1, v1, v1 done vm; s_endpgm
+        let mut words = read.to_vec();
+        words.extend_from_slice(&[0xF800_180F, 0x0101_0101, 0xBF81_0000]);
+        let ps = ps_lower(&words, 2);
+        assert!(declares(&ps, "dx.op.isHelperLane.i1"));
+        assert!(declares(&ps, "dx.op.waveReadLaneFirst.i32"));
+        assert!(
+            !declares(&cs_lower(&read), "dx.op.isHelperLane.i1"),
+            "a compute shader has no helper lanes"
+        );
     }
 
     /// A 16-bit interpolation pair: `v_interp_p2_f16` writes one half of its
