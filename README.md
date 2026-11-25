@@ -196,9 +196,14 @@ Every key is optional: `focus` and `enter` are off unless set, and a key left
 out keeps its value above. A missing file is both features off; a file that
 does not parse is a warning and both features off, and never stops the title
 from booting. The presses are real keys (`SendInput`, so the focused window
-receives them); `focus` taken for them is given back after the last one. The
-log carries the policy read, on one `RUN launch focus=… enter=… after=…
-every=… times=…` line.
+receives them); `focus` taken for them is given back after the last one. A
+press goes into the process's largest visible top-level window that is not the
+layer's own `VIctory` window, chosen again before every press, and that window
+is made front, active and focused first (`victory_gpu::autokeys::Choice`,
+`victory_gpu::autokeys::activate`): a window merely in front receives no key.
+The log carries the policy read, on one `RUN launch focus=… enter=… after=…
+every=… times=…` line, and the chosen window's handle, class and title once, on
+its `launch: the window is in front` line.
 
 ## Commands
 
