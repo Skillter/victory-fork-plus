@@ -221,6 +221,13 @@
   at what rate. `copystat` names the ranges and the memory kinds behind them.
   A new copy path adds its bytes there, or the frame line's `copies` and
   `copying back` stay unattributed.
+- `host::Meter::frame` is ticked at the top of `Host::present`, ahead of every
+  gate that returns without drawing (`client_size`, `fit`, no back buffer), so
+  the 5 s line and the caption count the frames the title spent, not the frames
+  that reached the card; a gate that returns every frame of a run says so
+  (`present.no-client-area`). `frame_ms` is the gap between presents, which is
+  the footer's `fps_worst`; `draws_frame` and `gpu_wait_us` are the two figures
+  a `runs.tsv` row keeps per run.
 - The title's buffer copies are deferred steps, run at submission in runs
   whose destinations carry on (`host::copy_run`): a run shares one flush
   before it, one opening of the guards over all it writes, one

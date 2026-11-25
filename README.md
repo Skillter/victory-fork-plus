@@ -153,9 +153,10 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+The window caption shows the framerate, the draws a frame and the commit the
+build was made from, so a screenshot carries them. Saves, settings and
+`crashes.log` are kept under the data folder (default
+`%LOCALAPPDATA%\victory\data`), derived data under the cache folder.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
@@ -193,8 +194,10 @@ a record; the newest 20 are kept). `VICTORY_LOG_FILE=<path>` puts that file some
 
 Three markers, in this order; grep them before reading anything else.
 
-- `RUN` — one line per fact the run started with: build (`version`, `commit`,
-  `+dirty` when tracked files differ from it), UTC and local start, the filter
+- `RUN` — one line per fact the run started with: build (`version`, the
+  commit's eight characters, its whole hash, the branch or `detached`, and
+  `dirty=true` when the crates the binary is made of differ from it), UTC and
+  local start, the filter
   and cap in effect, the log file, the config file or `(none)`, resolved game,
   cache and data directories, the image's BLAKE3, title id, manifest and
   storage quota, console model, and every `VICTORY_*` variable that was set,
@@ -213,6 +216,16 @@ A condition that repeats logs its first occurrence, then the 10th, 100th,
 `count=` and `suppressed=`, so a storm is counted instead of hidden. `RUN`,
 `STOP` and warn lines bypass `VICTORY_LOG`: a filter is for volume, not for the
 three records that explain a run.
+
+`<data-dir>\logs\runs.tsv` is the series the logs cannot be: one tab-separated
+row per run, appended and never rewritten, so a year of them is one file and a
+crash costs the row of the run that crashed. The header names the columns:
+`start_utc end_utc commit branch dirty console frames secs fps_mean ms_mean
+fps_worst ms_worst draws_mean gpu_wait_ms_mean end_reason log`. `fps_mean` and
+`ms_mean` are the whole run, `fps_worst` and `ms_worst` its worst frame,
+`draws_mean` the draws a presented frame made and `gpu_wait_ms_mean` what it
+waited for the card; an empty column is a figure nothing measured, which is not
+a zero. `column -t -s $'\t' runs.tsv` reads it, and so does a spreadsheet.
 
 The API for a call site is `victory_core::meter`: `meter().count("draws_n", 1)`
 per draw, `meter().observe("preparing_ms", ms)`, `meter().time("copy_us", d)`,
