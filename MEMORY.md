@@ -123,7 +123,7 @@ VIctory's own version-1.1 signatures keep them (2b makes those work).
 
 | Switch | Effect | Notes |
 |---|---|---|
-| `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off | **in the working config** |
+| `VICTORY_D3D12_BACKGROUND=0` | driver's background recompiles off; that is now the default, so the variable is no longer read (`VICTORY_BACKGROUND_PROCESSING=normal` gives the older behaviour back) | **in the working config** |
 | `VICTORY_RELAY=2` | relay thread lands flights; card work overlaps submission | **unstable**: 473 → 350 ms, then `device removed after 3 submissions sent ahead` (TDR) |
 | `VICTORY_LATE_WAIT=1/2/3` | stages of the same send-ahead machinery | same family as `RELAY`; assume the same risk |
 | `VICTORY_WIDE_BACK=1` | snapshot compares spread across cores | safe; sold as part of the fast config |

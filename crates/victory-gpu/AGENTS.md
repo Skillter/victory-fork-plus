@@ -47,6 +47,12 @@
 - Our root signatures are v1.1 and keep the heap-direct-index flags; the
   title's own go through the v1.0 serializer, which refuses them, so `root`
   drops exactly `0x400|0x800` there.
+- A root signature is built once per binding shape, not once per pipeline:
+  `host::canonical_params` orders the parameters by their binding and
+  `host::root_signature` caches the created object and its bytes by them, so
+  a cosmetic slot-order difference is neither a new library entry nor a new
+  driver compile. Each stage still reaches its own root views, through
+  indices `canonical_params` returns.
 - Translated shaders are cached by the executable's BLAKE3 plus translation
   switches. Old entries die with the build hash; do not hand-version them.
 
