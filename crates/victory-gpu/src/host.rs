@@ -1754,6 +1754,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Rectangles a draw expands from a title vertex stream into the list's
+    /// scratch memory (`crate::primitive::expand_rects`).
+    Rectangles(Rectangles),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1763,6 +1766,91 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+/// Rectangles a draw expands into a list's scratch memory when the list is
+/// submitted, held as data: one boxed closure per vertex stream per
+/// rectangle draw was a heap allocation and an indirect call each.
+pub(crate) struct Rectangles {
+    /// Title memory the vertices are read from, checked when recorded.
+    from: usize,
+    /// The list's scratch memory, `6` vertices for every `3` read.
+    to: usize,
+    stride: usize,
+    /// Rectangles.
+    count: usize,
+    /// The stream's elements as the input layout packs them.
+    elements: [(u32, u32); Rectangles::CAP],
+    named: usize,
+}
+
+impl Rectangles {
+    /// Elements one stream may name and stay a `Rectangles`: a longer one
+    /// keeps the boxed closure of [`HostList::defer_host`].
+    pub(crate) const CAP: usize = 8;
+
+    pub(crate) fn new(
+        from: usize,
+        to: usize,
+        stride: usize,
+        count: usize,
+        elements: &[(u32, u32)],
+    ) -> Option<Rectangles> {
+        if elements.len() > Self::CAP {
+            return None;
+        }
+        let mut held = [(0, 0); Self::CAP];
+        held[..elements.len()].copy_from_slice(elements);
+        Some(Rectangles {
+            from,
+            to,
+            stride,
+            count,
+            elements: held,
+            named: elements.len(),
+        })
+    }
+
+    /// Expands them, as [`crate::primitive::expand_rects`] does.
+    fn run(&self) {
+        expand_rects_now(
+            self.from,
+            self.to,
+            self.stride,
+            self.count,
+            &self.elements[..self.named],
+        );
+    }
+
+    /// The title memory it reads: where, how many bytes.
+    fn source(&self) -> (usize, usize) {
+        (self.from, self.count * 3 * self.stride)
+    }
+}
+
+/// Rectangles read from title memory `from` and written expanded to `to`
+/// when the list is submitted: the body [`Rectangles`] runs, and what the
+/// boxed closure of a stream naming more elements than [`Rectangles::CAP`]
+/// runs.
+pub(crate) fn expand_rects_now(
+    from: usize,
+    to: usize,
+    stride: usize,
+    count: usize,
+    elements: &[(u32, u32)],
+) {
+    // The vertices are read in place, at submission: no change of mapping
+    // under the read (see `crate::watch::title_memory_reading`).
+    let _mapped = crate::watch::title_memory_reading();
+    // SAFETY: the vertices lie in a title buffer (checked when recorded)
+    // and the scratch memory is the list's.
+    let (src, dst) = unsafe {
+        (
+            std::slice::from_raw_parts(from as *const u8, count * 3 * stride),
+            std::slice::from_raw_parts_mut(to as *mut u8, count * 6 * stride),
+        )
+    };
+    crate::primitive::expand_rects(src, dst, stride, elements);
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2277,6 +2365,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
+                // Rectangles are read out of title memory at submission, as
+                // a fill is (the closure this replaced was not told apart
+                // from work that writes host memory only).
+                Step::Rectangles(work) => {
+                    let (at, len) = work.source();
+                    if touches(written, at, at + len) {
+                        if count {
+                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -5260,9 +5360,31 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    ///
+    /// The reference is taken off the vtable the object already has:
+    /// `cast::<IUnknown>()` asked the object for the interface it starts
+    /// with (`QueryInterface`, then `AddRef`) on every pipeline change, and
+    /// the opening cutscene changes pipelines thousands of times a frame.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+        let raw = object.as_raw();
+        // SAFETY: a live interface the list's commands named; `clone` is
+        // the `AddRef` of the reference `kept` gives back at the reset.
+        if let Some(unknown) = unsafe { windows::core::IUnknown::from_raw_borrowed(&raw) } {
+            self.deferred().kept.push(unknown.clone());
+        }
+    }
+
+    /// Keeps `a` and `b` alive until the list is reset, in one lock: a
+    /// pipeline change keeps its pipeline and its root signature, and the
+    /// opening cutscene changes pipelines thousands of times a frame.
+    pub(crate) fn keep_pair(&self, a: &impl Interface, b: &impl Interface) {
+        let mut deferred = self.deferred();
+        for object in [a.as_raw(), b.as_raw()] {
+            // SAFETY: a live interface the list's commands named; `clone`
+            // is the `AddRef` of the reference `kept` gives back.
+            if let Some(unknown) = unsafe { windows::core::IUnknown::from_raw_borrowed(&object) } {
+                deferred.kept.push(unknown.clone());
+            }
         }
     }
 
@@ -5282,6 +5404,12 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// Runs [`Rectangles`] when the list is submitted: as
+    /// [`HostList::defer_host`], without the boxed closure.
+    pub(crate) fn defer_host_rects(&self, work: Rectangles) {
+        self.deferred().copies.push(Step::Rectangles(work));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -5339,6 +5467,15 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
                     }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::Rectangles(work) => {
+                    work.run();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
