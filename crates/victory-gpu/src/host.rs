@@ -6224,7 +6224,7 @@ impl Host {
                         "the window has another shape: distorted until a scale pass of our own exists"
                     },
                     "the window is another size than the frame: the host GPU stretches each present into it (the title \
-                     renders the size of the console's display mode, VICTORY_DISPLAY_MODE=WxH)"
+                     renders its own resolution setting, not the window, and ignores the display mode we report)"
                 );
             }
             Ok(Presenter {
