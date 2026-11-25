@@ -304,7 +304,9 @@ pub(super) fn effect(f: &Func) -> Effect {
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
         // none: they read the other lanes' values.
-        _ if name.starts_with("wave") || name.starts_with("quad") => Effect::Lanes,
+        _ if name.starts_with("wave") || name.starts_with("quad") || name.starts_with("isHelperLane") => {
+            Effect::Lanes
+        }
         _ => Effect::Writes,
     }
 }
