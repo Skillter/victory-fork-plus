@@ -277,7 +277,6 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_PIPELINE_WAIT_SHARED=0` | give each thread its own 500 ms pipeline wait per frame instead of sharing one budget across the frame |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_ADAPTER=<part of its name>` | picks the host GPU on a machine with several (e.g. one that does not drive the main display, so a GPU hang resets a different card); every hardware adapter is logged with its VRAM, and a name matching none leaves the runtime's default |
-| `VICTORY_TEXTURE_UNSEEN=0` | leave a texture to its hash turn even after its hash found a write the write watch and the guards cannot see (a movie's pictures, written through another view): with the switch on, such a texture is read at every check while it keeps changing |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
